@@ -51,7 +51,8 @@ def test_factual_mode_cannot_replace_technical_or_procedural_contract(tmp_path, 
 def test_live_schema_expresses_cross_field_constraints_without_repairing_values():
     requirement = source_selected_output_contract()["$defs"]["_Requirement"]
     assert "factual_response" in requirement["properties"]["response_mode"]["enum"]
-    constraints = {rule["if"]["properties"]["response_mode"]["const"]: rule for rule in requirement["allOf"]}
+    constraints = {rule["if"]["properties"]["response_mode"]["const"]: rule for rule in requirement["allOf"]
+                   if "const" in rule["if"]["properties"]["response_mode"]}
     assert set(constraints) == {"procedure", "factual_response"}
     assert constraints["procedure"]["then"]["properties"]["category"]["enum"] == ["procedure", "commercial"]
     assert constraints["factual_response"]["then"]["properties"]["category"]["enum"] == ["qualification", "commercial"]

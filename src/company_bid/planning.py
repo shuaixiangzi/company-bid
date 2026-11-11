@@ -23,7 +23,7 @@ from .extraction import (
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-PLANNING_VERSION = "bid-plan-v5"
+PLANNING_VERSION = "bid-plan-v6"
 
 
 class _Fill(_Strict):

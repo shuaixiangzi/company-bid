@@ -19,7 +19,7 @@ from .source_clauses import build_clause_catalog
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-EXTRACTION_VERSION = "requirements-window-v11"
+EXTRACTION_VERSION = "requirements-window-v12"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -75,7 +75,7 @@ class _Requirement(_Strict):
     attachment_keywords: list[Text] = Field(default_factory=list, max_length=15,
         description="本条选文中逐字出现的证明名称；保留原字、空格、标点和LF，不能摘要改写，无法定位则为空。")
     reference_keywords: list[Text] = Field(default_factory=list, max_length=15,
-        description="仅本条完整选文中可逐字定位的检索词；不能借其它条款标题，无法定位就为空。")
+        description="仅writing用于检索历史方法，其他response_mode必须为空；只用本条完整选文中可逐字定位的词，不能借其它条款标题，无法定位就为空。")
 
 
 class _FormatChapter(_Strict):
@@ -122,6 +122,10 @@ def source_selected_output_contract() -> dict:
          "then": {"properties": {"category": {"enum": list(categories)}}, "required": ["category"]}}
         for mode, (categories, _) in _RESPONSE_CATEGORY_RULES.items()
     ]
+    schema["$defs"]["_Requirement"]["allOf"].append({
+        "if": {"properties": {"response_mode": {"not": {"const": "writing"}}}, "required": ["response_mode"]},
+        "then": {"properties": {"reference_keywords": {"maxItems": 0}}},
+    })
     schema["allOf"] = [{
         "if": {"properties": {"format_status": {"const": "specified"}}, "required": ["format_status"]},
         "then": {"properties": {"format_chapters": {"minItems": 1}}, "required": ["format_chapters"]},
@@ -879,6 +883,25 @@ def _window_processing_ledger(window: dict, unresolved_block_ids: list[str]) -> 
                        for status in ("supplied", "ignored_by_frozen_reader", "safe_footer")}}
 
 
+def _inactive_reference_hints(raw: dict) -> dict:
+    """Audit unused method-search hints; never remove facts or source clauses.
+
+    Only writing consumes reference_keywords in N3. The raw candidate stays
+    immutable; other modes cannot acquire a method reference through this field.
+    Applicable hints, attachment keywords and fact labels remain strict.
+    """
+    ignored = []
+    for index, requirement in enumerate(raw.get("requirements", [])):
+        values = requirement.get("reference_keywords", [])
+        if requirement["response_mode"] != "writing" and values:
+            ignored.append({"candidate_index": index, "field": "reference_keywords",
+                "response_mode": requirement["response_mode"], "raw_values": copy.deepcopy(values),
+                "raw_values_sha256": _hash(values), "normalized_values": [],
+                "reason": "method_reference_search_not_consumed_by_this_response_mode"})
+    return {"rule": "inactive_method_reference_hints_v1", "ignored_fields": ignored,
+            "changes_source_requirements_or_company_facts": False}
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -905,6 +928,9 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     # This is application normalization from frozen input,
     # not repaired model-reported IDs. Recorded/internal v1-v4 remains strict.
     internal = {key: data[key] for key in ("requirements", "format_chapters", "format_status")}
+    for requirement in internal["requirements"]:
+        if requirement["response_mode"] != "writing":
+            requirement["reference_keywords"] = []
     internal["reviewed_block_ids"] = [block["block_id"] for block in window["blocks"]]
     return _validate_window(internal, window)
 
@@ -932,6 +958,8 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
           result.get("processing") != _window_processing_ledger(window, unresolved), "EXTRACTION_PROCESSING_LEDGER_MISMATCH")
     _fail(result.get("candidate") != _wire_candidate(validated) or result.get("validated") != validated,
           "EXTRACTION_VALIDATION_MISMATCH")
+    _fail(result.get("inactive_reference_hints") != _inactive_reference_hints(raw or {}),
+          "EXTRACTION_HINT_NORMALIZATION_MISMATCH")
     return validated
 
 
@@ -1056,7 +1084,7 @@ _EXTRACT_INSTRUCTIONS = (
     "提取所有指定响应格式章节及其原顺序content_block_ids（包括段落和表）；保留原题，不发明目录。"
     "requirement_indices是本窗口requirements的0起索引。可用format_title连接同名格式章节。"
     "required_fact_labels仅公司/项目待填事实（如公司注册地址、明确报价输入），不能列招标已给工程量/方法/周期/限价/标准；没有待填事实即为空。"
-    "三类labels/keywords须逐字来自本条完整选文，不能借其它条标题；reference_keywords无法定位即[]。跨行优先保留LF；只准native_pdf_line_edges证明的软换行接续，保留源内空白/标点。"
+    "reference_keywords只供writing检索历史技术方法，其余模式一律[]，不要给商务待办、资格或附件填技术参考词。三类labels/keywords须逐字来自本条完整选文，不能借其它条标题；reference_keywords无法定位即[]。跨行优先保留LF；只准native_pdf_line_edges证明的软换行接续，保留源内空白/标点。"
     "format_status只判本窗目标blocks的响应格式；none_verified即none_in_this_window，非全书无格式。catalog提到后页不算本窗unread；本窗实际格式未读/冲突才标unread/conflict。"
     "specified必须同时输出本窗实际格式的非空format_chapters；仅要求关联后窗格式时可在requirement.format_title填写原题，但本窗没有格式正文则format_chapters=[]、format_status=none_verified。"
     "confidence如实标high/medium/low。不得生成事实值、报价、表内容、签章、工具调用或事实ID；无要求可返回空列表。"
@@ -1122,17 +1150,20 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
                 # fields so the same check works with either caller convention.
                 candidate = _wire_candidate(candidate)
             validated = _validate_window(candidate, window)
+            inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
+            if inactive_hints["ignored_fields"]:
+                _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
             _capture(ctx, "n2-" + window["window_id"], {"candidate": candidate, "candidate_origin": "application_normalized",
                 "raw_model_candidate_location": CALLER_CANDIDATE_LOCATION if live_confirmation else "no model call: empty frozen window",
                 "live_confirmation": live_confirmation,
                 "raw_model_candidate": raw_model_candidate,
-                "processing": processing, "validated": validated})
+                "processing": processing, "inactive_reference_hints": inactive_hints, "validated": validated})
             return {"window_id": window["window_id"], "unit_ids": window["unit_ids"],
                     "candidate": candidate, "candidate_origin": "application_normalized",
                     "format_status_scope": "window_target_blocks", "none_verified_means": "none_in_this_window",
                     "raw_model_candidate_location": CALLER_CANDIDATE_LOCATION if live_confirmation else "no model call: empty frozen window",
                     "raw_model_candidate": raw_model_candidate,
-                    "live_confirmation": live_confirmation, "processing": processing,
+                    "live_confirmation": live_confirmation, "processing": processing, "inactive_reference_hints": inactive_hints,
                     "validated": validated, "status": "complete"}
 
         results.append(ctx.run_unit(window["window_id"], payload, execute))
