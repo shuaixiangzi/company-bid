@@ -19,6 +19,8 @@
 
 记录模型/Provider 标识、提示词模板版本、节点实现版本、schema 版本、输入输出 hash、等待与执行耗时、状态、错误码、重试理由、token/费用信息。Provider 没有返回用量时记 unknown，不记 0。区分一个逻辑调用与实际发生的多次 HTTP 请求。
 
+每次实际请求前按冻结费率预留保守费用上界。完整响应中的用量经严格整数及加总校验后，在业务候选校验之前持久记录费用估算；截断或候选校验失败仍收费。后续请求按“已知用量估算＋未知请求全部预留＋下一请求上界”检查预算，不释放调用次数。原始预留、费率、用量、响应 hash 与实际 attempt 身份保留，旧记录缺少结算依据时继续占用全部预留。结算写入失败或费用超过原预留时明确停止，不自动扩大预算；重启不能抹去占用。诊断应分别显示原预留、已知估算、未知预留和有效预算占用，均不冒充 Provider 账单。
+
 应有稳定事件：`job.queued/claimed/lease_lost/cancel_requested`，`node.started/checkpointed/failed/reused/paused`，`call.started/completed/failed/retry_scheduled`，`artifact.stored/published`，`diagnostics.capture_failed/export_failed`。异常堆栈受权限保护并脱敏，面向普通用户的错误摘要只给可执行原因。
 
 ## Trace 实现

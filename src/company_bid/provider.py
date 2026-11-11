@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -95,7 +96,7 @@ class ChatConfig:
             raise ProviderFailure("PROVIDER_KEY_ENV_INVALID")
         if not self.model or not 1 <= self.max_attempts <= 3 or not 1 <= self.timeout_seconds <= 180:
             raise ProviderFailure("PROVIDER_CONFIG_INVALID")
-        if not 1 <= self.max_output_tokens <= 8000 or not 1 <= self.max_input_chars <= 100000:
+        if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 16000 or not 1 <= self.max_input_chars <= 100000:
             raise ProviderFailure("PROVIDER_BUDGET_INVALID")
         if not 1 <= self.max_run_calls <= 200 or self.thinking_mode not in (None, "enabled", "disabled"):
             raise ProviderFailure("PROVIDER_CONFIG_INVALID")
@@ -145,6 +146,9 @@ class ChatProposalProvider:
         Validation executes inside the actual attempt: a 200 with invalid
         quotations is a failed call, with its raw response retained privately.
         """
+        from .runtime import (ProviderBudgetLedgerError, ProviderBudgetPersistenceError,
+                              ProviderUsageSettlementError, _valid_usage, usage_cost_estimate)
+
         secret = os.environ.get(self.config.auth_env, "")
         if not secret:
             raise ProviderFailure("PROVIDER_CREDENTIAL_MISSING")
@@ -183,8 +187,8 @@ class ChatProposalProvider:
         # request-token bound. Reserve at frozen configured peak prices; unknown
         # outcomes keep the reservation, so restart cannot reset the run budget.
         max_input_tokens = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 2048
-        upper_usd = (max_input_tokens * self.config.input_usd_per_million +
-                     self.config.max_output_tokens * self.config.output_usd_per_million) / 1_000_000
+        upper_usd = usage_cost_estimate(max_input_tokens, self.config.max_output_tokens,
+                                       self.config.input_usd_per_million, self.config.output_usd_per_million)
         call_id = uuid.uuid4().hex
         for attempt in range(1, self.config.max_attempts + 1):
             metadata = {"call_id": call_id, "call_attempt": attempt, "provider": "chat_completions",
@@ -195,7 +199,10 @@ class ChatProposalProvider:
             captured = ctx.capture(f"request-{call_id}-{attempt}", redact_secret(payload, secret))
             if captured["status"] == "write_failed":
                 raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
-            ctx.reserve_call(call_id, attempt, upper_usd, self.config.max_run_usd, self.config.max_run_calls)
+            ctx.reserve_call(call_id, attempt, upper_usd, self.config.max_run_usd, self.config.max_run_calls,
+                             input_usd_per_million=self.config.input_usd_per_million,
+                             output_usd_per_million=self.config.output_usd_per_million,
+                             unit_id=unit_id, input_hash=metadata["input_hash"])
             started = time.monotonic()
             retryable = False
             with ctx.call_span(metadata) as span:
@@ -223,12 +230,20 @@ class ChatProposalProvider:
                     for remote, local in [("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"), ("total_tokens", "total_tokens")]:
                         value = usage.get(remote)
                         metadata[local] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-                    metadata["usage_status"] = "known" if all(metadata[k] is not None for k in ("input_tokens", "output_tokens", "total_tokens")) else "unknown"
+                    metadata["usage_status"] = "known" if _valid_usage(metadata["input_tokens"], metadata["output_tokens"], metadata["total_tokens"]) else "unknown"
                     if metadata["usage_status"] == "known":
-                        metadata["cost"] = (metadata["input_tokens"] * self.config.input_usd_per_million + metadata["output_tokens"] * self.config.output_usd_per_million) / 1_000_000
+                        estimate = usage_cost_estimate(metadata["input_tokens"], metadata["output_tokens"],
+                                                       self.config.input_usd_per_million, self.config.output_usd_per_million)
+                        if estimate <= Decimal("1e308"):
+                            metadata["cost"] = float(estimate)
                     if isinstance(clean.get("id"), str):
                         metadata["provider_request_id"] = clean["id"]
                     metadata["output_hash"] = digest(clean)
+                    if metadata["usage_status"] == "known":
+                        settlement = ctx.settle_call_usage(call_id, attempt, metadata["input_tokens"], metadata["output_tokens"],
+                            metadata["total_tokens"], response_sha256=metadata["output_hash"], unit_id=unit_id)
+                        if settlement["exceeds_reserved_upper"]:
+                            raise ProviderFailure("PROVIDER_USAGE_EXCEEDS_RESERVATION")
                     choices = clean.get("choices") or []
                     if not choices or choices[0].get("finish_reason") != "stop":
                         raise ProviderFailure("PROVIDER_TRUNCATED_OR_INCOMPLETE")
@@ -284,6 +299,8 @@ class ChatProposalProvider:
                         code, retryable = "DIAGNOSTICS_CAPTURE_FAILED", False
                 except ProviderFailure as error:
                     code = error.error_code
+                except (ProviderUsageSettlementError, ProviderBudgetPersistenceError, ProviderBudgetLedgerError) as error:
+                    code = error.code
                 except (ValidationError, ValueError, KeyError, TypeError, AttributeError) as error:
                     code = "PROVIDER_SCHEMA_INVALID"
                     # Only schema locations/types; exception strings may echo credentials.

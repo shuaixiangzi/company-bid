@@ -46,6 +46,107 @@ class ProviderBudgetError(RuntimeContractError):
     code = "PROVIDER_RUN_BUDGET_EXCEEDED"
 
 
+class ProviderBudgetLedgerError(RuntimeContractError):
+    code = "PROVIDER_BUDGET_LEDGER_INVALID"
+
+
+class ProviderUsageSettlementError(RuntimeContractError):
+    code = "PROVIDER_USAGE_SETTLEMENT_INVALID"
+
+
+class ProviderBudgetPersistenceError(RuntimeContractError):
+    code = "PROVIDER_BUDGET_PERSIST_FAILED"
+
+
+class ProviderUsagePersistenceError(ProviderBudgetPersistenceError):
+    code = "PROVIDER_USAGE_PERSIST_FAILED"
+
+
+def _budget_decimal(value, *, positive=False) -> Decimal:
+    try:
+        result = Decimal(str(value))
+        if isinstance(value, bool) or not result.is_finite() or result < 0 or positive and result == 0:
+            raise ValueError
+        return result
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ProviderBudgetLedgerError("Invalid numeric budget ledger value.") from exc
+
+
+def _valid_usage(input_tokens, output_tokens, total_tokens) -> bool:
+    return (all(type(value) is int and value >= 0 for value in (input_tokens, output_tokens, total_tokens)) and
+            input_tokens + output_tokens == total_tokens)
+
+
+def usage_cost_estimate(input_tokens: int, output_tokens: int, input_rate, output_rate) -> Decimal:
+    if type(input_tokens) is not int or type(output_tokens) is not int or input_tokens < 0 or output_tokens < 0:
+        raise ProviderUsageSettlementError("Usage must contain nonnegative integer token counts.")
+    return (Decimal(input_tokens) * _budget_decimal(input_rate, positive=True) +
+            Decimal(output_tokens) * _budget_decimal(output_rate, positive=True)) / Decimal(1_000_000)
+
+
+def call_budget_summary(budget: dict) -> dict:
+    """Recompute admission charges from unique attempts, never log event counts.
+
+    Old reservations with no frozen rates/settlement retain their full upper
+    bound. A known usage cost is an estimate at frozen rates, not an invoice.
+    """
+    original = known = unknown = Decimal(0)
+    settled_count = unknown_count = 0
+    seen, overruns = set(), 0
+    if not isinstance(budget, dict):
+        raise ProviderBudgetLedgerError("The attempt budget ledger must be an object.")
+    if budget:
+        try:
+            if (not isinstance(budget, dict) or not isinstance(budget["reservations"], list) or
+                    type(budget["max_run_calls"]) is not int or budget["max_run_calls"] < 1):
+                raise ValueError
+            _budget_decimal(budget["max_run_usd"], positive=True)
+            for item in budget["reservations"]:
+                identity = (item["call_id"], item["call_attempt"])
+                if (not isinstance(identity[0], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", identity[0]) or
+                        type(identity[1]) is not int or identity[1] < 1 or identity in seen or
+                        not isinstance(item.get("node_key"), str) or not isinstance(item.get("node_attempt_id"), str)):
+                    raise ValueError
+                seen.add(identity)
+                upper = _budget_decimal(item["estimated_upper_usd"])
+                original += upper
+                rates = (item.get("input_usd_per_million"), item.get("output_usd_per_million"))
+                if rates != (None, None):
+                    for rate in rates:
+                        _budget_decimal(rate, positive=True)
+                if item.get("settlement_status") == "known_usage_cost_estimate":
+                    usage = item["usage"]
+                    if not _valid_usage(usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]):
+                        raise ValueError
+                    cost = usage_cost_estimate(usage["input_tokens"], usage["output_tokens"], *rates)
+                    if (cost != _budget_decimal(item["known_usage_cost_estimate_usd"]) or
+                            not re.fullmatch(r"[0-9a-f]{64}", item.get("response_sha256", "")) or
+                            item.get("exceeds_reserved_upper") is not (cost > upper)):
+                        raise ValueError
+                    known += cost
+                    settled_count += 1
+                    overruns += int(cost > upper)
+                elif item.get("settlement_status", "reserved_unknown_actual_cost") == "reserved_unknown_actual_cost":
+                    unknown += upper
+                    unknown_count += 1
+                else:
+                    raise ValueError
+            if (type(budget["reservation_count"]) is not int or budget["reservation_count"] != len(seen) or
+                    len(seen) > budget["max_run_calls"] or _budget_decimal(budget["reserved_upper_usd"]) != original):
+                raise ValueError
+            if budget.get("stop_reason") not in (None, "usage_exceeds_reservation", "usage_persistence_failed", "reservation_persistence_failed"):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, ProviderUsageSettlementError) as exc:
+            raise ProviderBudgetLedgerError("The attempt budget ledger is inconsistent.") from exc
+    return {"ledger_status": "available" if budget else "not_started", "original_reserved_upper_usd": str(original),
+            "known_usage_cost_estimate_usd": str(known), "unknown_reserved_upper_usd": str(unknown),
+            "effective_budget_charge_usd": str(known + unknown), "reservation_count": len(seen),
+            "known_usage_estimate_count": settled_count, "unknown_reservation_count": unknown_count,
+            "budget_stopped": bool(budget.get("stop_reason") or overruns),
+            "stop_reason": budget.get("stop_reason") or ("usage_exceeds_reservation" if overruns else None),
+            "cost_basis": "known_usage_estimates_plus_unknown_upper_reservations", "cost_is_provider_invoice": False}
+
+
 @dataclass(frozen=True)
 class NodeSpec:
     key: str
@@ -148,8 +249,32 @@ class NodeContext:
     def read_artifact(self, reference: dict) -> bytes:
         return self.executor.store.read_bytes(reference)
 
-    def reserve_call(self, call_id: str, call_attempt: int, estimated_upper_usd: float,
-                     max_run_usd: float, max_run_calls: int) -> None:
+    def _commit_call_budget(self, budget: dict, *, settling: bool = False) -> None:
+        # Preserve node/unit/attempt object identities. Only adopt a changed
+        # budget after its independent state copy was durably saved.
+        candidate = copy.deepcopy(self._state)
+        candidate["call_budget"] = budget
+        try:
+            self.executor._save(candidate)
+        except Exception as exc:
+            self._state["call_budget"]["stop_reason"] = "usage_persistence_failed" if settling else "reservation_persistence_failed"
+            if settling:
+                for old in self._state["call_budget"]["reservations"]:
+                    proposed = next((item for item in budget["reservations"] if item["call_id"] == old["call_id"] and
+                                     item["call_attempt"] == old["call_attempt"]), None)
+                    if proposed and proposed.get("settlement_status") == "known_usage_cost_estimate" and old.get("settlement_status") != "known_usage_cost_estimate":
+                        old["uncommitted_usage_observation"] = {key: copy.deepcopy(proposed[key]) for key in
+                            ("usage", "response_sha256", "known_usage_cost_estimate_usd", "usage_recorded_at", "exceeds_reserved_upper")}
+            error = ProviderUsagePersistenceError if settling else ProviderBudgetPersistenceError
+            raise error("The budget write failed; admission remains stopped with the prior full charge.") from exc
+        self._state["call_budget"] = candidate["call_budget"]
+        for key in ("revision", "updated_at", "storage_write_retries"):
+            if key in candidate:
+                self._state[key] = candidate[key]
+
+    def reserve_call(self, call_id: str, call_attempt: int, estimated_upper_usd,
+                     max_run_usd: float, max_run_calls: int, *, input_usd_per_million=None,
+                     output_usd_per_million=None, unit_id: str | None = None, input_hash: str | None = None) -> None:
         """Durably reserve BEFORE an actual request; unknown cost stays reserved.
 
         This operates under execute's OS lock. It is an M1 local budget guard,
@@ -171,18 +296,78 @@ class NodeContext:
             raise ConfigurationChangedError("The frozen call budget cannot change within a run.")
         if any(item["call_id"] == call_id and item["call_attempt"] == call_attempt for item in budget["reservations"]):
             raise ProviderBudgetError("This actual call attempt was already reserved; reconcile before retrying.")
-        reserved = Decimal(budget["reserved_upper_usd"])
-        if budget["reservation_count"] + 1 > max_run_calls or reserved + estimate > limit:
+        totals = call_budget_summary(budget)
+        if (totals["budget_stopped"] or budget["reservation_count"] + 1 > max_run_calls or
+                Decimal(totals["effective_budget_charge_usd"]) + estimate > limit):
             raise ProviderBudgetError("The local run provider budget is exhausted.")
-        budget["reservation_count"] += 1
-        budget["reserved_upper_usd"] = str(reserved + estimate)
-        budget["reservations"].append({"call_id": call_id, "call_attempt": call_attempt,
+        rates = (input_usd_per_million, output_usd_per_million)
+        if rates != (None, None):
+            rates = tuple(str(_budget_decimal(rate, positive=True)) for rate in rates)
+        unit_id = unit_id if unit_id is not None else self._active_unit.get("unit_id")
+        if unit_id is not None:
+            _identifier(unit_id, "Call unit identifier")
+        if (self._active_unit.get("unit_id") is not None and unit_id != self._active_unit["unit_id"] or
+                input_hash is not None and (not isinstance(input_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", input_hash))):
+            raise ProviderUsageSettlementError("Call provenance is inconsistent.")
+        changed = copy.deepcopy(budget)
+        changed["reservation_count"] += 1
+        changed["reserved_upper_usd"] = str(Decimal(totals["original_reserved_upper_usd"]) + estimate)
+        changed["reservations"].append({"call_id": call_id, "call_attempt": call_attempt,
                                        "estimated_upper_usd": str(estimate), "reserved_at": utc_now(),
                                        "node_key": self.node_key, "node_attempt_id": self.attempt_id,
+                                       "unit_id": unit_id, "unit_attempt_id": self._active_unit.get("unit_attempt_id"),
+                                       "input_hash": input_hash, "input_usd_per_million": rates[0], "output_usd_per_million": rates[1],
                                        "settlement_status": "reserved_unknown_actual_cost"})
-        self._persist()
+        self._commit_call_budget(changed)
         self.call_event("call.reserved", {"call_id": call_id, "call_attempt": call_attempt,
-                                          "count": budget["reservation_count"]})
+                                          "count": changed["reservation_count"]})
+
+    def settle_call_usage(self, call_id: str, call_attempt: int, input_tokens: int, output_tokens: int,
+                          total_tokens: int, *, response_sha256: str, unit_id: str | None = None) -> dict:
+        """Durably record complete usage before any candidate validation.
+
+        A duplicate with identical tokens/hash is a no-op. Unknown/legacy
+        attempts cannot release their reservation without frozen price rates.
+        """
+        if (not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", call_id) or
+                type(call_attempt) is not int or call_attempt < 1 or
+                not _valid_usage(input_tokens, output_tokens, total_tokens) or not isinstance(response_sha256, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", response_sha256)):
+            raise ProviderUsageSettlementError("Usage or response identity is invalid.")
+        budget = self._state.get("call_budget", {})
+        call_budget_summary(budget)
+        matches = [item for item in budget.get("reservations", []) if item["call_id"] == call_id and item["call_attempt"] == call_attempt]
+        if len(matches) != 1:
+            raise ProviderUsageSettlementError("Usage must bind one reserved attempt.")
+        original = matches[0]
+        usage = {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
+        selected_unit = unit_id if unit_id is not None else self._active_unit.get("unit_id")
+        if (original.get("node_key") != self.node_key or original.get("node_attempt_id") != self.attempt_id or
+                original.get("unit_id") != selected_unit or original.get("unit_attempt_id") != self._active_unit.get("unit_attempt_id") or
+                original.get("input_usd_per_million") is None or original.get("output_usd_per_million") is None):
+            raise ProviderUsageSettlementError("Usage must retain its original unit and frozen rates.")
+        if original.get("settlement_status") == "known_usage_cost_estimate":
+            if original["usage"] != usage or original["response_sha256"] != response_sha256:
+                raise ProviderUsageSettlementError("A recorded usage estimate cannot change.")
+            return copy.deepcopy(original)
+        cost = usage_cost_estimate(input_tokens, output_tokens, original["input_usd_per_million"], original["output_usd_per_million"])
+        changed = copy.deepcopy(budget)
+        item = next(item for item in changed["reservations"] if item["call_id"] == call_id and item["call_attempt"] == call_attempt)
+        overrun = cost > Decimal(item["estimated_upper_usd"])
+        item.update(settlement_status="known_usage_cost_estimate", usage=usage, response_sha256=response_sha256,
+                    known_usage_cost_estimate_usd=str(cost), usage_recorded_at=utc_now(), exceeds_reserved_upper=overrun,
+                    cost_is_provider_invoice=False)
+        if overrun:
+            changed["stop_reason"] = "usage_exceeds_reservation"
+        call_budget_summary(changed)
+        self._commit_call_budget(changed, settling=True)
+        metadata = {"call_id": call_id, "call_attempt": call_attempt, **usage, "usage_status": "known",
+                    "status": "known_usage_cost_estimate", "output_hash": response_sha256,
+                    "input_hash": original.get("input_hash"), "unit_id": selected_unit}
+        if cost <= Decimal("1e308"):
+            metadata["cost"] = float(cost)
+        self.call_event("call.usage_recorded", metadata)
+        return copy.deepcopy(item)
 
     def run_unit(self, unit_id: str, input_data: dict, fn: Callable[[], dict]) -> dict:
         _identifier(unit_id, "Unit identifier")
@@ -674,16 +859,13 @@ class Executor:
             result["unfinished_started_attempts"] = len(started - finished)
             costs = []
             for event in terminal:
-                known = True
-                for key in result["known_token_counts"]:
-                    value = event.get(key)
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        result["known_token_counts"][key] = (result["known_token_counts"][key] or 0) + value
-                    else:
-                        known = False
+                known = _valid_usage(event.get("input_tokens"), event.get("output_tokens"), event.get("total_tokens"))
+                if known:
+                    for key in result["known_token_counts"]:
+                        result["known_token_counts"][key] = (result["known_token_counts"][key] or 0) + event[key]
                 result["known_usage_attempts" if known else "unknown_usage_attempts"] += 1
                 cost = event.get("cost")
-                if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+                if known and isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
                     costs.append(cost)
             result["unknown_usage_attempts"] += result["unfinished_started_attempts"]
             result["estimated_cost_usd"] = round(sum(costs), 12) if costs else None

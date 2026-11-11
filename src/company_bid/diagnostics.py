@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 
 from .storage import LocalStore, StorageError, digest
+from .runtime import ProviderBudgetLedgerError, call_budget_summary
 
 
 def inspect_diagnostics(root: Path, run_id: str) -> dict:
@@ -256,11 +258,22 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
     if state.get("cursor") != expected_cursor:
         gap("CHECKPOINT_CURSOR_MISMATCH")
 
-    calls = {}
+    budgets = state.get("call_budget", {})
+    try:
+        budget_summary = call_budget_summary(budgets)
+    except ProviderBudgetLedgerError:
+        gap("CALL_BUDGET_LEDGER_INVALID")
+        budget_summary = {"ledger_status": "invalid", "effective_budget_charge_usd": None, "cost_is_provider_invoice": False}
+    reservations = budgets.get("reservations", []) if budget_summary["ledger_status"] == "available" else []
+    by_call = {(item["node_attempt_id"], item["call_id"], item["call_attempt"]): item for item in reservations}
+    calls, usage_events = {}, []
     for event in events:
-        if not event.get("call_id") or event.get("event") not in ("call.started", "call.completed", "call.failed", "call.retry_scheduled"):
+        if not event.get("call_id") or event.get("event") not in ("call.started", "call.completed", "call.failed", "call.retry_scheduled", "call.usage_recorded"):
             continue
         identity = (event.get("node_attempt_id"), event["call_id"], event.get("call_attempt"))
+        if event["event"] == "call.usage_recorded":
+            usage_events.append((identity, event))
+            continue
         item = calls.setdefault(identity, {"call_id": identity[1], "call_attempt": identity[2], "events": []})
         item["events"].append(event["event"])
         if event["event"] == "call.retry_scheduled":
@@ -269,6 +282,14 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         item.update({key: event[key] for key in ("node_key", "node_attempt_id", "unit_id", "unit_attempt_id", "model", "provider", "prompt_version",
                     "operation", "input_hash", "output_hash", "trace_id", "span_id", "elapsed_ms", "input_tokens", "output_tokens", "total_tokens",
                     "cost", "usage_status", "error_code", "validation_status", "provider_request_id") if key in event})
+    for identity, event in usage_events:
+        item = calls.get(identity)
+        if item is None or not any(name in item["events"] for name in ("call.started", "call.completed", "call.failed")):
+            gap("CALL_USAGE_WITHOUT_ATTEMPT", call_id=identity[1], call_attempt=identity[2])
+            continue
+        item["events"].append("call.usage_recorded")
+        item.setdefault("usage_events", []).append({key: event.get(key) for key in
+            ("trace_id", "span_id", "unit_id", "unit_attempt_id", "input_tokens", "output_tokens", "total_tokens", "cost", "output_hash")})
     for call in calls.values():
         names = call["events"]
         call["outcome"] = "completed" if "call.completed" in names else "failed" if "call.failed" in names else "unknown"
@@ -283,8 +304,34 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
                 gap("CALL_TRACE_IDENTITY_MISMATCH", call_id=call["call_id"], call_attempt=call["call_attempt"])
         if any((row.get("trace_id"), row.get("span_id")) != (call.get("trace_id"), call.get("span_id")) for row in call.get("retries", [])):
             gap("CALL_RETRY_TRACE_MISMATCH", call_id=call["call_id"], call_attempt=call["call_attempt"])
-    budgets = state.get("call_budget", {})
-    for reservation in budgets.get("reservations", []):
+        reservation = by_call.get((call.get("node_attempt_id"), call["call_id"], call["call_attempt"]))
+        usage_events = call.get("usage_events", [])
+        if len(usage_events) > 1:
+            gap("CALL_USAGE_EVENT_DUPLICATE", call_id=call["call_id"], call_attempt=call["call_attempt"])
+        known = reservation and reservation.get("settlement_status") == "known_usage_cost_estimate"
+        if known and not usage_events:
+            gap("CALL_USAGE_EVENT_MISSING", call_id=call["call_id"], call_attempt=call["call_attempt"])
+        for row in usage_events:
+            if (row.get("trace_id"), row.get("span_id")) != (call.get("trace_id"), call.get("span_id")):
+                gap("CALL_USAGE_TRACE_MISMATCH", call_id=call["call_id"], call_attempt=call["call_attempt"])
+            if (not known or {key: row.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")} != reservation["usage"] or
+                    row.get("output_hash") != reservation["response_sha256"] or
+                    row.get("unit_id") != reservation.get("unit_id") or row.get("unit_attempt_id") != reservation.get("unit_attempt_id")):
+                gap("CALL_USAGE_LEDGER_MISMATCH", call_id=call["call_id"], call_attempt=call["call_attempt"])
+            elif Decimal(reservation["known_usage_cost_estimate_usd"]) <= Decimal("1e308") and row.get("cost") != float(reservation["known_usage_cost_estimate_usd"]):
+                gap("CALL_USAGE_LEDGER_MISMATCH", call_id=call["call_id"], call_attempt=call["call_attempt"])
+        if known:
+            # Billing metadata is read from the unique durable attempt record;
+            # damaged or duplicate log events cannot change budget charges.
+            call.update(usage_status="known", **reservation["usage"], usage_evidence="durable_usage_estimate")
+            cost = Decimal(reservation["known_usage_cost_estimate_usd"])
+            if cost <= Decimal("1e308"):
+                call["cost"] = float(cost)
+            else:
+                call.pop("cost", None)
+        if reservation:
+            call["settlement_status"] = reservation.get("settlement_status", "reserved_unknown_actual_cost")
+    for reservation in reservations:
         identity = (reservation["node_attempt_id"], reservation["call_id"], reservation["call_attempt"])
         if identity not in calls:
             gaps.append({"code": "RESERVATION_WITHOUT_REQUEST_RECORD", "call_id": reservation["call_id"], "call_attempt": reservation["call_attempt"]})
@@ -301,7 +348,7 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
             "gaps": gaps, "content_limitations": content_limitations, "nodes": nodes, "execution_attempts": execution, "calls": list(calls.values()),
             "actual_call_attempts": len(calls), "unknown_usage_attempts": sum(c.get("usage_status") != "known" for c in calls.values()),
             "known_estimated_cost_usd": sum(c["cost"] for c in calls.values() if isinstance(c.get("cost"), (int, float))),
-            "cost_is_provider_invoice": False, "call_reservations": budgets,
+            "cost_is_provider_invoice": False, "call_reservations": budgets, "budget_summary": budget_summary,
             "storage_write_retries": [{key: item.get(key) for key in
                 ("operation", "retry_number", "state_revision", "winerror", "error_code", "recorded_at")}
                 for item in state.get("storage_write_retries", [])],
