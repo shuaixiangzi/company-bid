@@ -17,7 +17,10 @@ def read_json(path):
 
 
 def safe_summary(state):
-    return {key: state.get(key) for key in ("run_id", "status", "parent_run_id", "fork_from_node", "cursor", "error_code", "error_type", "observability", "call_budget") if key in state}
+    summary = {key: state.get(key) for key in ("run_id", "status", "parent_run_id", "fork_from_node", "cursor", "error_code", "observability", "call_budget") if key in state}
+    if state.get("error_code"):
+        summary["error_type"] = state.get("error_type")
+    return summary
 
 
 def parser():
