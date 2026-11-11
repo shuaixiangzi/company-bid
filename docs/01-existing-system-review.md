@@ -2,6 +2,8 @@
 
 审视日期：2026-11-10。结论是保留可靠执行、来源与文档处理方面的经验，重新建立一条面向“自动生成后线下修改”的小型业务链。旧项目的目录确认、在线编辑兼容、多代策略与发布补偿不适合作为新项目的起始骨架。
 
+2026-11-11 按用户要求补充了[逐环节设计复用记录](08-legacy-design-reuse.md)，重点核对既有 WritingTask、响应单元、参考改编、格式保护及附件绑定，作为继续改进 M1 的实施依据。
+
 ## 事实范围
 
 - 主要代码参考：`E:/ai-bid-rebuild-wt-mfs001`，HEAD `53f20a3afac42e07069d58ee53398457ea8b5aed`；代码树对应已审核 `dc5a67873973f7c0a7f81cd0e982918dd4e5182e`，两者之间只有接受记录等文档。
@@ -29,6 +31,8 @@
 | 准备页承担公司解析、绑定/冻结、解析等待和启动串联 | `apps/web/src/views/ProjectPrepView.vue:395`、`:551`、`:856` | 一个后端启动命令，前端只展示状态和操作 |
 
 表中 Python 路径相对 `E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/`。完整源码保留在旧目录，不复制到新项目。
+
+2026-11-11 复核补充：上表“主体判断”只说明存在相关合同/判断接口，不表示当前匹配入口实际启用。该基线 `workflow/handler.py:3025–3029` 将 `expected_subject` 清空，`composition/draft_quality.py:494` 忽略主体参数；`materials/scoring.py:1058` 还含核验状态调试旁路。新系统须显式实现主体/人员适用性，不能直接继承这些运行行为。
 
 可直接抽查：[工作稿输入](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/simplification/draft_input.py:25)、[文档投影](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/simplification/document.py:73)、[旧 draft 守卫](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/workflow/handler.py:5754)、[Worker 完成路径](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/jobs/execution.py:457)。
 
