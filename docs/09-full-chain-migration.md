@@ -190,6 +190,8 @@ N3 版本为 `bid-plan-v3`：固定函件只在显式声明引导词与从 1 起
 
 本轮最终全量回归 **1131 passed、1 skipped（102.65 秒）**，仅跳过 Windows 符号链接权限负例。新增评分 50、同窗绑定 24、源文本保真 10 项测试；独立复核限定范围没有未解决的 P1/P2。真实 N1 离线重建全部 34 窗、74 页、1,320 目标块，最大请求 49,576 字符，来源目录逐窗重建一致；旧前 11 个成功窗口原始响应不改写的离线兼容检查全部通过。这些是离线验证，不新增模型成功，也不允许跨执行版本回写旧 checkpoint；当前仍未完成 N2 整节点与 N3～N6 真实整链，尚无本轮完整自动 Word。
 
+代码提交 `d0a513a` 后，新子 run `58cfc5b0f0a14008960e462de4e008fe` 已从 N0 免费重建并单步到 N1，状态 `paused_debug`，N2～N6 尚未执行。冻结配置为 `.local/full-chain-20261112/config-v17-direct-source-fidelity.json`，hash `57f3746285bafb2e87a78f1976bdabcc0f9d464f2e9770ec8f5fc467eff54862`；新 N1 输出 hash `5613ddd749c1dc5d06fcb5d8c4b959dfd962a4a4d2057e93dbfdba9eba24c029`。新检查点再次通过全部来源与输入容量预检，34 窗基础请求的全额预留之和为 1.2192939 美元（额外纠正另占预算，不保证最终整链费用）；实际外部调用 0。诊断 `available_with_content_limitations`、缺口 0：招标必读完整，但人工参考文件既有未 OCR/不支持对象仍明确显示，不冒充内容全读。夜间在冻结版本不变时可对此 run 单步 N2；旧成功/失败记录保持不变，没有自动定时启动或后台付费任务。
+
 ## 运行方式
 
 PowerShell 在项目根设置 `$env:PYTHONPATH='src'`，用项目 Python 执行 `-m company_bid.cli`。自动流程配置 `pipeline: automatic`，输入符合 `IntakeManifest`；敏感原文/配置放受控目录。密钥仅用已有环境变量或 `--credential-file`，不要写入 JSON 配置。
