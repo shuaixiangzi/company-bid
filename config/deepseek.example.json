@@ -1,0 +1,21 @@
+{
+  "provider": {
+    "mode": "chat_completions",
+    "endpoint": "https://api.deepseek.com/chat/completions",
+    "model": "deepseek-flash",
+    "auth_env": "COMPANY_BID_API_KEY",
+    "max_attempts": 1,
+    "timeout_seconds": 90,
+    "max_output_tokens": 4000,
+    "max_input_chars": 12000,
+    "max_run_calls": 2,
+    "max_run_usd": 0.02,
+    "input_usd_per_million": 0.30,
+    "output_usd_per_million": 1.20,
+    "thinking_mode": "disabled"
+  },
+  "debug_capture": true,
+  "pricing_reference": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "pricing_checked_date": "2026-11-11",
+  "cost_meaning": "Conservative peak-price estimate; unknown outcomes keep the reservation. Provider invoice remains authoritative."
+}
