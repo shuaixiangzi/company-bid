@@ -16,10 +16,10 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .source_clauses import build_clause_catalog
-from .table_continuations import build_table_continuations
+from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-EXTRACTION_VERSION = "requirements-window-v10"
+EXTRACTION_VERSION = "requirements-window-v11"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -56,6 +56,8 @@ class _Citation(_Strict):
     block_ids: list[Text] = Field(default_factory=list, max_length=24)
     clause_id: Text | None = Field(default=None,
         description="可选；仅technical/writing可选择source_clause_catalog的完整编号条款ID。必须逐项复制其source_id/block_id/locator/block_ids；不能自造ID、offset或截取文本。")
+    table_row_id: Text | None = Field(default=None,
+        description="表格条款优先选择source_table_row_catalog的完整行ID，并复制其source_id/block_id/locator/block_ids；跨页续行已包含在同一ID内。不得与clause_id混用、拆掉勾选/条件或用于格式章节锚点。")
 
 
 class _Requirement(_Strict):
@@ -232,6 +234,16 @@ def _clause_catalog_view(catalog: list[dict]) -> list[dict]:
             for item in catalog]
 
 
+def _table_continuation_view(proofs):
+    return [{key: proof[key] for key in ("rule", "source_id", "source_sha256", "block_ids", "continuation", "proof_sha256")}
+            for proof in proofs]
+
+
+def _table_row_view(rows):
+    return [{key: row[key] for key in ("table_row_id", "source_id", "block_id", "locator", "block_ids", "quote", "proof_sha256")}
+            for row in rows]
+
+
 def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
     limit = config.get("window_max_chars", 14000)
     block_limit = config.get("window_max_blocks", 60)
@@ -279,6 +291,7 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
         source_blocks = [block for block in blocks.values() if block["source_id"] == document["source_id"]]
         line_edges = _native_pdf_line_edges(document, source_blocks)
         table_continuations = build_table_continuations(document, source_blocks, footer_skips)
+        table_rows = build_table_row_catalog(document, source_blocks, table_continuations)
         forward_markers = _arabic_forward_markers(source_blocks)
         positions = {block["block_id"]: i for i, block in enumerate(source_blocks)}
         catalog = []
@@ -335,12 +348,14 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
             window["source_format"] = document.get("format")
             window["source_sha256"] = document["sha256"]
             window["native_pdf_line_edges"] = local_edges
-            window["source_table_continuations"] = [proof for proof in table_continuations
-                                                     if set(proof["block_ids"]) <= local_ids]
+            window["source_table_continuations"] = _table_continuation_view([proof for proof in table_continuations
+                                                     if set(proof["block_ids"]) <= local_ids])
+            window["source_table_row_catalog"] = _table_row_view([row for row in table_rows
+                if set(row["block_ids"]) <= local_ids and target_ids.intersection(row["block_ids"])])
             window["context_boundary_decisions"] = decisions
             window["source_clause_catalog"] = _clause_catalog_view(build_clause_catalog(window))
             context = [adjacent, catalog, local_skips, local_edges, window["source_format"], window["source_sha256"], decisions,
-                       window["source_clause_catalog"], window["source_table_continuations"]]
+                       window["source_clause_catalog"], window["source_table_continuations"], window["source_table_row_catalog"]]
             window["context_identity"] = {"context_id": _id("CONTEXT-", context), "sha256": _hash(context),
                                           "scope": "citation_context_only_not_reviewed_window_denominator"}
             window["source_heading_catalog"] = catalog
@@ -592,21 +607,46 @@ def _guard_heading_only_requirement(requirement, available, safe_skips):
 
 
 def _citation(citation: dict, available: dict, safe_skips: dict | None = None,
-              clause_catalog: list[dict] | None = None, table_continuations: list[dict] | None = None) -> dict:
+              clause_catalog: list[dict] | None = None, table_continuations: list[dict] | None = None,
+              table_rows: list[dict] | None = None) -> dict:
     block = available.get(citation["block_id"])
     _fail(block is None or block["source_id"] != citation["source_id"] or
           block["locator"] != citation["locator"], "CITATION_LOCATION_INVALID")
     ids = citation.get("block_ids") or [citation["block_id"]]
     _fail(ids[0] != citation["block_id"] or len(set(ids)) != len(ids) or any(key not in available for key in ids), "CITATION_SPAN_ID_INVALID")
     span = [available[key] for key in ids]
+    if citation.get("table_row_id"):
+        rows = [row for row in table_rows or [] if row["table_row_id"] == citation["table_row_id"]]
+        _fail(len(rows) != 1 or bool(citation.get("clause_id")), "TABLE_ROW_ID_NOT_IN_FROZEN_CATALOG")
+        row = rows[0]
+        _fail(any(citation[key] != row[key] for key in ("source_id", "block_id", "locator")) or ids != row["block_ids"],
+              "TABLE_ROW_SOURCE_SELECTION_MISMATCH")
+        _fail(citation.get("quote") is not None and citation["quote"] != row["quote"], "TABLE_ROW_QUOTE_MISMATCH")
+        return {**citation, "quote": row["quote"], "unit_id": block["unit_id"], "page": block.get("page"),
+                "start": 0, "end": len(row["quote"]), "basis": "frozen_table_rows_tsv_v1",
+                "end_locator": span[-1]["locator"], "pages": list(dict.fromkeys(value.get("page") for value in span)),
+                "skipped_block_ids": [], "quote_sha256": row["quote_sha256"],
+                "cell_refs": copy.deepcopy(row["cell_refs"]), "table_row_parts": copy.deepcopy(row["parts"]),
+                "table_row_parents": copy.deepcopy(row["tables"]), "table_row_proof_sha256": row["proof_sha256"]}
     table_proof = None
+    kinds = {value["kind"] for value in span}
+    mixed = kinds == {"paragraph", "table"}
+    tables = [value for value in span if value["kind"] == "table"]
     if len(span) > 1:
-        if all(value["kind"] == "table" for value in span):
-            matches = [proof for proof in table_continuations or [] if proof["block_ids"] == ids]
+        if kinds == {"table"} or mixed and len(tables) > 1:
+            table_ids = [value["block_id"] for value in tables]
+            matches = [proof for proof in table_continuations or [] if proof["block_ids"] == table_ids]
             _fail(len(matches) != 1 or bool(citation.get("clause_id")), "TABLE_CONTINUATION_NOT_PROVEN")
             table_proof = matches[0]
+        if mixed:
+            _fail(bool(citation.get("clause_id")) or any(
+                value.get("text_basis") != "table_rows_tsv_v1" or
+                value.get("text") != "\n".join("\t".join(row) for row in value["rows"]) for value in tables),
+                "MIXED_CITATION_SOURCE_VIEW_INVALID")
+            _fail(any(set(proof["block_ids"]) & set(ids) and not set(proof["block_ids"]) <= set(ids)
+                      for proof in table_continuations or []), "TABLE_CONTINUATION_SELECTION_REQUIRED")
         _fail(any(value["source_id"] != block["source_id"] or
-                  (value["kind"] != "paragraph" and table_proof is None) for value in span) or
+                  (value["kind"] != "paragraph" and table_proof is None and not mixed) for value in span) or
               ids != sorted(ids, key=lambda key: available[key]["ordinal"]), "CITATION_SPAN_ORDER_INVALID")
         _fail(any(key in (safe_skips or {}) for key in ids), "CITATION_SPAN_CONTAINS_PAGE_FOOTER")
         skipped = []
@@ -616,8 +656,9 @@ def _citation(citation: dict, available: dict, safe_skips: dict | None = None,
                   any(value["block_id"] not in (safe_skips or {}) for value in between), "CITATION_SPAN_NOT_CONTIGUOUS")
             skipped.extend(value["block_id"] for value in between)
         text = "\n".join(value.get("text", "") for value in span)
-        _fail(table_proof is not None and (table_proof["quote"] != text or
-              table_proof["quote_sha256"] != hashlib.sha256(text.encode()).hexdigest()), "TABLE_CONTINUATION_PROOF_INVALID")
+        table_text = "\n".join(value["text"] for value in tables)
+        _fail(table_proof is not None and (table_proof["quote"] != table_text or
+              table_proof["quote_sha256"] != hashlib.sha256(table_text.encode()).hexdigest()), "TABLE_CONTINUATION_PROOF_INVALID")
         _fail(not citation.get("clause_id") and citation.get("quote") is not None and citation["quote"] != text,
               "CITATION_SPAN_MUST_QUOTE_ALL_BLOCKS")
     else:
@@ -649,12 +690,25 @@ def _citation(citation: dict, available: dict, safe_skips: dict | None = None,
     if clause:
         result.update(basis="frozen_clause_span_v1", start=clause["start"], end=clause["end"],
                       clause_proof_sha256=clause["proof_sha256"], parent_quote_sha256=clause["parent_quote_sha256"])
-    if table_proof:
-        result.update(basis="consecutive_native_tables_tsv_v1",
-                      table_continuation_proof_sha256=table_proof["proof_sha256"],
+    if mixed or table_proof:
+        result.update(basis="consecutive_mixed_blocks_lf_v1" if mixed else "consecutive_native_tables_tsv_v1",
                       cell_refs=[{"block_id": value["block_id"], "row": r, "column": c}
-                                 for value in span for r, row in enumerate(value["rows"])
+                                 for value in tables for r, row in enumerate(value["rows"])
                                  for c, cell in enumerate(row) if cell])
+        if table_proof:
+            result["table_continuation_proof_sha256"] = table_proof["proof_sha256"]
+        if mixed:
+            cursor, parts = 0, []
+            for value in span:
+                end = cursor + len(value["text"])
+                part = {"block_id": value["block_id"], "kind": value["kind"], "locator": value["locator"],
+                        "quote_start": cursor, "quote_end": end, "text_sha256": hashlib.sha256(value["text"].encode()).hexdigest(),
+                        "text_basis": value.get("text_basis", "native_block_text_v1")}
+                if value["kind"] == "table":
+                    part["grid_sha256"] = _hash({key: value.get(key, []) for key in ("rows", "merges", "column_widths", "header_rows")})
+                parts.append(part)
+                cursor = end + 1
+            result["block_parts"] = parts
     elif block.get("text_basis") == "table_rows_tsv_v1":
         offset, cells = 0, []
         for r, row in enumerate(block["rows"]):
@@ -720,8 +774,8 @@ def _require_proven_table_tails(window: dict, proofs: list[dict]) -> None:
         raise PlanningError("TABLE_CONTINUATION_UNPROVEN", {"field": "source_table_continuations", "block_ids": unresolved})
 
 
-def _validate_window(raw: dict, window: dict) -> dict:
-    data = _validate_response_schema(raw, _WindowResponse)
+def _window_source_catalogs(window: dict):
+    """Rebuild source evidence before paying for inference and when consuming it."""
     targets = {b["block_id"]: b for b in window["blocks"]}
     available = {b["block_id"]: b for b in [*window["blocks"], *window.get("adjacent_context", [])]}
     safe_skips = {row["block_id"]: row for row in window.get("safe_skip_blocks", [])}
@@ -729,9 +783,19 @@ def _validate_window(raw: dict, window: dict) -> dict:
     table_continuations = build_table_continuations(
         {"source_id": window["source_id"], "sha256": window.get("source_sha256"), "format": window.get("source_format")},
         sorted(available.values(), key=lambda block: block["ordinal"]), safe_skips)
-    _fail(window.get("source_table_continuations", []) != table_continuations, "WINDOW_TABLE_CONTINUATIONS_MISMATCH")
+    _fail(window.get("source_table_continuations", []) != _table_continuation_view(table_continuations), "WINDOW_TABLE_CONTINUATIONS_MISMATCH")
     _require_proven_table_tails(window, table_continuations)
+    table_rows = [row for row in build_table_row_catalog(
+        {"source_id": window["source_id"], "sha256": window.get("source_sha256"), "format": window.get("source_format")},
+        list(available.values()), table_continuations) if set(row["block_ids"]) & set(targets)]
+    _fail(window.get("source_table_row_catalog", []) != _table_row_view(table_rows), "WINDOW_TABLE_ROW_CATALOG_MISMATCH")
     _fail(window.get("source_clause_catalog", []) != _clause_catalog_view(clause_catalog), "WINDOW_CLAUSE_CATALOG_MISMATCH")
+    return targets, available, safe_skips, clause_catalog, table_continuations, table_rows
+
+
+def _validate_window(raw: dict, window: dict) -> dict:
+    data = _validate_response_schema(raw, _WindowResponse)
+    targets, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
     _fail(len(set(data["reviewed_block_ids"])) != len(data["reviewed_block_ids"]) or
           set(data["reviewed_block_ids"]) != set(targets), "WINDOW_BLOCK_DENOMINATOR_MISMATCH")
     titles = {chapter["title"] for chapter in data["format_chapters"]} | {row["title"] for row in window.get("source_heading_catalog", [])}
@@ -743,9 +807,10 @@ def _validate_window(raw: dict, window: dict) -> dict:
                   (requirement["category"] != "technical" or requirement["response_mode"] != "writing"),
                   "CLAUSE_RESPONSE_MODE_INVALID")
             selected_ids = requirement["citation"]["block_ids"] or [requirement["citation"]["block_id"]]
-            _fail(len(selected_ids) == 1 and any(selected_ids[0] in proof["block_ids"] for proof in table_continuations),
+            _fail(not requirement["citation"].get("table_row_id") and len(selected_ids) == 1 and
+                  any(selected_ids[0] in proof["block_ids"] for proof in table_continuations),
                   "TABLE_CONTINUATION_SELECTION_REQUIRED")
-            requirement["citation"] = _citation(requirement["citation"], available, safe_skips, clause_catalog, table_continuations)
+            requirement["citation"] = _citation(requirement["citation"], available, safe_skips, clause_catalog, table_continuations, table_rows)
             if requirement["category"] == "technical" and requirement["response_mode"] == "writing":
                 _guard_clause_selection(requirement["citation"], available, clause_catalog)
             quote = requirement["citation"]["quote"]
@@ -763,6 +828,7 @@ def _validate_window(raw: dict, window: dict) -> dict:
     for index, chapter in enumerate(data["format_chapters"]):
         try:
             _fail(bool(chapter["citation"].get("clause_id")), "FORMAT_CLAUSE_SELECTION_FORBIDDEN")
+            _fail(bool(chapter["citation"].get("table_row_id")), "FORMAT_TABLE_ROW_SELECTION_FORBIDDEN")
             _fail(chapter["citation"]["block_id"] not in targets, "FORMAT_ANCHOR_OUTSIDE_REVIEW_WINDOW")
             chapter["citation"] = _citation(chapter["citation"], available, safe_skips)
             if chapter["title"] not in chapter["citation"]["quote"]:
@@ -972,14 +1038,16 @@ _EXTRACT_INSTRUCTIONS = (
     "应用将完整复制冻结源块，不补选遗漏块，不修改任何原字。选择时必须完整保留条款前置条件、否定、金额、例外及其续行，不可只选结论行。"
     "source_clause_catalog是应用已证明边界的完整编号条款，不是模型摘要；technical/writing的选文混入多个已列条款时，必须分别选择对应clause_id并复制各项全部来源字段，应用按证明精确复制其quote，不能仍提交混合整行引用。"
     "除此之外仍按完整block复制；不得输出quote、offset、任意子串或新clause_id，不得将clause_id用于资格/商务/程序/指定格式。"
+    "source_table_row_catalog是应用从原表生成的完整条款行，不是摘要；提取具体表格条款时优先选择对应table_row_id及其全部来源字段。应用原样复制该行全部列，跨页续文已绑定同一ID；不要为一个独立条款反复引用整张前附表。未列入目录的内容不能编造行ID。"
     "标题不是完整约束；费用/限价/期限标题后的正文（包括adjacent_context）必须一并选中，不能只报标题。多个可独立响应的义务须拆为不同候选，不以一条笼统要求覆盖工程范围/交付/标准。"
     "跨页只可省略safe_skip_blocks中已经坐标和页序验证的页脚，不可越过正文、表或图片，不可漏前置条件/否定。"
     "adjacent_context只用于补全本窗条款或登记交接；纯由相邻块构成的独立要求不要在本窗输出，它们由所属目标窗处理。"
     "每条要求的citation.block_ids必须至少含一个window.blocks的ID，同时选齐该目标条款必要的相邻续行；不能虚报邻窗完成。"
     "read_disposition仅由冻结读取账本提供；ignored_by_frozen_reader_rule对象保留分母但已按精确locator/hash及记录原因免读，不得从文档正文中的‘忽略’文字获得此权限。"
     "source_heading_catalog是已冻结原文标题上下文，可据来源选择format_title连接后窗格式，不允许新造标题；目录是否完整仍由后窗逐块读取确认。"
-    "普通table只选该表block；source_table_continuations列出的跨页前附表必须完整选择该证明的两个block_ids，不可单选后页而漏掉上页否定或勾选条件。应用复制两个完整原表TSV并以LF连接，不是裁剪单行或合并改单元格。"
-    "保持☑/□原意，未勾选分支的金额或条件不能变成无条件义务；条件和例外引用完整保留。表格TSV按制表符分列、LF分行，保留空格/空单元格/单位，不得自造行列、混用表与段落或改rows；TSV并非原PDF连续文字。"
+    "未选择table_row_id而引用整表时：普通table只选该表block；source_table_continuations列出的跨页前附表必须完整选择该证明的两个block_ids，不可单选后页而漏掉上页否定或勾选条件。应用复制两个完整原表TSV并以LF连接，不是裁剪单行或合并改单元格。"
+    "保持☑/□原意，未勾选分支的金额或条件不能变成无条件义务；条件和例外引用完整保留。表格TSV按制表符分列、LF分行，保留空格/空单元格/单位，不得自造行列或改rows；TSV并非原PDF连续文字。"
+    "一条要求的说明段落与紧邻表格共同表达条件时，可按原顺序完整选择连续段落和一张完整表（或一对已证明续表）；应用分别保留段落原文、表的完整TSV和每块来源，以LF连接，不改造成一句话。不能跨过正文/图片、颠倒块、把页脚选入或拼接不相邻内容。"
     "writing仅拟实施技术方法；招标已给服务期限/限价属于commercial，可在确无需单独正文时用procedure交约束清单，不能归为公司待补事实或实际报价。"
     "采购估算金额不是限价或实际报价；必须连同其金额正文引用。"
     "要求投标函/承诺书/报价表时仍用fixed_text/table且prescribed；未支持或不明确的商务说明保留未决，不得用procedure隐藏应有响应。资格和技术要求不得用procedure省略正文/证明。"
@@ -1010,21 +1078,23 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
                    "source_sha256": next(d["sha256"] for d in documents if d["source_id"] == window["source_id"])}
 
         def execute(window=window, payload=payload):
-            if window.get("source_clause_catalog"):
-                _capture(ctx, "n2-source-clause-boundaries", {"window_id": window["window_id"],
-                    "basis": "application_generated_frozen_source", "clauses": build_clause_catalog(window)})
-            if window.get("source_table_continuations"):
-                _capture(ctx, "n2-table-continuation-proofs", {"window_id": window["window_id"],
-                    "basis": "application_generated_frozen_source", "proofs": window["source_table_continuations"]})
-            # Known unsupported continuations must stop before a paid call;
-            # an empty model answer cannot turn a detached tail into success.
+            # Deterministic source faults must stop before a paid request.
             try:
-                _require_proven_table_tails(window, window.get("source_table_continuations", []))
+                _, _, _, clauses, proofs, table_rows = _window_source_catalogs(window)
             except PlanningError as exc:
-                _capture(ctx, "n2-unproven-table-continuation", {"window_id": window["window_id"],
+                _capture(ctx, "n2-source-context-preflight", {"window_id": window["window_id"],
                     "error_code": exc.code, "diagnostic_context": exc.diagnostic_context,
                     "actual_call_started": False})
                 raise
+            if window.get("source_clause_catalog"):
+                _capture(ctx, "n2-source-clause-boundaries", {"window_id": window["window_id"],
+                    "basis": "application_generated_frozen_source", "clauses": clauses})
+            if window.get("source_table_continuations"):
+                _capture(ctx, "n2-table-continuation-proofs", {"window_id": window["window_id"],
+                    "basis": "application_generated_frozen_source", "proofs": proofs})
+            if window.get("source_table_row_catalog"):
+                _capture(ctx, "n2-table-row-proofs", {"window_id": window["window_id"],
+                    "basis": "application_generated_frozen_source", "rows": table_rows})
             processing = _window_processing_ledger(window, [])
             live_confirmation = None
             raw_model_candidate = None
@@ -1122,7 +1192,8 @@ def _wire_candidate(candidate: dict) -> dict:
             item["citation"] = {key: value for key, value in item["citation"].items()
                                 if key not in {"unit_id", "page", "start", "end", "quote_sha256", "basis", "cell_refs",
                                                "end_locator", "pages", "skipped_block_ids", "label_grounding",
-                                               "clause_proof_sha256", "parent_quote_sha256", "table_continuation_proof_sha256"}}
+                                               "clause_proof_sha256", "parent_quote_sha256", "table_continuation_proof_sha256", "block_parts",
+                                               "table_row_parts", "table_row_parents", "table_row_proof_sha256"}}
     return candidate
 
 

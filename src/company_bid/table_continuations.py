@@ -1,8 +1,8 @@
-"""Conservative source proofs for a native PDF table split across two pages.
+"""Conservative whole-table continuation and exact-row source proofs.
 
-The quote always contains both complete frozen grids. Boundary-row metadata
-only explains the join; it never activates an unchecked option, joins cells,
-or claims that unrelated rows belong to the continuing clause.
+Continuation quotes contain both complete frozen grids; row-catalog quotes
+contain only their proved complete source rows. Neither activates unchecked
+options, rewrites cells, or adds unrelated rows to a continuing clause.
 """
 from __future__ import annotations
 
@@ -157,4 +157,170 @@ def build_table_continuations(document: dict, source_blocks: list[dict], safe_sk
                                   "clause_number": left["rows"][-1][0], "clause_name": left["rows"][-1][1],
                                   "scope": "boundary_rows_only; quote_preserves_both_complete_grids"}}
         results.append({**proof, "proof_sha256": _hash(proof)})
+    return results
+
+
+def _row_parent(block: dict, source_id: str):
+    """Validate a whole grid while keeping unrelated valid merges harmless."""
+    rows, widths, merges = block.get("rows"), block.get("column_widths"), block.get("merges")
+    page, ordinal = block.get("page"), block.get("ordinal")
+    if (block.get("source_id") != source_id or block.get("kind") != "table" or
+            block.get("origin") != "native" or block.get("read_disposition") or
+            type(page) is not int or page < 1 or type(ordinal) is not int or ordinal < 0 or
+            not isinstance(block.get("block_id"), str) or not block["block_id"] or
+            not re.fullmatch(rf"pdf/page\[{page}\]/table\[\d+\]", str(block.get("locator", ""))) or
+            not isinstance(rows, list) or len(rows) < 2 or
+            any(not isinstance(row, list) or len(row) != 3 or any(not isinstance(cell, str) for cell in row) for row in rows) or
+            rows[0] != _HEADER or not isinstance(widths, list) or len(widths) != 3 or
+            any(type(width) not in (int, float) or not math.isfinite(width) or width <= 0 for width in widths) or
+            not isinstance(merges, list) or block.get("text_basis") != "table_rows_tsv_v1" or
+            not isinstance(block.get("header_rows", []), list) or
+            any(type(row) is not int or not 0 <= row < len(rows) for row in block.get("header_rows", []))):
+        return None
+    text = "\n".join("\t".join(row) for row in rows)
+    if block.get("text") != text:
+        return None
+    occupied, merged_rows = set(), set()
+    for merge in merges:
+        if not isinstance(merge, dict):
+            return None
+        r, c, rs, cs = (merge.get("row"), merge.get("column"), merge.get("row_span", 1), merge.get("col_span", 1))
+        if (any(type(value) is not int for value in (r, c, rs, cs)) or min(r, c) < 0 or
+                min(rs, cs) < 1 or rs * cs == 1 or r + rs > len(rows) or c + cs > 3 or r == 0):
+            return None
+        for row in range(r, r + rs):
+            merged_rows.add(row)
+            for column in range(c, c + cs):
+                cell = (row, column)
+                if cell in occupied or (cell != (r, c) and rows[row][column]):
+                    return None
+                occupied.add(cell)
+    metadata = {"block_id": block["block_id"], "locator": block["locator"], "page": page, "ordinal": ordinal,
+                "origin": "native", "text_basis": block["text_basis"], "text_sha256": _text_hash(text),
+                "grid_sha256": _hash({"rows": rows, "merges": merges, "column_widths": widths,
+                                      "header_rows": block.get("header_rows", [])}),
+                "row_count": len(rows), "column_widths": list(widths), "header": list(_HEADER)}
+    return metadata, merged_rows
+
+
+def _row_part(block: dict, row: int) -> dict:
+    start = sum(len("\t".join(value)) + 1 for value in block["rows"][:row])
+    quote = "\t".join(block["rows"][row])
+    cells, cursor = [], start
+    for column, value in enumerate(block["rows"][row]):
+        cells.append({"block_id": block["block_id"], "row": row, "column": column,
+                      "start": cursor, "end": cursor + len(value)})
+        cursor += len(value) + 1
+    return {"block_id": block["block_id"], "locator": block["locator"], "row": row,
+            "start": start, "end": start + len(quote), "quote": quote,
+            "quote_sha256": _text_hash(quote), "cell_refs": cells}
+
+
+def _unknown_row_tails(rows: list) -> set[int]:
+    """Do not expose a row while later empty-key conditions remain unbound.
+
+    Blank or merged separators do not prove a new clause. A later explicit
+    numeric key and label is the only supported reset; no rows are combined.
+    A leading continuation row can itself have an unsupported further tail.
+    """
+    anchor, reserved = None, set()
+    for row, values in enumerate(rows[1:], 1):
+        if _CLAUSE.fullmatch(values[0]) and values[1].strip():
+            anchor = row
+        elif not values[0].strip() and not values[1].strip() and values[2].strip():
+            if anchor is not None:
+                reserved.add(anchor)
+            elif row == 1:
+                anchor = row
+    return reserved
+
+
+def build_table_row_catalog(document: dict, source_blocks: list[dict], continuations: list[dict]) -> list[dict]:
+    """Freeze exact three-column source rows, joining only proved continuation rows.
+
+    Offsets in ``parts`` and ``cell_refs`` are relative to each original parent
+    TSV. They are application-computed evidence, never model-selected slices.
+    Unknown continuation structure still requires the caller's input guard.
+    """
+    source_id, source_hash = document.get("source_id"), document.get("sha256")
+    if (document.get("format") != "pdf" or not isinstance(source_id, str) or not source_id or
+            not isinstance(source_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", source_hash) or
+            not isinstance(source_blocks, list) or not isinstance(continuations, list) or
+            any(not isinstance(block, dict) for block in source_blocks)):
+        return []
+    body = [block for block in source_blocks if block.get("source_id") == source_id]
+    if (any(type(block.get("ordinal")) is not int or block["ordinal"] < 0 or
+            not isinstance(block.get("block_id"), str) or not block["block_id"] for block in body) or
+            len({block["block_id"] for block in body}) != len(body) or
+            len({block["ordinal"] for block in body}) != len(body)):
+        return []
+    body.sort(key=lambda block: block["ordinal"])
+    blocks = {block["block_id"]: block for block in body}
+    parents = {block["block_id"]: parent for block in body if (parent := _row_parent(block, source_id)) is not None}
+    unknown_tails = {key: _unknown_row_tails(blocks[key]["rows"]) for key in parents}
+    safe_skips, reserved = {}, set()
+    for proof in continuations:
+        if not isinstance(proof, dict):
+            continue
+        ids = proof.get("block_ids")
+        if isinstance(ids, list) and len(ids) == 2 and all(isinstance(key, str) for key in ids):
+            if ids[0] in parents:
+                reserved.add((ids[0], len(blocks[ids[0]]["rows"]) - 1))
+            reserved.add((ids[1], 1))
+        for skip in proof.get("skipped_blocks", []) if isinstance(proof.get("skipped_blocks", []), list) else []:
+            footer = skip.get("footer_proof") if isinstance(skip, dict) else None
+            if isinstance(footer, dict) and isinstance(footer.get("block_id"), str):
+                safe_skips[footer["block_id"]] = footer
+    # Rebuild from frozen metadata so a stale or fabricated row/parent proof
+    # cannot turn a half-clause into a selectable catalog entry.
+    rebuilt = build_table_continuations(document, body, safe_skips)
+    joined = {}
+    for proof in rebuilt:
+        if proof not in continuations:
+            continue
+        left_id, right_id = proof["block_ids"]
+        if left_id not in parents or right_id not in parents:
+            continue
+        left_row, right_row = proof["continuation"]["left_row"], proof["continuation"]["right_row"]
+        if (left_row in parents[left_id][1] or right_row in parents[right_id][1] or
+                left_row in unknown_tails[left_id] or right_row in unknown_tails[right_id]):
+            continue
+        joined[(left_id, left_row)] = (right_id, right_row, proof["proof_sha256"])
+    # A leading empty-key row is never an independent clause. Conservatively
+    # reserve the preceding page's last row even when its join is unproved;
+    # the caller must report that unsupported boundary rather than select half.
+    tables = [block for block in body if block["block_id"] in parents]
+    for left, right in zip(tables, tables[1:]):
+        if (right["page"] == left["page"] + 1 and right["rows"][1][:2] == ["", ""] and
+                right["rows"][1][2].strip()):
+            reserved.add((left["block_id"], len(left["rows"]) - 1))
+            reserved.add((right["block_id"], 1))
+    results = []
+    for block in tables:
+        key = block["block_id"]
+        metadata, merged_rows = parents[key]
+        for row, values in enumerate(block["rows"][1:], 1):
+            if (row in merged_rows or row in unknown_tails[key] or
+                    not _CLAUSE.fullmatch(values[0]) or not values[1].strip()):
+                continue
+            pair = joined.get((key, row))
+            if (key, row) in reserved and pair is None:
+                continue
+            parts, parent_tables = [_row_part(block, row)], [metadata]
+            if pair:
+                right_id, right_row, continuation_hash = pair
+                parts.append(_row_part(blocks[right_id], right_row))
+                parent_tables.append(parents[right_id][0])
+            quote = "\n".join(part["quote"] for part in parts)
+            ids = [table["block_id"] for table in parent_tables]
+            proof = {"rule": "native_pdf_front_matter_row_v1", "source_id": source_id, "source_sha256": source_hash,
+                     "block_id": key, "locator": block["locator"], "block_ids": ids,
+                     "quote": quote, "quote_sha256": _text_hash(quote),
+                     "parent_quote_sha256": _text_hash("\n".join(blocks[identity]["text"] for identity in ids)),
+                     "tables": parent_tables, "parts": parts,
+                     "cell_refs": [cell for part in parts for cell in part["cell_refs"]]}
+            if pair:
+                proof["continuation_proof_sha256"] = continuation_hash
+            proof_hash = _hash(proof)
+            results.append({"table_row_id": "TROW-" + proof_hash[:24], **proof, "proof_sha256": proof_hash})
     return results
