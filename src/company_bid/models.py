@@ -14,6 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# Quoted requirement text may end in a TSV delimiter for an empty source cell.
+# Reject blank-only input without trimming source bytes or changing column count.
+SourceText = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -61,7 +64,7 @@ class Fact(Contract):
 
 class Requirement(Contract):
     requirement_id: Text
-    text: Text
+    text: SourceText
     category: Literal["qualification", "technical", "commercial", "fixed_table", "procedure"]
     source_refs: list[Text] = Field(min_length=1)
     mandatory: bool = True
@@ -82,7 +85,7 @@ class ReviewAction(Contract):
     status: Literal["pending_manual", "not_checked"]
     requirement_refs: list[Text] = Field(min_length=1)
     source_refs: list[Text] = Field(min_length=1)
-    source_requirement: Text
+    source_requirement: SourceText
     instruction: Text
 
     @model_validator(mode="after")
@@ -102,7 +105,7 @@ class Issue(Contract):
     requirement_refs: list[Text] = Field(min_length=1)
     reason: Text
     action: Text
-    source_requirement: Text
+    source_requirement: SourceText
     severity: Literal["missing", "warning"] = "missing"
 
     @property
@@ -197,7 +200,7 @@ class ReferenceExcerpt(Contract):
     reference_id: Text
     source_id: Text
     locator: Text
-    text: Text
+    text: SourceText
     text_sha256: Sha256
     applicability: Text
     retained_points: list[Text] = Field(min_length=1)
@@ -228,7 +231,7 @@ class WritingTask(Contract):
     unit_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:-]{1,100}$")]
     title: Text
     objective: Text
-    must_cover: list[Text] = Field(min_length=1, max_length=30)
+    must_cover: list[SourceText] = Field(min_length=1, max_length=30)
     requirement_refs: list[Text] = Field(min_length=1)
     reference_refs: list[Text] = Field(default_factory=list)
     forbidden_fields: list[Text] = Field(min_length=1)
@@ -381,7 +384,7 @@ class HeadingBlock(BlockReferences):
 
 class ParagraphBlock(BlockReferences):
     kind: Literal["paragraph"] = "paragraph"
-    text: Text
+    text: SourceText
     content_role: Literal["proposal", "fact", "neutral"] = "neutral"
 
 
