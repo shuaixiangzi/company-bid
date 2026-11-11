@@ -113,7 +113,7 @@ def intake_nodes(root: Path, version, settings: dict):
     reading_keys = ("reading", "ocr") + (("provider",) if settings.get("ocr") is not None and "provider" not in settings["ocr"] else ())
     return [NodeSpec("N0", freeze_version, freeze, config_keys=()),
             NodeSpec("N1", parser_version, read, config_keys=reading_keys),
-            NodeSpec("N2", version(*core, "extraction.py", "provider.py", "structured.py"), extract,
+            NodeSpec("N2", version(*core, "extraction.py", "source_clauses.py", "provider.py", "structured.py"), extract,
                      config_keys=extraction_keys),
-            NodeSpec("N3", version(*core, "extraction.py", "planning.py", "material_matching.py", "slots.py", "provider.py", "structured.py"), plan,
+            NodeSpec("N3", version(*core, "extraction.py", "source_clauses.py", "planning.py", "material_matching.py", "slots.py", "provider.py", "structured.py"), plan,
                      config_keys=mapping_keys)]

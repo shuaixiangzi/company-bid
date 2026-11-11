@@ -429,8 +429,19 @@ def _trace_appendix(document, package):
                     label = f"附件 {block.attachment_id}"
                 trace(f"位置 {label}；要求 {'、'.join(block.requirement_refs) or '见所属章节'}。")
     trace("采用事实", bold=True, keep_next=True)
+    used_fact_ids = set()
+    for section in package.sections:
+        if not section.render_body:
+            continue
+        for block in section.blocks:
+            used_fact_ids.update(getattr(block, "fact_refs", []))
+            if isinstance(block, TableBlock):
+                used_fact_ids.update(ref for row in block.table.rows for cell in row for ref in cell.fact_refs)
     for fact in package.facts:
-        trace(f"{fact.fact_id} {fact.label}：{fact.value}；来源 {'、'.join(fact.source_refs)}。")
+        if fact.fact_id in used_fact_ids:
+            trace(f"{fact.fact_id} {fact.label}：{fact.value}；来源 {'、'.join(fact.source_refs)}。")
+    if not used_fact_ids:
+        trace("本次正文和表格没有采用来源事实值；未采用的资料保留在受控输入中。")
     groups = {}
     for source in package.sources:
         groups.setdefault(source.sha256, []).append(source)

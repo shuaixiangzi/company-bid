@@ -65,7 +65,13 @@ class Requirement(Contract):
     category: Literal["qualification", "technical", "commercial", "fixed_table", "procedure"]
     source_refs: list[Text] = Field(min_length=1)
     mandatory: bool = True
-    response_mode: Literal["writing", "fixed_text", "table", "attachment", "procedure"] = "writing"
+    response_mode: Literal["writing", "fixed_text", "table", "attachment", "factual_response", "procedure"] = "writing"
+
+    @model_validator(mode="after")
+    def factual_category(self):
+        if self.response_mode == "factual_response" and self.category not in {"qualification", "commercial"}:
+            raise ValueError("factual responses require a qualification or commercial category")
+        return self
 
 
 class ReviewAction(Contract):

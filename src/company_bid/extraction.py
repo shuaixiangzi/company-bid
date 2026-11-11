@@ -15,9 +15,18 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from .source_clauses import build_clause_catalog
 
-EXTRACTION_VERSION = "requirements-window-v7"
+
+EXTRACTION_VERSION = "requirements-window-v8"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
+
+# The live output contract and deterministic guard use the same combinations.
+# These rules describe response handling; they never establish company facts.
+_RESPONSE_CATEGORY_RULES = {
+    "procedure": (("procedure", "commercial"), "PROCEDURE_CLASSIFICATION_INVALID"),
+    "factual_response": (("qualification", "commercial"), "FACTUAL_RESPONSE_CLASSIFICATION_INVALID"),
+}
 
 
 Text = Annotated[str, StringConstraints(min_length=1)]
@@ -44,14 +53,16 @@ class _Citation(_Strict):
     # source_selected_output_contract() and selects locations without echoing it.
     quote: Text | None = None
     block_ids: list[Text] = Field(default_factory=list, max_length=24)
+    clause_id: Text | None = Field(default=None,
+        description="可选；仅technical/writing可选择source_clause_catalog的完整编号条款ID。必须逐项复制其source_id/block_id/locator/block_ids；不能自造ID、offset或截取文本。")
 
 
 class _Requirement(_Strict):
     citation: _Citation
     category: Literal["qualification", "technical", "commercial", "fixed_table", "procedure"] = Field(
         description="要求的业务类别；招标给定工期、限价属于commercial，不能误作公司事实。")
-    response_mode: Literal["writing", "fixed_text", "table", "attachment", "procedure"] = Field(
-        description="writing仅拟实施技术方法；指定函/承诺用fixed_text、报价原表用table；procedure只用于确无需单独正文的程序或商务约束，不能隐藏技术/资格响应。")
+    response_mode: Literal["writing", "fixed_text", "table", "attachment", "factual_response", "procedure"] = Field(
+        description="writing用于拟实施技术方法；指定函/承诺用fixed_text、报价原表用table、明确证明要求用attachment；qualification/commercial的事实条件未指定格式/附件时用factual_response，有来源事实才采用，否则待补。procedure仅限procedure/commercial且确无需单独正文，不能隐藏资格响应。")
     mandatory: bool = True
     confidence: Literal["high", "medium", "low"] = "medium"
     format_status: Literal["not_prescribed", "prescribed", "unread", "conflict"]
@@ -102,6 +113,11 @@ def source_selected_output_contract() -> dict:
     citation["properties"].pop("quote")
     citation["required"] = [key for key in citation.get("required", []) if key != "quote"]
     citation["additionalProperties"] = False
+    schema["$defs"]["_Requirement"]["allOf"] = [
+        {"if": {"properties": {"response_mode": {"const": mode}}, "required": ["response_mode"]},
+         "then": {"properties": {"category": {"enum": list(categories)}}, "required": ["category"]}}
+        for mode, (categories, _) in _RESPONSE_CATEGORY_RULES.items()
+    ]
     return schema
 
 
@@ -203,6 +219,13 @@ def _index(parsed: dict, manifest: dict) -> tuple[dict, dict, list]:
     return blocks, units, tender_documents
 
 
+def _clause_catalog_view(catalog: list[dict]) -> list[dict]:
+    # The full deterministic boundary proof is captured privately; the model
+    # needs only a stable choice, its exact source span and copied clause text.
+    return [{key: item[key] for key in ("clause_id", "source_id", "block_id", "locator", "block_ids", "quote", "proof_sha256")}
+            for item in catalog]
+
+
 def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
     limit = config.get("window_max_chars", 14000)
     block_limit = config.get("window_max_blocks", 60)
@@ -293,7 +316,9 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
             window["source_sha256"] = document["sha256"]
             window["native_pdf_line_edges"] = local_edges
             window["context_boundary_decisions"] = decisions
-            context = [adjacent, catalog, local_skips, local_edges, window["source_format"], window["source_sha256"], decisions]
+            window["source_clause_catalog"] = _clause_catalog_view(build_clause_catalog(window))
+            context = [adjacent, catalog, local_skips, local_edges, window["source_format"], window["source_sha256"], decisions,
+                       window["source_clause_catalog"]]
             window["context_identity"] = {"context_id": _id("CONTEXT-", context), "sha256": _hash(context),
                                           "scope": "citation_context_only_not_reviewed_window_denominator"}
             window["source_heading_catalog"] = catalog
@@ -471,24 +496,36 @@ def _label_grounding(requirement, available, window):
         edges[tuple(ids)] = edge
     view, offsets, removals = [], [], []
     expected = "\n".join(available[identity]["text"] for identity in selected)
+    # A catalog clause has a proved interval inside these same parent blocks.
+    # Joins remain confined to that interval; adjacent obligations cannot lend
+    # labels merely because they share a physical PDF line.
+    focused = citation.get("basis") == "frozen_clause_span_v1"
+    can_join = quote == expected or focused
     cursor = 0
     for index, identity in enumerate(selected):
         text = available[identity]["text"]
         view.extend(text); offsets.extend(range(cursor, cursor + len(text))); cursor += len(text)
         if index < len(selected) - 1:
-            edge = edges.get((identity, selected[index + 1])) if quote == expected else None
+            edge = edges.get((identity, selected[index + 1])) if can_join else None
             if edge:
                 removals.append((cursor, edge["evidence_sha256"]))
             else:
                 view.append("\n"); offsets.append(cursor)
             cursor += 1
+    if focused:
+        left, right = citation["start"], citation["end"]
+        _fail(expected[left:right] != quote, "CLAUSE_SOURCE_PROOF_INVALID")
+        selected_view = [(character, offset - left) for character, offset in zip(view, offsets) if left <= offset < right]
+        view = [character for character, _ in selected_view]
+        offsets = [offset for _, offset in selected_view]
+        removals = [(offset - left, identity) for offset, identity in removals if left < offset < right]
     joined = "".join(view)
     result = []
     for field in ("required_fact_labels", "attachment_keywords", "reference_keywords"):
         for label_index, label in enumerate(requirement[field]):
             exact = label in quote
             text = quote if exact else joined
-            if not exact and (quote != expected or label not in joined):
+            if not exact and (not can_join or label not in joined):
                 raise PlanningError("EXTRACTION_LABEL_NOT_GROUNDED", {"field": field, "label_index": label_index})
             matches, start = [], 0
             while (found := text.find(label, start)) >= 0:
@@ -522,7 +559,8 @@ def _guard_heading_only_requirement(requirement, available, safe_skips):
         raise PlanningError("HEADING_ONLY_REQUIREMENT_MISSES_CONSTRAINT", {"field": "citation", "adjacent_block_id": following[0]["block_id"]})
 
 
-def _citation(citation: dict, available: dict, safe_skips: dict | None = None) -> dict:
+def _citation(citation: dict, available: dict, safe_skips: dict | None = None,
+              clause_catalog: list[dict] | None = None) -> dict:
     block = available.get(citation["block_id"])
     _fail(block is None or block["source_id"] != citation["source_id"] or
           block["locator"] != citation["locator"], "CITATION_LOCATION_INVALID")
@@ -540,12 +578,27 @@ def _citation(citation: dict, available: dict, safe_skips: dict | None = None) -
                   any(value["block_id"] not in (safe_skips or {}) for value in between), "CITATION_SPAN_NOT_CONTIGUOUS")
             skipped.extend(value["block_id"] for value in between)
         text = "\n".join(value.get("text", "") for value in span)
-        _fail(citation.get("quote") is not None and citation["quote"] != text, "CITATION_SPAN_MUST_QUOTE_ALL_BLOCKS")
+        _fail(not citation.get("clause_id") and citation.get("quote") is not None and citation["quote"] != text,
+              "CITATION_SPAN_MUST_QUOTE_ALL_BLOCKS")
     else:
         text, skipped = block.get("text", ""), []
     # No trimming, omitted-block inference or source-ID repair is permitted.
     # A table block's text is its complete frozen rows-TSV citation view.
-    quote = text if citation.get("quote") is None else citation["quote"]
+    clause = None
+    if citation.get("clause_id"):
+        matches = [item for item in clause_catalog or [] if item["clause_id"] == citation["clause_id"]]
+        _fail(len(matches) != 1, "CLAUSE_ID_NOT_IN_FROZEN_CATALOG")
+        clause = matches[0]
+        _fail(any(citation[key] != clause[key] for key in ("source_id", "block_id", "locator")) or
+              ids != clause["block_ids"] or skipped, "CLAUSE_SOURCE_SELECTION_MISMATCH")
+        _fail(hashlib.sha256(text.encode()).hexdigest() != clause["parent_quote_sha256"] or
+              type(clause["start"]) is not int or type(clause["end"]) is not int or
+              not 0 <= clause["start"] < clause["end"] <= len(text) or
+              text[clause["start"]:clause["end"]] != clause["quote"] or
+              hashlib.sha256(clause["quote"].encode()).hexdigest() != clause["quote_sha256"],
+              "CLAUSE_SOURCE_PROOF_INVALID")
+        _fail(citation.get("quote") is not None and citation["quote"] != clause["quote"], "CLAUSE_QUOTE_MISMATCH")
+    quote = clause["quote"] if clause else text if citation.get("quote") is None else citation["quote"]
     _fail(not quote.strip() or text.count(quote) != 1, "CITATION_QUOTE_NOT_UNIQUE_EXACT")
     result = {**citation, "quote": quote, "unit_id": block["unit_id"], "page": block.get("page"),
             "start": text.index(quote), "end": text.index(quote) + len(quote),
@@ -553,6 +606,9 @@ def _citation(citation: dict, available: dict, safe_skips: dict | None = None) -
             "end_locator": span[-1]["locator"], "pages": list(dict.fromkeys(value.get("page") for value in span)),
             "skipped_block_ids": skipped,
             "quote_sha256": hashlib.sha256(quote.encode()).hexdigest()}
+    if clause:
+        result.update(basis="frozen_clause_span_v1", start=clause["start"], end=clause["end"],
+                      clause_proof_sha256=clause["proof_sha256"], parent_quote_sha256=clause["parent_quote_sha256"])
     if block.get("text_basis") == "table_rows_tsv_v1":
         offset, cells = 0, []
         for r, row in enumerate(block["rows"]):
@@ -583,11 +639,35 @@ def _validate_response_schema(raw: dict, model) -> dict:
         raise error from exc
 
 
+def _guard_clause_selection(citation: dict, available: dict, catalog: list[dict]) -> None:
+    """Do not accept mixed physical lines when separate proved items exist."""
+    if citation.get("clause_id") or not catalog:
+        return
+    selected_parts, cursor = {}, 0
+    for identity in citation.get("block_ids") or [citation["block_id"]]:
+        length = len(available[identity].get("text", ""))
+        start, end = max(0, citation["start"] - cursor), min(length, citation["end"] - cursor)
+        if start < end:
+            selected_parts[identity] = (start, end)
+        cursor += length + 1
+    overlapping = []
+    for clause in catalog:
+        for part in clause["boundary_proof"]["span_parts"]:
+            selected = selected_parts.get(part["block_id"])
+            if selected and max(selected[0], part["start"]) < min(selected[1], part["end"]):
+                overlapping.append(clause["clause_id"])
+                break
+    if len(overlapping) > 1:
+        raise PlanningError("CLAUSE_SELECTION_REQUIRED", {"field": "citation.clause_id", "clause_ids": overlapping})
+
+
 def _validate_window(raw: dict, window: dict) -> dict:
     data = _validate_response_schema(raw, _WindowResponse)
     targets = {b["block_id"]: b for b in window["blocks"]}
     available = {b["block_id"]: b for b in [*window["blocks"], *window.get("adjacent_context", [])]}
     safe_skips = {row["block_id"]: row for row in window.get("safe_skip_blocks", [])}
+    clause_catalog = build_clause_catalog(window)
+    _fail(window.get("source_clause_catalog", []) != _clause_catalog_view(clause_catalog), "WINDOW_CLAUSE_CATALOG_MISMATCH")
     _fail(len(set(data["reviewed_block_ids"])) != len(data["reviewed_block_ids"]) or
           set(data["reviewed_block_ids"]) != set(targets), "WINDOW_BLOCK_DENOMINATOR_MISMATCH")
     titles = {chapter["title"] for chapter in data["format_chapters"]} | {row["title"] for row in window.get("source_heading_catalog", [])}
@@ -595,20 +675,27 @@ def _validate_window(raw: dict, window: dict) -> dict:
         try:
             _fail(not (set(requirement["citation"]["block_ids"] or [requirement["citation"]["block_id"]]) & set(targets)),
                   "CITATION_OUTSIDE_REVIEW_WINDOW")
-            requirement["citation"] = _citation(requirement["citation"], available, safe_skips)
+            _fail(bool(requirement["citation"].get("clause_id")) and
+                  (requirement["category"] != "technical" or requirement["response_mode"] != "writing"),
+                  "CLAUSE_RESPONSE_MODE_INVALID")
+            requirement["citation"] = _citation(requirement["citation"], available, safe_skips, clause_catalog)
+            if requirement["category"] == "technical" and requirement["response_mode"] == "writing":
+                _guard_clause_selection(requirement["citation"], available, clause_catalog)
             quote = requirement["citation"]["quote"]
             _guard_heading_only_requirement(requirement, available, safe_skips)
             requirement["citation"]["label_grounding"] = _label_grounding(requirement, available, window)
             title = requirement["format_title"]
             if title is not None and title not in quote and title not in titles:
                 raise PlanningError("FORMAT_TITLE_NOT_GROUNDED", {"field": "format_title"})
-            _fail(requirement["response_mode"] == "procedure" and requirement["category"] not in {"procedure", "commercial"},
-                  "PROCEDURE_CLASSIFICATION_INVALID")
+            rule = _RESPONSE_CATEGORY_RULES.get(requirement["response_mode"])
+            if rule and requirement["category"] not in rule[0]:
+                raise PlanningError(rule[1], {"field": "response_mode"})
         except PlanningError as exc:
             raise _candidate_error(exc, requirement, "requirement", index) from None
     seen_titles = set()
     for index, chapter in enumerate(data["format_chapters"]):
         try:
+            _fail(bool(chapter["citation"].get("clause_id")), "FORMAT_CLAUSE_SELECTION_FORBIDDEN")
             _fail(chapter["citation"]["block_id"] not in targets, "FORMAT_ANCHOR_OUTSIDE_REVIEW_WINDOW")
             chapter["citation"] = _citation(chapter["citation"], available, safe_skips)
             if chapter["title"] not in chapter["citation"]["quote"]:
@@ -816,6 +903,8 @@ _EXTRACT_INSTRUCTIONS = (
     "必填unresolved_block_ids，列目标或adjacent_context尚无法处理的ID；无未决即[]。相邻未决仅交其owner目标窗，不算已完成；未知/重复/catalog-only禁止。处理声明不代表语义覆盖。"
     "引文仅选择source_id/block_id/locator和完整连续block_ids，不输出quote或摘要；block_id/locator必须为首块。单块可省略block_ids或仅列该块。"
     "应用将完整复制冻结源块，不补选遗漏块，不修改任何原字。选择时必须完整保留条款前置条件、否定、金额、例外及其续行，不可只选结论行。"
+    "source_clause_catalog是应用已证明边界的完整编号条款，不是模型摘要；technical/writing的选文混入多个已列条款时，必须分别选择对应clause_id并复制各项全部来源字段，应用按证明精确复制其quote，不能仍提交混合整行引用。"
+    "除此之外仍按完整block复制；不得输出quote、offset、任意子串或新clause_id，不得将clause_id用于资格/商务/程序/指定格式。"
     "标题不是完整约束；费用/限价/期限标题后的正文（包括adjacent_context）必须一并选中，不能只报标题。多个可独立响应的义务须拆为不同候选，不以一条笼统要求覆盖工程范围/交付/标准。"
     "跨页只可省略safe_skip_blocks中已经坐标和页序验证的页脚，不可越过正文、表或图片，不可漏前置条件/否定。"
     "adjacent_context只用于补全本窗条款或登记交接；纯由相邻块构成的独立要求不要在本窗输出，它们由所属目标窗处理。"
@@ -826,6 +915,8 @@ _EXTRACT_INSTRUCTIONS = (
     "writing仅拟实施技术方法；招标已给服务期限/限价属于commercial，可在确无需单独正文时用procedure交约束清单，不能归为公司待补事实或实际报价。"
     "采购估算金额不是限价或实际报价；必须连同其金额正文引用。"
     "要求投标函/承诺书/报价表时仍用fixed_text/table且prescribed；未支持或不明确的商务说明保留未决，不得用procedure隐藏应有响应。资格和技术要求不得用procedure省略正文/证明。"
+    "资格/商务中的公司事实条件若未指定响应格式或证明附件，用factual_response；它保留正文响应与待补，不代表已满足。"
+    "例如信用状态条件只陈述否决情形而没有要求截图时，不得自造截图、承诺书或事实值；完整保留核查时点、已解除/已移出等例外，有明确指定格式时仍关联该格式。"
     "提取所有指定响应格式章节及其原顺序content_block_ids（包括段落和表）；保留原题，不发明目录。"
     "requirement_indices是本窗口requirements的0起索引。可用format_title连接同名格式章节。"
     "required_fact_labels仅公司/项目待填事实（如公司注册地址、明确报价输入），不能列招标已给工程量/方法/周期/限价/标准；没有待填事实即为空。"
@@ -850,6 +941,9 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
                    "source_sha256": next(d["sha256"] for d in documents if d["source_id"] == window["source_id"])}
 
         def execute(window=window, payload=payload):
+            if window.get("source_clause_catalog"):
+                _capture(ctx, "n2-source-clause-boundaries", {"window_id": window["window_id"],
+                    "basis": "application_generated_frozen_source", "clauses": build_clause_catalog(window)})
             processing = _window_processing_ledger(window, [])
             live_confirmation = None
             raw_model_candidate = None
@@ -946,7 +1040,8 @@ def _wire_candidate(candidate: dict) -> dict:
         if isinstance(item.get("citation"), dict):
             item["citation"] = {key: value for key, value in item["citation"].items()
                                 if key not in {"unit_id", "page", "start", "end", "quote_sha256", "basis", "cell_refs",
-                                               "end_locator", "pages", "skipped_block_ids", "label_grounding"}}
+                                               "end_locator", "pages", "skipped_block_ids", "label_grounding",
+                                               "clause_proof_sha256", "parent_quote_sha256"}}
     return candidate
 
 

@@ -13,6 +13,7 @@ from pydantic import Field
 
 from .models import PreparedBid, SourceRef
 from .slots import has_fill_marker, whole_cell_slot
+from .source_clauses import build_clause_catalog
 from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
@@ -55,6 +56,7 @@ _MODEL_DENY = re.compile(r"报价|金额|价格|税|联系人|电话|手机|代�
 
 
 _VOLATILE = re.compile(r"报价|投标价|响应价|总价|单价|价款|价格|金额|税|费用|费率|成本|万元|人民币|[（(]元[）)]|[￥¥]|(?:人工|材料|机械|服务|交通|管理|运输)费|联系人|项目经理|被授权|签字|盖章|投标日期")
+_CURRENT_ELIGIBILITY_STATUS = re.compile(r"经营异常|失信|信用中国|信用信息公示|信用(?:状态|记录)|信誉")
 
 
 def _normal(label: str) -> str:
@@ -66,7 +68,7 @@ def _title_key(title: str) -> str:
 
 
 def _wire_citation(citation: dict) -> dict:
-    return {key: citation[key] for key in ("source_id", "block_id", "locator", "quote", "block_ids") if key in citation}
+    return {key: citation[key] for key in ("source_id", "block_id", "locator", "quote", "block_ids", "clause_id") if key in citation}
 
 
 def _writing_space(detail: dict, chapter: dict, blocks: dict) -> list:
@@ -141,9 +143,9 @@ def _fact_index(manifest: dict) -> list:
     return facts
 
 
-def _label_facts(label: str, facts: list, sources: dict, source_roles: dict) -> list:
+def _label_facts(label: str, facts: list, sources: dict, source_roles: dict, *, require_project_input: bool = False) -> list:
     candidates = [fact for fact in facts if _canonical(fact["label"]) == _canonical(label)]
-    if _VOLATILE.search(label):
+    if require_project_input or _VOLATILE.search(label):
         candidates = [fact for fact in candidates if all(sources.get(ref, {}).get("kind") == "manual_input" and
                                                         sources.get(ref, {}).get("provenance") != "derived_from_bid" and
                                                         source_roles.get(ref) == "project_supplement"
@@ -382,6 +384,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     expected_requirements, expected_formats = _merge_results(verified_results)
     _fail(expected_requirements != extracted.get("requirements") or expected_formats != extracted.get("format_chapters"),
           "EXTRACTION_MERGE_MISMATCH")
+    clause_by_id = {}
+    for window in windows:
+        for clause in build_clause_catalog(window):
+            _fail(clause["clause_id"] in clause_by_id and clause_by_id[clause["clause_id"]] != clause,
+                  "CLAUSE_CATALOG_ID_CONFLICT")
+            clause_by_id[clause["clause_id"]] = clause
 
     input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": manifest,
                   "parsed_hash": _hash(parsed), "config": config}
@@ -416,7 +424,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                    for citation in requirement["citations"]):
                 format_errors.append({"reason": "requirement_anchor_is_page_footer", "requirement_id": requirement["requirement_id"]})
             unresolved = requirement["format_status"] in {"unread", "conflict"}
-            needs_format = requirement["format_status"] == "prescribed" or requirement["response_mode"] in {"table", "fixed_text"}
+            needs_format = (requirement["format_status"] == "prescribed" or requirement["response_mode"] in {"table", "fixed_text"} or
+                            requirement["response_mode"] == "factual_response" and bool(requirement.get("format_title")))
             matching_formats = [chapter for chapter in planned_formats if requirement["requirement_id"] in chapter["requirement_refs"] or
                                 _title_key(requirement.get("format_title") or "") == _title_key(chapter["title"])]
             located = bool(matching_formats)
@@ -424,6 +433,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 located = any(blocks[key]["kind"] == "table" for chapter in matching_formats for key in chapter["content_block_ids"])
             elif requirement["response_mode"] == "fixed_text":
                 located = any(blocks[key]["kind"] == "paragraph" and blocks[key].get("text", "").strip() != chapter["title"].strip()
+                              for chapter in matching_formats for key in chapter["content_block_ids"])
+            elif requirement["response_mode"] == "factual_response" and needs_format:
+                located = any(blocks[key]["kind"] == "table" or
+                              (key != chapter["citation"]["block_id"] and blocks[key]["kind"] == "paragraph" and
+                               bool(blocks[key].get("text", "").strip()) and
+                               _title_key(blocks[key]["text"]) != _title_key(chapter["title"]))
                               for chapter in matching_formats for key in chapter["content_block_ids"])
             if unresolved or (needs_format and not located):
                 format_errors.append({"reason": "required_response_format_unresolved", "requirement_id": requirement["requirement_id"],
@@ -448,9 +463,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         table_owners, attachment_owners, section_formats = {}, {}, {}
         placements, table_reports, attachment_reports = [], [], []
         writing_space_reports = []
+        factual_response_reports = []
 
         def scoped_source(citation):
-            checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks))
+            checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks), list(clause_by_id.values()))
             source_id = _id("SCOPE-", checked)
             if source_id not in source_map:
                 parent = source_map[checked["source_id"]]
@@ -492,6 +508,31 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                      "source_requirement": "；".join(details[ref]["text"] for ref in refs), "severity": "missing"}
             issues.append(value)
             return value["issue_id"]
+
+        def adopt_facts_or_mark_missing(section, rid, detail):
+            labels = detail.get("required_fact_labels", [])
+            current_status = (detail["response_mode"] == "factual_response" and
+                              bool(_CURRENT_ELIGIBILITY_STATUS.search(detail["text"])))
+            decisions = []
+            for label in labels:
+                matches = _label_facts(label, facts, source_map, manifest.get("source_roles", {}),
+                                       require_project_input=current_status)
+                decisions.append({"label": label,
+                    "candidate_fact_ids": [fact["fact_id"] for fact in facts if _canonical(fact["label"]) == _canonical(label)],
+                    "adopted_fact_ids": [matches[0]["fact_id"]] if matches else [],
+                    "status": "source_fact_selected_for_review" if matches else "missing_unique_eligible_fact"})
+                if matches:
+                    if matches[0]["fact_id"] not in section["fact_refs"]:
+                        section["fact_refs"].append(matches[0]["fact_id"])
+                else:
+                    issue(section, [rid], label + "待补", "冻结资料中无唯一、可采用的明确事实值。", "补充该字段原件或本项目明确输入。")
+            if not labels:
+                issue(section, [rid], "事实响应资料待完善", "该要求不是可自由起草的技术方法，且无明确可填字段。", "补充有来源的事实或指定响应格式。")
+            if detail["response_mode"] == "factual_response":
+                factual_response_reports.append({"requirement_id": rid, "section_id": section["section_id"],
+                    "adoption_policy": "explicit_project_status_input_required" if current_status else "source_backed_unique_fact",
+                    "semantic_review": "requires_source_review", "decisions": decisions,
+                    "status": "no_fact_labels_pending_manual" if not labels else "facts_checked_for_eligibility"})
 
         def new_section(identity, title, refs, level=1, source_refs=None):
             section = {"section_id": _id("SEC-", identity), "title": title, "kind": "facts",
@@ -623,6 +664,14 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                         "section_format_status": detail["format_status"], "task_body_format_status": "not_prescribed",
                         "decision": "grounded_open_body_in_prescribed_section" if evidence else "no_prescribed_body_after_complete_extraction",
                         "source_refs": evidence_refs, "citations": evidence})
+                elif mode == "factual_response":
+                    _fail(detail["category"] not in {"qualification", "commercial"}, "FACTUAL_RESPONSE_CATEGORY_INVALID")
+                    # Preserve the complete condition, including time and
+                    # exceptions, as a source rule rather than a company claim.
+                    requirement = next(item for item in requirements if item["requirement_id"] == rid)
+                    section["fixed_content"].append({"kind": "paragraph", "text": "响应要求（招标原文）：\n" + detail["text"],
+                                                     "source_refs": requirement["source_refs"]})
+                    adopt_facts_or_mark_missing(section, rid, detail)
                 elif mode == "attachment":
                     keywords = detail.get("attachment_keywords", [])
                     matches = [item for item in manifest.get("attachments", []) if keywords and
@@ -663,16 +712,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     if not section["fixed_content"]:
                         issue(section, [rid], "指定响应格式未定位", "要求需要原文格式，但没有通过引用校验的格式内容。", "补充并定位指定格式，不能改为自由写作。")
                 else:
-                    labels = detail.get("required_fact_labels", [])
-                    for label in labels:
-                        matches = _label_facts(label, facts, source_map, manifest.get("source_roles", {}))
-                        if matches:
-                            if matches[0]["fact_id"] not in section["fact_refs"]:
-                                section["fact_refs"].append(matches[0]["fact_id"])
-                        else:
-                            issue(section, [rid], label + "待补", "冻结资料中无唯一、可采用的明确事实值。", "补充该字段原件或本项目明确输入。")
-                    if not labels:
-                        issue(section, [rid], "事实响应资料待完善", "该要求不是可自由起草的技术方法，且无明确可填字段。", "补充有来源的事实或指定响应格式。")
+                    adopt_facts_or_mark_missing(section, rid, detail)
             if section["writing_tasks"]:
                 # Structural obligations/fixed items are already represented by
                 # fixed_content; the existing task contract demands exact cover.
@@ -694,6 +734,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
+                  "factual_responses": factual_response_reports,
                   "review_actions": review_actions,
                   "counts": {"requirements": len(requirements), "sections": len(sections), "writing_tasks": sum(len(s["writing_tasks"]) for s in sections),
                              "tables": len(tables), "attachments": len(attachments), "issues": len(issues),

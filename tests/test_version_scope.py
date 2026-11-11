@@ -10,6 +10,7 @@ from company_bid.pipeline import build_executor
     ("planning.py", {"N3"}),
     ("slots.py", {"N3"}),
     ("extraction.py", {"N2", "N3"}),
+    ("source_clauses.py", {"N2", "N3"}),
     ("material_matching.py", {"N3"}),
 ])
 def test_local_code_change_invalidates_only_nodes_that_consume_it(tmp_path, monkeypatch, changed_file, affected):
