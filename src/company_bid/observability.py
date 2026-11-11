@@ -33,6 +33,7 @@ _SAFE_METADATA = {"run_id", "job_attempt_id", "node_key", "node_attempt_id", "un
                   "duration_ms", "elapsed_ms", "wait_ms", "count", "size_bytes", "input_tokens", "output_tokens", "total_tokens", "cost", "usage_status", "validation_status",
                   "retry_reason", "reused_from_run_id", "capture_status", "attempt_number", "phase", "operation", "http_status"}
 _TOKEN_VALUE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,160}$")
+_KEY_TOKEN = re.compile(r"\b(?:sk-|oc_sk_)[A-Za-z0-9_-]{12,}")
 
 
 def redact_payload(value: Any) -> Any:
@@ -72,7 +73,7 @@ def redact_payload(value: Any) -> Any:
             for secret in sorted(secrets, key=len, reverse=True):
                 item = item.replace(secret, "[REDACTED]")
             item = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", item)
-            item = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}", "[REDACTED]", item)
+            item = _KEY_TOKEN.sub("[REDACTED]", item)
 
             def clean_url(match: re.Match) -> str:
                 try:
@@ -99,7 +100,7 @@ def safe_metadata(value: dict | None) -> dict:
             continue
         if item is None or isinstance(item, (bool, int, float)):
             result[key] = item
-        elif isinstance(item, str) and _TOKEN_VALUE.fullmatch(item) and "?" not in item:
+        elif isinstance(item, str) and _TOKEN_VALUE.fullmatch(item) and "?" not in item and not _KEY_TOKEN.search(item):
             result[key] = item
     return result
 

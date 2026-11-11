@@ -6,6 +6,14 @@ from company_bid.observability import redact_payload, safe_metadata
 from company_bid.runtime import Executor, NodeSpec
 
 
+def test_opencode_credential_prefix_is_redacted_even_without_a_named_secret_field():
+    key = "oc_sk_SYNTHETIC_ONLY_never_a_real_credential_012345"
+    value = redact_payload({"note": "echo=" + key, key: "synthetic field name"})
+    assert key not in json.dumps(value)
+    assert "[REDACTED]" in value["note"]
+    assert safe_metadata({"provider_request_id": key, "model": "deepseek-v4.1-flash"}) == {"model": "deepseek-v4.1-flash"}
+
+
 def test_secret_and_source_canaries_absent_from_events_spans_and_error(tmp_path):
     source = "SOURCE_CANARY_PRIVATE_BID"
     secret = "SECRET_CANARY_CREDENTIAL"

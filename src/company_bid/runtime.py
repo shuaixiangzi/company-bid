@@ -62,6 +62,20 @@ class ProviderUsagePersistenceError(ProviderBudgetPersistenceError):
     code = "PROVIDER_USAGE_PERSIST_FAILED"
 
 
+class ProviderPolicyPersistenceError(ProviderBudgetPersistenceError):
+    code = "PROVIDER_POLICY_PERSIST_FAILED"
+
+
+PROVIDER_POLICY_STOP_CODES = frozenset({"PROVIDER_SUBSCRIPTION_BILLING_REQUIRED",
+    "PROVIDER_BILLING_UNVERIFIED", "PROVIDER_BILLING_INVALID"})
+
+
+class ProviderPolicyStopError(RuntimeContractError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
 def _budget_decimal(value, *, positive=False) -> Decimal:
     try:
         result = Decimal(str(value))
@@ -134,16 +148,31 @@ def call_budget_summary(budget: dict) -> dict:
             if (type(budget["reservation_count"]) is not int or budget["reservation_count"] != len(seen) or
                     len(seen) > budget["max_run_calls"] or _budget_decimal(budget["reserved_upper_usd"]) != original):
                 raise ValueError
-            if budget.get("stop_reason") not in (None, "usage_exceeds_reservation", "usage_persistence_failed", "reservation_persistence_failed"):
+            if budget.get("stop_reason") not in (None, "usage_exceeds_reservation", "usage_persistence_failed", "reservation_persistence_failed",
+                                                 "provider_policy_stop", "provider_policy_persistence_failed"):
                 raise ValueError
+            stop = budget.get("provider_stop")
+            if budget.get("stop_reason") in {"provider_policy_stop", "provider_policy_persistence_failed"} and not isinstance(stop, dict):
+                raise ValueError
+            if stop is not None:
+                if (not isinstance(stop, dict) or stop.get("code") not in PROVIDER_POLICY_STOP_CODES or
+                        type(stop.get("call_attempt")) is not int or
+                        (stop.get("call_id"), stop.get("call_attempt")) not in seen or
+                        not isinstance(stop.get("response_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", stop["response_sha256"])):
+                    raise ValueError
+                stopped_attempt = next(item for item in budget["reservations"] if
+                                       (item["call_id"], item["call_attempt"]) == (stop["call_id"], stop["call_attempt"]))
+                if stopped_attempt.get("response_sha256", stop["response_sha256"]) != stop["response_sha256"]:
+                    raise ValueError
         except (KeyError, TypeError, ValueError, ProviderUsageSettlementError) as exc:
             raise ProviderBudgetLedgerError("The attempt budget ledger is inconsistent.") from exc
     return {"ledger_status": "available" if budget else "not_started", "original_reserved_upper_usd": str(original),
             "known_usage_cost_estimate_usd": str(known), "unknown_reserved_upper_usd": str(unknown),
             "effective_budget_charge_usd": str(known + unknown), "reservation_count": len(seen),
             "known_usage_estimate_count": settled_count, "unknown_reservation_count": unknown_count,
-            "budget_stopped": bool(budget.get("stop_reason") or overruns),
-            "stop_reason": budget.get("stop_reason") or ("usage_exceeds_reservation" if overruns else None),
+            "budget_stopped": bool(budget.get("stop_reason") or budget.get("provider_stop") or overruns),
+            "stop_reason": budget.get("stop_reason") or ("provider_policy_stop" if budget.get("provider_stop") else
+                           "usage_exceeds_reservation" if overruns else None),
             "cost_basis": "known_usage_estimates_plus_unknown_upper_reservations", "cost_is_provider_invoice": False}
 
 
@@ -249,7 +278,7 @@ class NodeContext:
     def read_artifact(self, reference: dict) -> bytes:
         return self.executor.store.read_bytes(reference)
 
-    def _commit_call_budget(self, budget: dict, *, settling: bool = False) -> None:
+    def _commit_call_budget(self, budget: dict, *, settling: bool = False, policy_stop: bool = False) -> None:
         # Preserve node/unit/attempt object identities. Only adopt a changed
         # budget after its independent state copy was durably saved.
         candidate = copy.deepcopy(self._state)
@@ -257,7 +286,10 @@ class NodeContext:
         try:
             self.executor._save(candidate)
         except Exception as exc:
-            self._state["call_budget"]["stop_reason"] = "usage_persistence_failed" if settling else "reservation_persistence_failed"
+            self._state["call_budget"]["stop_reason"] = ("provider_policy_persistence_failed" if policy_stop else
+                                                         "usage_persistence_failed" if settling else "reservation_persistence_failed")
+            if policy_stop:
+                self._state["call_budget"]["provider_stop"] = copy.deepcopy(budget["provider_stop"])
             if settling:
                 for old in self._state["call_budget"]["reservations"]:
                     proposed = next((item for item in budget["reservations"] if item["call_id"] == old["call_id"] and
@@ -265,7 +297,7 @@ class NodeContext:
                     if proposed and proposed.get("settlement_status") == "known_usage_cost_estimate" and old.get("settlement_status") != "known_usage_cost_estimate":
                         old["uncommitted_usage_observation"] = {key: copy.deepcopy(proposed[key]) for key in
                             ("usage", "response_sha256", "known_usage_cost_estimate_usd", "usage_recorded_at", "exceeds_reserved_upper")}
-            error = ProviderUsagePersistenceError if settling else ProviderBudgetPersistenceError
+            error = ProviderPolicyPersistenceError if policy_stop else ProviderUsagePersistenceError if settling else ProviderBudgetPersistenceError
             raise error("The budget write failed; admission remains stopped with the prior full charge.") from exc
         self._state["call_budget"] = candidate["call_budget"]
         for key in ("revision", "updated_at", "storage_write_retries"):
@@ -297,6 +329,8 @@ class NodeContext:
         if any(item["call_id"] == call_id and item["call_attempt"] == call_attempt for item in budget["reservations"]):
             raise ProviderBudgetError("This actual call attempt was already reserved; reconcile before retrying.")
         totals = call_budget_summary(budget)
+        if budget.get("provider_stop"):
+            raise ProviderPolicyStopError(budget["provider_stop"]["code"])
         if (totals["budget_stopped"] or budget["reservation_count"] + 1 > max_run_calls or
                 Decimal(totals["effective_budget_charge_usd"]) + estimate > limit):
             raise ProviderBudgetError("The local run provider budget is exhausted.")
@@ -321,6 +355,35 @@ class NodeContext:
         self._commit_call_budget(changed)
         self.call_event("call.reserved", {"call_id": call_id, "call_attempt": call_attempt,
                                           "count": changed["reservation_count"]})
+
+    def stop_provider_calls(self, code: str, *, call_id: str, call_attempt: int, response_sha256: str) -> None:
+        """Latch a confirmed transport-policy stop without altering usage charges."""
+        budget = self._state.get("call_budget", {})
+        call_budget_summary(budget)
+        if (not isinstance(code, str) or code not in PROVIDER_POLICY_STOP_CODES or
+                not isinstance(call_id, str) or type(call_attempt) is not int or not isinstance(response_sha256, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", response_sha256)):
+            raise ProviderBudgetLedgerError("Invalid provider stop identity.")
+        matches = [item for item in budget.get("reservations", []) if item["call_id"] == call_id and item["call_attempt"] == call_attempt]
+        if (len(matches) != 1 or matches[0]["node_key"] != self.node_key or matches[0]["node_attempt_id"] != self.attempt_id or
+                (self._active_unit.get("unit_id") is not None and matches[0].get("unit_id") != self._active_unit["unit_id"]) or
+                matches[0].get("unit_attempt_id") != self._active_unit.get("unit_attempt_id") or
+                matches[0].get("response_sha256", response_sha256) != response_sha256):
+            raise ProviderBudgetLedgerError("Provider stop must bind its actual reserved attempt.")
+        value = {"code": code, "call_id": call_id, "call_attempt": call_attempt, "response_sha256": response_sha256}
+        existing = budget.get("provider_stop")
+        if existing is not None:
+            if existing != value:
+                raise ProviderBudgetLedgerError("A recorded provider stop cannot change.")
+            return
+        changed = copy.deepcopy(budget)
+        changed["provider_stop"] = value
+        if not changed.get("stop_reason"):
+            changed["stop_reason"] = "provider_policy_stop"
+        call_budget_summary(changed)
+        self._commit_call_budget(changed, policy_stop=True)
+        self.call_event("call.policy_stopped", {"call_id": call_id, "call_attempt": call_attempt,
+                                                "error_code": code, "output_hash": response_sha256})
 
     def settle_call_usage(self, call_id: str, call_attempt: int, input_tokens: int, output_tokens: int,
                           total_tokens: int, *, response_sha256: str, unit_id: str | None = None) -> dict:
