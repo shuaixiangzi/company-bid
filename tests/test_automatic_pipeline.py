@@ -51,7 +51,7 @@ def test_complete_chain_preserves_original_grid_and_trace_and_rerenders_without_
         if data.get("task_type") == "extract_requirements":
             blocks = data["window"]["blocks"]
             def cite(block):
-                return {key: block[key] for key in ("source_id", "block_id", "locator")} | {"quote": block["text"]}
+                return {key: block[key] for key in ("source_id", "block_id", "locator")}
             heading = next(b for b in blocks if b["text"] == "一 公司基本情况表")
             grid = next(b for b in blocks if b["kind"] == "table")
             requirements = []

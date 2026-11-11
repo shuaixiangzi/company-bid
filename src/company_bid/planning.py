@@ -472,6 +472,19 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             requirements.append(requirement)
             details[raw["requirement_id"]] = raw
 
+        review_actions = []
+        for requirement in requirements:
+            if requirement["response_mode"] != "procedure":
+                continue
+            commercial = requirement["category"] == "commercial"
+            review_actions.append({"action_id": _id("RA-", requirement["requirement_id"]),
+                "kind": "commercial_constraint" if commercial else "procedure",
+                "status": "not_checked" if commercial else "pending_manual",
+                "requirement_refs": [requirement["requirement_id"]], "source_refs": requirement["source_refs"],
+                "source_requirement": requirement["text"],
+                "instruction": "按来源规则核对本项目明确输入；尚未判断满足，不以规则值代替报价或履约承诺。" if commercial else
+                               "按来源要求线下办理并核对；本记录不代表事项已经完成。"})
+
         def issue(section, refs, title, reason, action):
             value = {"issue_id": f"M-{len(issues) + 1:03d}", "title": title, "section_id": section["section_id"],
                      "requirement_refs": list(dict.fromkeys(refs)), "reason": reason, "action": action,
@@ -673,15 +686,20 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
+                    "review_actions": review_actions,
                     "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
                     "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
+                  "review_actions": review_actions,
                   "counts": {"requirements": len(requirements), "sections": len(sections), "writing_tasks": sum(len(s["writing_tasks"]) for s in sections),
-                             "tables": len(tables), "attachments": len(attachments), "issues": len(issues)},
-                  "coverage": extracted["coverage"], "status": "ok_with_issues" if issues else "ok"}
+                             "tables": len(tables), "attachments": len(attachments), "issues": len(issues),
+                             "review_actions": len(review_actions), "pending_review": len(review_actions),
+                             "commercial_constraints": sum(action["kind"] == "commercial_constraint" for action in review_actions),
+                             "procedure_actions": sum(action["kind"] == "procedure" for action in review_actions)},
+                  "coverage": extracted["coverage"], "status": "ok_with_issues" if issues or review_actions else "ok"}
         from .material_matching import material_candidate_report
         report["material_candidates"] = material_candidate_report(requirements, manifest.get("material_records", []))
         _capture(ctx, "n3-planning-report", report)

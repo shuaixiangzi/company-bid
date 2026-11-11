@@ -237,6 +237,14 @@ class ChatProposalProvider:
                         error_code = getattr(error, "code", "PROVIDER_SCHEMA_INVALID" if isinstance(error, (ValueError, KeyError, TypeError, AttributeError)) else "PROVIDER_VALIDATION_FAILED")
                         if not isinstance(error_code, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", error_code):
                             error_code = "PROVIDER_VALIDATION_FAILED"
+                        context = getattr(error, "diagnostic_context", None)
+                        if isinstance(context, dict):
+                            captured = ctx.capture(f"validation-{call_id}-{attempt}", redact_secret({
+                                "status": "failed", "error_code": error_code,
+                                "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id,
+                                "diagnostic_context": context}, secret))
+                            if captured["status"] == "write_failed":
+                                raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
                         raise ProviderFailure(error_code) from None
                     if not isinstance(proposal, dict):
                         raise ProviderFailure("PROVIDER_VALIDATOR_CONTRACT_INVALID")

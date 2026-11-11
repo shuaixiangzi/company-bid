@@ -418,7 +418,7 @@ def _trace_appendix(document, package):
     for section in package.sections:
         trace(f"{section.section_id} {section.title}；要求 {'、'.join(section.requirement_refs)}。")
         if not section.render_body:
-            trace("该项为程序事项，无需投标正文；保留于制作检查记录。")
+            trace("该项无需单独投标正文；办理或约束核对状态保留于清单，不代表已经满足。")
         for block in section.blocks:
             if isinstance(block, (HeadingBlock, TableBlock, AttachmentBlock)):
                 if isinstance(block, HeadingBlock):
@@ -464,7 +464,7 @@ def _render_issues(package):
     _plain(document, f"投标人：{package.company.name}", style)
     if package.issues:
         _plain(document, "需线下补充的事项如下。正文和清单使用同一待补编号。", style, bold=True)
-    else:
+    elif not package.review_actions:
         _plain(document, "本次未自动检出待补项。提交前仍须线下核对原件、报价及签字盖章。", style)
     titles = {section.section_id: section.title for section in package.sections}
     for issue in package.issues:
@@ -476,6 +476,21 @@ def _render_issues(package):
         _plain(document, f"缺项原因：{issue.reason}", style)
         _plain(document, f"来源要求：{issue.source_requirement}", style)
         _plain(document, f"补充动作：{issue.action}", style)
+    if package.review_actions:
+        document.add_paragraph("待办理事项与待核验商业约束", "Heading 1")
+        _plain(document, "以下保留招标来源规则，不属于公司事实、报价或履约承诺；无需单独正文不代表已经满足。", style)
+        sources = {source.source_id: source for source in package.sources}
+        for action in package.review_actions:
+            label = "商业约束待核验" if action.kind == "commercial_constraint" else "程序事项待办理"
+            status = "尚未核验" if action.status == "not_checked" else "待线下办理"
+            document.add_paragraph(f"{action.action_id} {label}", "Heading 2")
+            _plain(document, f"状态：{status}；尚未认定满足。", style)
+            _plain(document, f"对应要求：{'、'.join(action.requirement_refs)}", style)
+            _plain(document, f"来源要求：{action.source_requirement}", style)
+            _plain(document, f"办理或核对动作：{action.instruction}", style)
+            for ref in action.source_refs:
+                source = sources[ref]
+                _plain(document, f"来源定位：{ref}；{source.title}；{source.locator}", style)
     _trace_appendix(document, package)
     return document
 

@@ -53,7 +53,8 @@ def add_unit(parsed, unit_id, text, *, kind="paragraph", status="read", **extra)
 
 
 def cite(block, quote=None):
-    return {key: block[key] for key in ("source_id", "block_id", "locator")} | {"quote": quote or block["text"]}
+    value = {key: block[key] for key in ("source_id", "block_id", "locator")}
+    return value if quote is None else {**value, "quote": quote}
 
 
 def requirement(block, *, category="technical", mode="writing", **extra):
@@ -125,7 +126,7 @@ def test_unread_tender_cannot_be_success(tmp_path, status):
 
 
 @pytest.mark.parametrize("mutation,code", [
-    (lambda value: value["requirements"][0]["citation"].update(quote="并不存在的原文"), "CITATION_QUOTE"),
+    (lambda value: value["requirements"][0]["citation"].update(quote="并不存在的原文"), "LIVE_CITATION_QUOTE_FORBIDDEN"),
     (lambda value: value["requirements"][0]["citation"].update(locator="elsewhere"), "CITATION_LOCATION"),
     (lambda value: value.update(reviewed_block_ids=[]), "WINDOW_BLOCK_DENOMINATOR"),
     (lambda value: value["requirements"][0].update(required_fact_labels=["未出现字段"]), "LABEL_NOT_GROUNDED"),
@@ -142,12 +143,15 @@ def test_source_grounding_and_denominator_reject_candidates(tmp_path, mutation, 
 
 
 def test_repeated_quote_requires_unambiguous_larger_excerpt(tmp_path):
+    from company_bid.extraction import _index, _windows, _validate_window
     manifest, parsed = fixture(tmp_path)
     block = add_unit(parsed, "U1", "应记录。应记录。")
     candidate = requirement(block)
     candidate["citation"]["quote"] = "应记录。"
+    blocks, _, documents = _index(parsed, manifest)
+    window = _windows(documents, blocks, {})[0][0]
     with pytest.raises(PlanningError, match="CITATION_QUOTE_NOT_UNIQUE_EXACT"):
-        extract(Context(), parsed, manifest, lambda p: response(p, [candidate]))
+        _validate_window(response({"window": window}, [candidate]), window)
 
 
 def test_failed_window_resume_reuses_completed_and_preserves_money_and_negation(tmp_path):
@@ -513,7 +517,7 @@ def test_cross_page_span_preserves_condition_negation_and_only_skips_verified_fo
     manifest, parsed, condition, negative, footers = three_pdf_pages(tmp_path)
     ctx = Context()
     candidate = requirement(condition)
-    candidate["citation"].update(block_ids=[condition["block_id"], negative["block_id"]], quote=condition["text"] + "\n" + negative["text"])
+    candidate["citation"].update(block_ids=[condition["block_id"], negative["block_id"]])
     def make(payload):
         assert payload["window"]["context_identity"]["sha256"]
         blocks = payload["window"]["blocks"]
@@ -537,13 +541,14 @@ def test_span_cannot_drop_ordinary_text_condition_or_preempt_another_window(tmp_
         ordinary = {**condition, "block_id": "ORDINARY", "locator": "pdf/page[1]/line[extra]", "text": "作业前还须取得业主书面授权。", "bbox": [60, 120, 300, 132]}
         parsed["documents"][0]["units"][0]["blocks"].insert(1, ordinary)
     candidate = requirement(condition)
-    candidate["citation"].update(block_ids=[condition["block_id"], negative["block_id"]],
-                                  quote=negative["text"] if failure == "cropped_quote" else condition["text"] + "\n" + negative["text"])
+    candidate["citation"].update(block_ids=[condition["block_id"], negative["block_id"]])
+    if failure == "cropped_quote":
+        candidate["citation"]["quote"] = negative["text"]
     def make(payload):
         target = payload["window"]["blocks"][0]
         emit = target["block_id"] == (footers[1]["block_id"] if failure == "outside_target" else condition["block_id"])
         return response(payload, [candidate] if emit else [])
-    code = {"ordinary_gap": "CITATION_SPAN_NOT_CONTIGUOUS", "cropped_quote": "CITATION_SPAN_MUST_QUOTE_ALL_BLOCKS", "outside_target": "CITATION_OUTSIDE_REVIEW_WINDOW"}[failure]
+    code = {"ordinary_gap": "CITATION_SPAN_NOT_CONTIGUOUS", "cropped_quote": "LIVE_CITATION_QUOTE_FORBIDDEN", "outside_target": "CITATION_OUTSIDE_REVIEW_WINDOW"}[failure]
     with pytest.raises(PlanningError, match=code):
         extract(Context(), parsed, manifest, make, {"window_max_blocks": 1})
 
@@ -678,7 +683,7 @@ def test_span_cannot_cross_a_table_even_when_page_footer_skip_is_verified(tmp_pa
              "rows": [["额外前置条件", "须书面授权"]], "merges": [], "column_widths": [1, 2], "bbox": [60, 120, 500, 180]}
     parsed["documents"][0]["units"][0]["blocks"].insert(1, table)
     candidate = requirement(condition)
-    candidate["citation"].update(block_ids=[condition["block_id"], negative["block_id"]], quote=condition["text"] + "\n" + negative["text"])
+    candidate["citation"].update(block_ids=[condition["block_id"], negative["block_id"]])
     with pytest.raises(PlanningError, match="CITATION_SPAN_NOT_CONTIGUOUS"):
         extract(Context(), parsed, manifest, lambda payload: response(payload, [candidate]))
 

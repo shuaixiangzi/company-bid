@@ -39,9 +39,9 @@ def prepare(tmp_path, permission, *, previous=None, clipped_quote=None, window_b
     permission_block = blocks[-2]
     requirement_block = permission_block if clipped_quote is not None else blocks[-1]
     citation = {key: requirement_block[key] for key in ("source_id", "block_id", "locator")}
-    citation["quote"] = clipped_quote if clipped_quote is not None else requirement_block["text"]
-    heading_citation = {key: blocks[0][key] for key in ("source_id", "block_id", "locator", "text")}
-    heading_citation["quote"] = heading_citation.pop("text")
+    # Live candidates now select the complete source block. Source-context
+    # negation/actor assertions below still exercise the N3 permission guard.
+    heading_citation = {key: blocks[0][key] for key in ("source_id", "block_id", "locator")}
     def candidate(ctx, task_type, unit_id, payload, validate):
         targets = {block["block_id"] for block in payload["window"]["blocks"]}
         requirements = [{"citation": citation, "category": "technical", "response_mode": "writing",

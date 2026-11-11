@@ -196,12 +196,23 @@ def build_executor(root: Path, config: dict) -> Executor:
                   "requirement_count": len(package.requirements), "section_count": len(package.sections),
                   "attachment_count": len(package.attachments), "issue_count": len(package.issues),
                   "table_count": len(table_ids), "writing_units": value.get("writing_review", []),
+                  "review_actions": [item.model_dump(mode="json") for item in package.review_actions],
+                  "pending_review_count": len(package.review_actions),
                   "requirement_coverage": []}
+        actions_by_requirement = {ref: action for action in package.review_actions for ref in action.requirement_refs}
+        nonbody_requirements = {item.requirement_id for item in package.requirements if item.response_mode == "procedure"}
+        if value.get("input_kind") == "automatic" and set(actions_by_requirement) != nonbody_requirements:
+            raise PipelineFailure("NON_BODY_REVIEW_ACTION_MISSING")
         for requirement in package.requirements:
             issues = [i.issue_id for i in package.issues if requirement.requirement_id in i.requirement_refs]
-            checks["requirement_coverage"].append({"requirement_id": requirement.requirement_id,
-                                                   "status": "pending_manual" if issues else "no_body_required" if requirement.response_mode == "procedure" else "drafted_for_review",
-                                                   "issue_ids": issues})
+            coverage = {"requirement_id": requirement.requirement_id,
+                        "status": "pending_manual" if issues else "no_body_required" if requirement.response_mode == "procedure" else "drafted_for_review",
+                        "issue_ids": issues}
+            if requirement.response_mode == "procedure":
+                action = actions_by_requirement.get(requirement.requirement_id)
+                coverage.update(body_status="not_required", review_status=action.status if action else "not_recorded",
+                                review_action_ids=[action.action_id] if action else [], satisfaction_status="not_determined")
+            checks["requirement_coverage"].append(coverage)
         ctx.capture("validation", checks)
         return {**value, "validation": checks}
 
@@ -221,6 +232,7 @@ def build_executor(root: Path, config: dict) -> Executor:
                 "input_kind": value.get("input_kind", "manual_prepared"), "synthetic": package.synthetic,
                 "chain_diagnostics": value.get("chain_diagnostics", {}),
                 "warnings": rendered["warnings"], "issue_ids": rendered["issue_ids"],
+                "review_action_ids": [item.action_id for item in package.review_actions],
                 "source_artifacts": value["source_artifacts"]}
 
     # Actual source hashes prevent continuing a partially completed run after code

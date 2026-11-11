@@ -15,7 +15,7 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
     store = LocalStore(root)
     state = store.read_state(run_id)
     directory = store.run_dir(run_id)
-    gaps, integrity, json_cache = [], {}, {}
+    gaps, integrity, json_cache, content_limitations = [], {}, {}, []
     artifact_identities = {}
 
     def gap(code, **metadata):
@@ -149,6 +149,60 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
     if initial is not None and digest(initial) != state.get("initial_input_hash"):
         gap("INITIAL_INPUT_HASH_MISMATCH")
 
+    def reading_limitation(capture, attempt_id):
+        """Recognize a complete ledger of partial source reading, including old captures.
+
+        Do not reinterpret arbitrary partial captures, bad JSON or a missing
+        ledger as available evidence. Content is not declared semantically read.
+        """
+        if capture.get("name") != "reading-coverage" or capture.get("status") not in {"captured", "partial"}:
+            return False
+        def invalid():
+            gap("READING_LEDGER_INVALID", attempt_id=attempt_id)
+            return False
+        value = artifact_json(capture.get("ref"))
+        if not isinstance(value, dict) or value.get("schema_version") != "1.0":
+            return invalid()
+        coverage, documents = value.get("coverage"), value.get("documents")
+        if not isinstance(coverage, dict) or not isinstance(documents, list) or not documents:
+            return invalid()
+        try:
+            units = [unit for doc in documents for unit in doc["units"]]
+            counts = Counter(unit["coverage"]["status"] for unit in units)
+            unresolved = coverage["unresolved_units"]
+            roles = coverage["required_roles"]
+            if (not isinstance(roles, list) or "tender" not in roles or
+                    any(role not in {"tender", "company_material", "reference_bid", "project_supplement"} for role in roles)):
+                return invalid()
+            expected_unresolved = [{"source_id": doc["source_id"], "unit_id": unit["unit_id"], "locator": unit["locator"],
+                "page": unit.get("page"), "status": unit["coverage"]["status"], "error_code": unit["coverage"].get("error_code")}
+                for doc in documents for unit in doc["units"] if unit["coverage"]["status"] not in {"read", "empty"}]
+            expected_required = [entry for entry in expected_unresolved if next(
+                doc["role"] for doc in documents if doc["source_id"] == entry["source_id"]) in roles]
+            if (type(coverage["complete"]) is not bool or coverage["complete"] != (not expected_unresolved) or
+                    type(coverage["required_complete"]) is not bool or not isinstance(unresolved, list) or
+                    not units or any(type(doc.get("expected_units")) is not int or
+                        doc["expected_units"] < 1 or len(doc["units"]) != doc["expected_units"] for doc in documents) or
+                    len(documents) != coverage["document_count"] or len(units) != coverage["unit_count"] or
+                    len({doc["source_id"] for doc in documents}) != len(documents) or
+                    len({unit["unit_id"] for unit in units}) != len(units) or
+                    any(unit["source_id"] != doc["source_id"] for doc in documents for unit in doc["units"]) or
+                    set(counts) - {"read", "empty", "needs_ocr", "failed", "unsupported"} or
+                    coverage["counts"] != {key: counts[key] for key in ("read", "empty", "needs_ocr", "failed", "unsupported")} or
+                    unresolved != expected_unresolved or coverage["required_unresolved_units"] != expected_required or
+                    coverage["required_complete"] != (not expected_required) or
+                    coverage["status"] != ("failed" if expected_required else "partial" if expected_unresolved else "complete")):
+                return invalid()
+        except (KeyError, TypeError):
+            return invalid()
+        if not unresolved:
+            return False
+        content_limitations.append({"code": "SOURCE_READING_PARTIAL", "attempt_id": attempt_id,
+            "artifact_id": capture["ref"]["artifact_id"], "coverage_status": coverage["status"],
+            "required_complete": coverage["required_complete"], "unit_count": coverage["unit_count"],
+            "unresolved_unit_count": len(unresolved), "diagnostic_ledger_status": "captured"})
+        return True
+
     def attempt(item, *, inherited=False):
         result = {key: item.get(key) for key in ("attempt_id", "node_attempt_id", "job_attempt_id", "started_at", "ended_at",
                   "status", "duration_ms", "input_hash", "output_hash", "trace_id", "span_id", "error_code", "error_type")}
@@ -159,7 +213,8 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         result["captures"] = [{**{key: c.get(key) for key in ("name", "status", "unit_id", "unit_attempt_id", "error_code")},
                                "artifact": ref(c.get("ref"))} for c in item.get("captures", [])]
         for capture in item.get("captures", []):
-            if capture["status"] in ("write_failed", "partial"):
+            source_limitation = reading_limitation(capture, item["attempt_id"])
+            if capture["status"] == "write_failed" or capture["status"] == "partial" and not source_limitation:
                 gaps.append({"code": "CAPTURE_INCOMPLETE", "attempt_id": item["attempt_id"], "name": capture["name"], "status": capture["status"]})
         return result
 
@@ -213,7 +268,7 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
             continue
         item.update({key: event[key] for key in ("node_key", "node_attempt_id", "unit_id", "unit_attempt_id", "model", "provider", "prompt_version",
                     "operation", "input_hash", "output_hash", "trace_id", "span_id", "elapsed_ms", "input_tokens", "output_tokens", "total_tokens",
-                    "cost", "usage_status", "error_code", "validation_status") if key in event})
+                    "cost", "usage_status", "error_code", "validation_status", "provider_request_id") if key in event})
     for call in calls.values():
         names = call["events"]
         call["outcome"] = "completed" if "call.completed" in names else "failed" if "call.failed" in names else "unknown"
@@ -241,8 +296,9 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
     return {"schema_version": "chain.diagnostic-index.v1", "run_id": run_id, "run_status": state["status"],
             "parent_run_id": state.get("parent_run_id"), "fork_from_node": state.get("fork_from_node"),
             "observability": state["observability"], "capture_policy": state["capture_policy"],
-            "evidence_status": "incomplete" if gaps else "metadata_only_capture_disabled" if not state["capture_policy"] else "available",
-            "gaps": gaps, "nodes": nodes, "execution_attempts": execution, "calls": list(calls.values()),
+            "evidence_status": "incomplete" if gaps else "metadata_only_capture_disabled" if not state["capture_policy"] else
+                               "available_with_content_limitations" if content_limitations else "available",
+            "gaps": gaps, "content_limitations": content_limitations, "nodes": nodes, "execution_attempts": execution, "calls": list(calls.values()),
             "actual_call_attempts": len(calls), "unknown_usage_attempts": sum(c.get("usage_status") != "known" for c in calls.values()),
             "known_estimated_cost_usd": sum(c["cost"] for c in calls.values() if isinstance(c.get("cost"), (int, float))),
             "cost_is_provider_invoice": False, "call_reservations": budgets,

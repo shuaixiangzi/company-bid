@@ -705,10 +705,12 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
             raise ReadingFailure("READING_SOURCE_CHANGED_DURING_READ")
     output = {"schema_version": "1.0", "producer_version": READER_VERSION,
               "documents": results, "coverage": _summary(results, options)}
-    capture = ctx.capture("reading-coverage", {"schema_version": "1.0", "coverage": output["coverage"],
+    # A fully saved ledger can describe unread source objects. That is a
+    # content limitation, not a truncated/missing diagnostic capture.
+    capture = ctx.capture("reading-coverage", {"schema_version": "1.0", "content_status": output["coverage"]["status"], "coverage": output["coverage"],
                             "documents": [{k: v for k, v in doc.items() if k != "units"} | {
                                 "units": [{k: v for k, v in unit.items() if k != "blocks"} for unit in doc["units"]]}
-                                          for doc in results]}, partial=not output["coverage"]["complete"])
+                                          for doc in results]})
     if isinstance(capture, dict) and capture.get("status") == "write_failed":
         raise ReadingFailure("READING_CAPTURE_FAILED", output)
     if not output["coverage"]["required_complete"]:

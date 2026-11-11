@@ -42,7 +42,7 @@ def prepare(tmp_path, candidates):
     def extract(ctx, task_type, unit_id, payload, validate):
         block = payload["window"]["blocks"][0]
         return validate({"reviewed_block_ids": [b["block_id"] for b in payload["window"]["blocks"]],
-            "requirements": [{"citation": {key: block[key] for key in ("source_id", "block_id", "locator")} | {"quote": block["text"]},
+            "requirements": [{"citation": {key: block[key] for key in ("source_id", "block_id", "locator")},
                               "category": "qualification", "response_mode": "attachment", "format_status": "not_prescribed",
                               "attachment_keywords": ["LICENSE"]}], "format_chapters": [], "format_status": "none_verified"})
     extracted = extract_requirements(ctx, parsed, manifest, extract, {})

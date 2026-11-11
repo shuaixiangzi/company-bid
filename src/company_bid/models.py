@@ -68,6 +68,27 @@ class Requirement(Contract):
     response_mode: Literal["writing", "fixed_text", "table", "attachment", "procedure"] = "writing"
 
 
+class ReviewAction(Contract):
+    """A source rule awaiting work or review; never a bidder fact or promise."""
+
+    action_id: Text
+    kind: Literal["procedure", "commercial_constraint"]
+    status: Literal["pending_manual", "not_checked"]
+    requirement_refs: list[Text] = Field(min_length=1)
+    source_refs: list[Text] = Field(min_length=1)
+    source_requirement: Text
+    instruction: Text
+
+    @model_validator(mode="after")
+    def pending_status_matches_kind(self):
+        expected = "not_checked" if self.kind == "commercial_constraint" else "pending_manual"
+        if self.status != expected:
+            raise ValueError("review action must retain its unfulfilled review status")
+        if len(set(self.requirement_refs)) != len(self.requirement_refs) or len(set(self.source_refs)) != len(self.source_refs):
+            raise ValueError("review action references must be unique")
+        return self
+
+
 class Issue(Contract):
     issue_id: Annotated[str, StringConstraints(pattern=r"^M-[0-9]{3,}$")]
     title: Text
@@ -424,6 +445,7 @@ class Snapshot(Contract):
     requirements: list[Requirement] = Field(min_length=1)
     attachments: list[Attachment] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list)
+    review_actions: list[ReviewAction] = Field(default_factory=list)
     reference_excerpts: list[ReferenceExcerpt] = Field(default_factory=list)
     style: DocumentStyle = Field(default_factory=DocumentStyle)
 
@@ -435,6 +457,7 @@ class Snapshot(Contract):
         _unique(self.attachments, "attachment_id", "attachment")
         validate_attachment_bundles(self.attachments)
         _unique(self.issues, "issue_id", "issue")
+        _unique(self.review_actions, "action_id", "review action")
         _unique(self.reference_excerpts, "reference_id", "reference excerpt")
         _known(self.style.reference_source_refs, source_ids, "style source")
         for reference in self.reference_excerpts:
@@ -443,6 +466,22 @@ class Snapshot(Contract):
             _known(item.source_refs, source_ids, "source")
         for item in [*self.attachments, *self.issues]:
             _known(item.requirement_refs, requirement_ids, "requirement")
+        requirements = {item.requirement_id: item for item in self.requirements}
+        reviewed = set()
+        for action in self.review_actions:
+            _known(action.requirement_refs, requirement_ids, "review action requirement")
+            _known(action.source_refs, source_ids, "review action source")
+            selected = [requirements[ref] for ref in action.requirement_refs]
+            category = "commercial" if action.kind == "commercial_constraint" else "procedure"
+            if any(item.response_mode != "procedure" or item.category != category for item in selected):
+                raise ValueError("review action must reference a compatible non-body requirement")
+            if reviewed & set(action.requirement_refs):
+                raise ValueError("each non-body requirement may have only one review action")
+            reviewed.update(action.requirement_refs)
+            if set(action.source_refs) != {ref for item in selected for ref in item.source_refs}:
+                raise ValueError("review action sources must equal its requirement sources")
+            if action.source_requirement != "\n".join(item.text for item in selected):
+                raise ValueError("review action rule must equal its cited requirements")
         if self.synthetic and (any(not item.synthetic for item in self.sources) or any(not item.synthetic for item in self.attachments)):
             raise ValueError("synthetic sample must label every source and attachment synthetic")
         return self
@@ -467,6 +506,10 @@ class PreparedBid(Snapshot):
         task_ids = _unique([task for section in self.sections for task in section.writing_tasks], "unit_id", "writing task")
         if task_ids & section_ids:
             raise ValueError("writing task identities must not collide with section checkpoint identities")
+        if self.input_kind == "automatic":
+            nonbody = {item.requirement_id for item in self.requirements if item.response_mode == "procedure"}
+            if {ref for action in self.review_actions for ref in action.requirement_refs} != nonbody:
+                raise ValueError("automatic non-body requirements need pending review actions")
         covered = set()
         for section in self.sections:
             _known(section.source_refs, source_ids, "section source")
