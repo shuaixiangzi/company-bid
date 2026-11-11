@@ -579,7 +579,7 @@ class Executor:
                       "billing_verified": False, "invalid_event_records": 0}
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
-            except OSError:
+            except (OSError, UnicodeError):
                 result["status"] = "unavailable" if state["execution_attempts"] else "not_started"
                 if state["execution_attempts"]:
                     for key in ("started_events", "completed_events", "failed_events", "unfinished_started_attempts",
@@ -623,7 +623,8 @@ class Executor:
             return result
 
         changes = sorted(key for key in set(old["execution_config"]) | set(new["execution_config"])
-                         if old["execution_config"].get(key) != new["execution_config"].get(key))
+                         if key not in old["execution_config"] or key not in new["execution_config"] or
+                         old["execution_config"][key] != new["execution_config"][key])
         old_nodes = {item["key"]: index for index, item in enumerate(old["nodes"])}
         new_nodes = {item["key"]: index for index, item in enumerate(new["nodes"])}
         comparisons = []

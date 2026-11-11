@@ -50,15 +50,19 @@ def build_executor(root: Path, config: dict) -> Executor:
         validate_sources(prepared)
         data = prepared.model_dump(mode="json")
         refs = []
+        copied = {}
         for group in ("sources", "attachments"):
             for item in data[group]:
                 path = Path(item["path"])
-                ref = ctx.store_bytes("source" + path.suffix.lower(), path.read_bytes())
-                if ref["sha256"] != item["sha256"]:
-                    raise PipelineFailure("SOURCE_CHANGED_DURING_FREEZE")
+                ref = copied.get(item["sha256"])
+                if ref is None:
+                    ref = ctx.store_bytes("source" + path.suffix.lower(), path.read_bytes())
+                    if ref["sha256"] != item["sha256"]:
+                        raise PipelineFailure("SOURCE_CHANGED_DURING_FREEZE")
+                    copied[item["sha256"]] = ref
+                    refs.append(ref)
                 # Pin real copied bytes rather than mutable outside input paths.
                 item["path"] = str(root / ref["path"])
-                refs.append(ref)
         return {"prepared": data, "proposals": value.get("proposals", {}),
                 "source_artifacts": refs, "input_kind": "manual_prepared",
                 "unimplemented_automatic_nodes": ["N1", "N2", "N3"]}

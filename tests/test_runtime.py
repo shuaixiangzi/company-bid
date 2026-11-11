@@ -266,3 +266,85 @@ def test_final_commit_reconciles_without_rerender_after_event_failure(tmp_path, 
     assert second["status"] == "succeeded"
     assert second["observability"]["event_status"] == "write_failed"
     assert len(calls) == 1
+
+
+def test_controlled_diff_includes_config_refs_counts_issues_and_call_usage(tmp_path):
+    source_canary, secret_canary = "PRIVATE_SOURCE_DIFF_CANARY", "PRIVATE_CREDENTIAL_DIFF_CANARY"
+
+    def draft(ctx, data):
+        case = ctx.execution_config["case"]
+        metadata = {"call_id": "synthetic-call", "call_attempt": 1, "provider": "synthetic_offline"}
+        ctx.call_event("call.started", metadata)
+        usage = ({"input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
+                  "usage_status": "known", "cost": 0.001} if case == 1 else {"usage_status": "unknown"})
+        ctx.call_event("call.completed", {**metadata, **usage})
+        return {"package": {"requirements": [{}] * (case + 1), "sections": [{}] * case,
+                            "issues": [{"issue_id": "M-00" + str(case)}]}, "private_source": data["source"]}
+
+    nodes = [NodeSpec("N0", "1", lambda ctx, data: data, ()), NodeSpec("N4", "1", draft, ("provider", "case"))]
+    config1 = {"provider": {"model": "v1", "api_key": secret_canary}, "case": 1}
+    config2 = {"provider": {"model": "v2", "api_key": secret_canary}, "case": 2}
+    before_executor = Executor(tmp_path, nodes, config1)
+    old = before_executor.create_run({"source": source_canary})
+    before_executor.execute(old)
+    after_executor = Executor(tmp_path, nodes, config2)
+    new = after_executor.fork(old, "N4")
+    after_executor.execute(new)
+    state_bytes = {run: (tmp_path / "runs" / run / "state.json").read_bytes() for run in (old, new)}
+    comparison = after_executor.diff(old, new)
+    assert comparison["configuration"]["before"]["provider"]["model"] == "v1"
+    assert comparison["configuration"]["after"]["provider"]["model"] == "v2"
+    assert comparison["configuration_changes"] == ["case", "provider"]
+    assert comparison["nodes"][0]["reused"]
+    n4 = comparison["nodes"][1]
+    assert n4["before"]["input"]["ref"] == before_executor.inspect(old)["nodes"][0]["output_ref"]
+    assert n4["after"]["input"]["ref"] == after_executor.inspect(new)["nodes"][0]["output_ref"]
+    assert n4["before"]["output"]["summary"] == {"requirement_count": 2, "section_count": 1, "issue_count": 1, "issue_ids": ["M-001"]}
+    assert n4["after"]["output"]["summary"] == {"requirement_count": 3, "section_count": 2, "issue_count": 1, "issue_ids": ["M-002"]}
+    assert comparison["calls"]["before"]["known_token_counts"] == {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+    assert comparison["calls"]["before"]["estimated_cost_usd"] == 0.001
+    assert not comparison["calls"]["before"]["billing_verified"]
+    assert comparison["calls"]["after"]["unknown_usage_attempts"] == 1
+    assert comparison["calls"]["after"]["known_token_counts"]["total_tokens"] is None
+    assert comparison["calls"]["after"]["estimated_cost_usd"] is None
+    serialized = json.dumps(comparison)
+    assert source_canary not in serialized and secret_canary not in serialized
+    assert all((tmp_path / "runs" / run / "state.json").read_bytes() == content for run, content in state_bytes.items())
+
+
+def test_diff_preserves_changed_initial_input_references_without_source_copy(tmp_path):
+    executor = Executor(tmp_path, [NodeSpec("N0", "1", lambda ctx, data: data)], {})
+    old = executor.create_run({"private": "source-one"})
+    new = executor.create_run({"private": "source-two"})
+    report = executor.diff(old, new)
+    assert report["initial_input_changed"]
+    assert report["initial_input"]["before"]["ref"] == executor.inspect(old)["initial_input_ref"]
+    assert report["initial_input"]["after"]["hash"] == executor.inspect(new)["initial_input_hash"]
+    assert report["nodes"][0]["before"]["output"]["validation"] == "unavailable"
+    assert report["calls"]["before"]["status"] == "not_started"
+    assert "source-one" not in json.dumps(report) and "source-two" not in json.dumps(report)
+
+
+def test_diff_exposes_partial_call_records_and_invalid_checkpoint_without_writes(tmp_path):
+    def handler(ctx, data):
+        ctx.call_event("call.started", {"call_id": "synthetic-unfinished", "call_attempt": 1})
+        return {"validation": {"requirement_count": 4, "section_count": 2, "issue_count": 1}, "issue_ids": ["M-001"]}
+
+    executor = Executor(tmp_path, [NodeSpec("N6", "1", handler)], {})
+    run = executor.create_run({})
+    executor.execute(run)
+    initial = executor.diff(run, run)
+    assert initial["nodes"][0]["before"]["output"]["summary"] == {"requirement_count": 4, "section_count": 2, "issue_count": 1, "issue_ids": ["M-001"]}
+    events = executor.store.run_dir(run) / "events.jsonl"
+    with events.open("ab") as handle:
+        handle.write(b'{"event":unfinished')
+    state = executor.inspect(run)
+    executor.store.resolve(state["nodes"][0]["output_ref"]["path"]).write_bytes(b"invalid")
+    before = (executor.store.run_dir(run) / "state.json").read_bytes()
+    report = executor.diff(run, run)
+    assert report["calls"]["before"]["status"] == "partial"
+    assert report["calls"]["before"]["started_events"] == 1
+    assert report["calls"]["before"]["unknown_usage_attempts"] == 1
+    assert report["calls"]["before"]["invalid_event_records"] == 1
+    assert report["nodes"][0]["before"]["output"]["validation"] == "checkpoint_invalid"
+    assert (executor.store.run_dir(run) / "state.json").read_bytes() == before

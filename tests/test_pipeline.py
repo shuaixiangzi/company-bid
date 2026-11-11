@@ -15,6 +15,9 @@ def test_prepared_slice_freezes_sources_resumes_and_forks(tmp_path):
     run_id = runner.create_run(initial)
     paused = runner.execute(run_id, stop_after="N4")
     assert paused["status"] == "paused_debug"
+    frozen = runner.output(run_id, "N0")
+    assert len(frozen["source_artifacts"]) == 3  # proof source and attachment share bytes
+    assert frozen["prepared"]["sources"][2]["path"] == frozen["prepared"]["attachments"][0]["path"]
     source = sample.sources[0].path
     source.write_text("changed outside source", encoding="utf-8")
     # N0 already copied and froze bytes; later nodes use that immutable copy.
