@@ -20,7 +20,7 @@
 | OCR 覆盖和来源引文有实质校验 | `extraction/ocr/service.py:161`；`source_span.py:90` | 保留逐页/逐块账本和精确引用，不让 UI 简化损害内容覆盖 |
 | DOCX 主循环只显式处理正文段落/表格/SDT，存在异常后 continue 和一律 requires_ocr=False | `extraction/parser/docx.py:83`、`:190` | 检测嵌图、复杂对象、失败块；明确支持范围，不假报完整读取 |
 | 分章节窗口、覆盖账本和有界重试已经存在 | `requirements/windows.py:89`；`requirements/extraction.py:798` | 保留算法与负例；合并为一个明确节点及通用尝试记录 |
-| structured 匹配包含检索、硬条件过滤、主体和有效期判断 | `workflow/handler.py:2893`、`:3109`、`:3280` | 保留判断，不复制 H5/Harness 多代分支；相似度不等于资格满足 |
+| structured 匹配包含检索、硬条件/有效期判断，以及主体相关接口 | `workflow/handler.py:2893`、`:3109`、`:3280` | 保留材料是否响应要求的判断；按用户决定不继承公司主体核对，不复制 H5/Harness 多代分支；相似度不等于资格满足 |
 | 自动目录骨架已能从原文派生，但 workflow 仍停在人工确认/规划 handoff | `composition/outline_plan_service.py:252`、`:302`；`workflow/handler.py:4288`、`:4468` | 自动目录成为内部节点；不伪造人工 confirmed 标志 |
 | 旧 draft 入口明确禁止进入旧实现 | `workflow/handler.py:5754`、`:5764` | 不因后面有大量代码就认定已具备可用正文生成 |
 | 新 publisher 默认正文主要是公司名、证据 ID 说明和步骤文字，不负责生成技术方案正文 | `simplification/draft_input.py:25`、`:39`、`:45`、`:62`；`simplification/service.py:152` | 实质章节写作是新项目首要能力，不能只改发布状态 |
@@ -32,7 +32,7 @@
 
 表中 Python 路径相对 `E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/`。完整源码保留在旧目录，不复制到新项目。
 
-2026-11-11 复核补充：上表“主体判断”只说明存在相关合同/判断接口，不表示当前匹配入口实际启用。该基线 `workflow/handler.py:3025–3029` 将 `expected_subject` 清空，`composition/draft_quality.py:494` 忽略主体参数；`materials/scoring.py:1058` 还含核验状态调试旁路。新系统须显式实现主体/人员适用性，不能直接继承这些运行行为。
+2026-11-11 复核补充：上表主体相关接口不表示当前匹配入口实际启用。该基线 `workflow/handler.py:3025–3029` 将 `expected_subject` 清空，`composition/draft_quality.py:494` 忽略主体参数；`materials/scoring.py:1058` 还含核验状态调试旁路。用户随后明确新系统固定单公司、不核对公司主体，因此主体过滤关闭不列为新项目需修问题；只保留人员、证书、有效期及材料内容适用性，不继承全库强制视为已核验的旁路。
 
 可直接抽查：[工作稿输入](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/simplification/draft_input.py:25)、[文档投影](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/simplification/document.py:73)、[旧 draft 守卫](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/workflow/handler.py:5754)、[Worker 完成路径](E:/ai-bid-rebuild-wt-mfs001/apps/api/src/ai_bid_api/jobs/execution.py:457)。
 
@@ -46,7 +46,7 @@
 
 ## 什么复用，什么重新做
 
-保留：hash/来源定位、原件与派生资料区分、主体/有效期筛选、分窗和单位级重试、不可变文件、下载授权、租约/fencing、故障/并发反例、表格和页面核验方法。
+保留：hash/来源定位、原件与派生资料区分、人员/证书/有效期筛选、分窗和单位级重试、不可变文件、按项目所有者授权下载、租约/fencing、故障/并发反例、表格和页面核验方法。公司主体选择、比对和核验不在新项目范围。
 
 重新做：简单自动流水线、统一 BidPlan 与章节文档结构、正文生成、公司资料维护界面、最终完成事务、单节点执行器、checkpoint 与调试分支、标准 trace 采集。
 
