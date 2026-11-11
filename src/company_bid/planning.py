@@ -20,9 +20,10 @@ from .extraction import (
     _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid,
     _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result, _close_deferred_context,
 )
+from .table_continuations import build_table_continuations
 
 
-PLANNING_VERSION = "bid-plan-v3"
+PLANNING_VERSION = "bid-plan-v4"
 
 
 class _Fill(_Strict):
@@ -467,6 +468,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             _fail(clause["clause_id"] in clause_by_id and clause_by_id[clause["clause_id"]] != clause,
                   "CLAUSE_CATALOG_ID_CONFLICT")
             clause_by_id[clause["clause_id"]] = clause
+    table_continuations = [proof for document in documents for proof in build_table_continuations(
+        document, [block for block in blocks.values() if block["source_id"] == document["source_id"]], _pdf_footer_skips(blocks))]
 
     input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": manifest,
                   "parsed_hash": _hash(parsed), "config": config}
@@ -544,14 +547,16 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         factual_response_reports = []
 
         def scoped_source(citation):
-            checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks), list(clause_by_id.values()))
+            checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks), list(clause_by_id.values()), table_continuations)
             source_id = _id("SCOPE-", checked)
             if source_id not in source_map:
                 parent = source_map[checked["source_id"]]
                 item = {**parent, "source_id": source_id,
                         "locator": f"{checked['locator']}; basis={checked['basis']}; chars[{checked['start']}:{checked['end']}]; quote_sha256={checked['quote_sha256']}"}
                 if checked.get("cell_refs"):
-                    item["locator"] += "; cells=" + ",".join(f"r{cell['row']}c{cell['column']}" for cell in checked["cell_refs"])
+                    item["locator"] += "; cells=" + ",".join(
+                        (cell["block_id"] + ":" if cell.get("block_id") else "") + f"r{cell['row']}c{cell['column']}"
+                        for cell in checked["cell_refs"])
                 if checked.get("block_ids"):
                     item["locator"] += "; through=" + checked["end_locator"] + "; blocks=" + ",".join(checked["block_ids"])
                 SourceRef.model_validate(item)
