@@ -10,6 +10,8 @@ from collections import Counter
 from collections.abc import Callable
 import hashlib
 import io
+import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -23,10 +25,10 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 import pdfplumber
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pypdf import PdfReader
 
-READER_VERSION = "native-reading-2"
+READER_VERSION = "native-reading-3"
 Role = Literal["tender", "company_material", "reference_bid", "project_supplement"]
 Status = Literal["read", "empty", "needs_ocr", "failed", "unsupported"]
 
@@ -54,6 +56,38 @@ class GlyphMap(StrictModel):
         return self
 
 
+class NativeIgnoreRule(StrictModel):
+    """A manual, source-bound decision; never an automatic visibility test."""
+
+    rule_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,100}$")
+    source_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,100}$")
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    role: Role
+    locator: str = Field(pattern=r"^pdf/page\[[1-9][0-9]*\]/line\[[0-9]+\]$")
+    text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    reason: Literal["occluded_by_verified_decorative_image"]
+    explanation: str = Field(min_length=1, max_length=2000)
+    visual_evidence_path: Path
+    visual_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("bbox", mode="before")
+    @classmethod
+    def finite_box(cls, value):
+        if (not isinstance(value, list) or len(value) != 4 or
+                any(type(number) not in (int, float) or not math.isfinite(number) for number in value)):
+            raise ValueError("native ignore requires four finite coordinates")
+        if value[0] < 0 or value[1] < 0 or value[2] <= value[0] or value[3] <= value[1]:
+            raise ValueError("native ignore requires a nonempty page box")
+        return value
+
+    @model_validator(mode="after")
+    def explicit_explanation(self):
+        if not self.explanation.strip():
+            raise ValueError("native ignore requires a controlled review explanation")
+        return self
+
+
 class ReadingConfig(StrictModel):
     required_roles: list[Role] = Field(default_factory=lambda: ["tender"])
     ocr_roles: list[Role] | None = None
@@ -63,6 +97,7 @@ class ReadingConfig(StrictModel):
     # Exact '<source_sha256>::<source_id>::<locator>' -> reason; no wildcard.
     ignored_objects: dict[str, str] = Field(default_factory=dict)
     glyph_maps: list[GlyphMap] = Field(default_factory=list)
+    native_ignored_objects: list[NativeIgnoreRule] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def explicit_ignores(self):
@@ -76,6 +111,13 @@ class ReadingConfig(StrictModel):
                 if (rule.source_sha256, rule.font, int(rule.codepoint[2:], 16)) == (
                     other.source_sha256, other.font, int(other.codepoint[2:], 16)) and set(rule.pages) & set(other.pages):
                     raise ValueError("overlapping glyph rules")
+        identities, anchors = set(), set()
+        for rule in self.native_ignored_objects:
+            anchor = (rule.source_id, rule.source_sha256, rule.role, rule.locator)
+            if rule.rule_id in identities or anchor in anchors:
+                raise ValueError("duplicate native ignore rule or target")
+            identities.add(rule.rule_id)
+            anchors.add(anchor)
         return self
 
 
@@ -189,6 +231,137 @@ def _hash(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+_NATIVE_IGNORE_BASIS = "explicit_source_bound_manual_ignore"
+_NATIVE_BOX_TOLERANCE = 0.000001
+
+
+def _native_rule_metadata(rule: NativeIgnoreRule) -> dict:
+    # The mutable source PNG path belongs only in the frozen unit input.
+    return rule.model_dump(mode="json", exclude={"visual_evidence_path"})
+
+
+def _native_capture(ctx, name: str, value: dict) -> None:
+    result = ctx.capture(name, value)
+    if isinstance(result, dict) and result.get("status") == "write_failed":
+        raise ReadingFailure("READING_CAPTURE_FAILED")
+
+
+def _prepare_native_rules(ctx, sources: list[SourceDocument], config: ReadingConfig) -> dict[str, dict]:
+    """Freeze reviewed visual evidence once, then resume from its artifact."""
+    evidence = {}
+    by_id = {source.source_id: source for source in sources}
+    for rule in config.native_ignored_objects:
+        metadata = _native_rule_metadata(rule)
+        key = hashlib.sha256(json.dumps(rule.model_dump(mode="json"), sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()[:24]
+        capture_name = "native-ignore-rule-" + key
+        source = by_id.get(rule.source_id)
+        if source is None or source.sha256 != rule.source_sha256 or source.role != rule.role:
+            _native_capture(ctx, capture_name, {"basis": _NATIVE_IGNORE_BASIS, "status": "source_mismatch", "rule": metadata})
+            raise ReadingFailure("READING_NATIVE_IGNORE_SOURCE_MISMATCH")
+
+        def freeze(rule=rule):
+            try:
+                content = rule.visual_evidence_path.read_bytes()
+                if hashlib.sha256(content).hexdigest() != rule.visual_evidence_sha256:
+                    raise ValueError
+                with Image.open(io.BytesIO(content)) as image:
+                    if image.format != "PNG":
+                        raise ValueError
+                    image.verify()
+            except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError) as exc:
+                raise ReadingFailure("READING_NATIVE_IGNORE_EVIDENCE_INVALID") from exc
+            reference = ctx.store_bytes("native-ignore-visual", content, "image/png")
+            return {"rule_id": rule.rule_id, "visual_evidence": reference}
+
+        try:
+            frozen = ctx.run_unit("N1-native-ignore-proof-" + key,
+                                  {"reader_version": READER_VERSION, "basis": _NATIVE_IGNORE_BASIS,
+                                   "rule": rule.model_dump(mode="json")}, freeze)
+            reference = frozen.get("visual_evidence") if isinstance(frozen, dict) else None
+            if (not isinstance(reference, dict) or frozen.get("rule_id") != rule.rule_id or
+                    not isinstance(reference.get("artifact_id"), str) or
+                    not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", reference["artifact_id"]) or
+                    not isinstance(reference.get("path"), str) or not reference["path"] or
+                    type(reference.get("size_bytes")) is not int or reference["size_bytes"] < 0 or
+                    reference.get("sha256") != rule.visual_evidence_sha256 or reference.get("media_type") != "image/png"):
+                raise ReadingFailure("READING_NATIVE_IGNORE_EVIDENCE_INVALID")
+            try:
+                content = ctx.read_artifact(reference)
+            except Exception as exc:
+                raise ReadingFailure("READING_NATIVE_IGNORE_EVIDENCE_INVALID") from exc
+            if len(content) != reference["size_bytes"] or hashlib.sha256(content).hexdigest() != rule.visual_evidence_sha256:
+                raise ReadingFailure("READING_NATIVE_IGNORE_EVIDENCE_INVALID")
+        except ReadingFailure as exc:
+            _native_capture(ctx, capture_name, {"basis": _NATIVE_IGNORE_BASIS, "status": "failed",
+                                               "error_code": exc.code, "rule": metadata})
+            raise
+        evidence[rule.rule_id] = reference
+        _native_capture(ctx, capture_name, {"basis": _NATIVE_IGNORE_BASIS, "status": "evidence_frozen",
+                                           "rule": metadata, "visual_evidence": reference,
+                                           "automatic_visual_verification": False})
+    return evidence
+
+
+def _native_fail(unit: ReadingUnit, code: str):
+    unit.coverage.status, unit.coverage.error_code = "failed", code
+    raise _UnitFailure(code, unit)
+
+
+def _native_decisions(source: SourceDocument, unit: ReadingUnit, config: ReadingConfig,
+                      evidence: dict[str, dict]) -> list[dict[str, str]]:
+    decisions = []
+    for rule in config.native_ignored_objects:
+        if rule.source_id != source.source_id or rule.locator.rsplit("/line[", 1)[0] != unit.locator:
+            continue
+        blocks = [block for block in unit.blocks if block.locator == rule.locator]
+        if not blocks:
+            _native_fail(unit, "READING_NATIVE_IGNORE_UNMATCHED")
+        if len(blocks) != 1:
+            _native_fail(unit, "READING_NATIVE_IGNORE_OBJECT_MISMATCH")
+        block = blocks[0]
+        if (block.source_id != rule.source_id or source.sha256 != rule.source_sha256 or source.role != rule.role or
+                block.kind != "paragraph" or block.origin != "native" or
+                hashlib.sha256(block.text.encode("utf-8")).hexdigest() != rule.text_sha256 or
+                block.bbox is None or len(block.bbox) != 4 or
+                any(not math.isfinite(actual) or abs(actual - expected) > _NATIVE_BOX_TOLERANCE
+                    for actual, expected in zip(block.bbox, rule.bbox))):
+            _native_fail(unit, "READING_NATIVE_IGNORE_OBJECT_MISMATCH")
+        reference = evidence[rule.rule_id]
+        decisions.append({"native_ignore_rule_id": rule.rule_id, "basis": _NATIVE_IGNORE_BASIS,
+                          "locator": block.locator, "reason": rule.reason, "explanation": rule.explanation,
+                          "source_id": source.source_id, "source_sha256": source.sha256, "role": source.role,
+                          "text_sha256": rule.text_sha256,
+                          "bbox_sha256": hashlib.sha256(json.dumps(block.bbox, separators=(",", ":")).encode()).hexdigest(),
+                          "visual_evidence_artifact_id": reference["artifact_id"],
+                          "visual_evidence_sha256": reference["sha256"]})
+    return decisions
+
+
+def _verify_native_decisions(source, unit, config, evidence):
+    expected = _native_decisions(source, unit, config, evidence)
+    locators = {rule.locator for rule in config.native_ignored_objects if rule.source_id == source.source_id}
+    actual = [row for row in unit.coverage.ignored_objects if
+              row.get("basis") == _NATIVE_IGNORE_BASIS or "native_ignore_rule_id" in row or row.get("locator") in locators]
+    if actual != expected:
+        _native_fail(unit, "READING_NATIVE_IGNORE_CHECKPOINT_INVALID")
+
+
+def _native_rule_ledger(documents: list[dict], config: ReadingConfig, evidence: dict[str, dict]) -> list[dict]:
+    rows = []
+    for rule in config.native_ignored_objects:
+        matches = [{"source_id": doc["source_id"], "unit_id": unit["unit_id"], "block_locator": entry["locator"]}
+                   for doc in documents for unit in doc["units"]
+                   for entry in unit["coverage"]["ignored_objects"]
+                   if entry.get("native_ignore_rule_id") == rule.rule_id and
+                   not (unit["coverage"].get("error_code") or "").startswith("READING_NATIVE_IGNORE_")]
+        rows.append({**_native_rule_metadata(rule), "basis": _NATIVE_IGNORE_BASIS,
+                     "visual_evidence": evidence[rule.rule_id], "matches": matches, "match_count": len(matches),
+                     "status": "matched" if len(matches) == 1 else "unmatched_or_duplicate",
+                     "automatic_visual_verification": False})
+    return rows
 
 
 def _unit_id(source: SourceDocument, suffix: str) -> str:
@@ -633,6 +806,7 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
         raise ReadingFailure("READING_INPUT_INVALID") from None
     if not sources or len({s.source_id for s in sources}) != len(sources):
         raise ReadingFailure("READING_SOURCE_SET_INVALID")
+    native_evidence = _prepare_native_rules(ctx, sources, options)
     results = []
     for source in sources:
         if not source.path.is_file():
@@ -648,12 +822,29 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                        "reader_version": READER_VERSION, "config": options.model_dump(mode="json"),
                        "ocr_configured": ocr is not None}
         def execute(unit_id, locator, page, fn):
+            def parse_unit():
+                try:
+                    unit = fn()
+                except _UnitFailure as exc:
+                    # A manual exemption does not resolve any other unread
+                    # object on this page or change its failure status.
+                    if options.native_ignored_objects:
+                        exc.unit.coverage.ignored_objects.extend(_native_decisions(source, exc.unit, options, native_evidence))
+                    raise
+                if options.native_ignored_objects:
+                    unit.coverage.ignored_objects.extend(_native_decisions(source, unit, options, native_evidence))
+                return unit.model_dump(mode="json")
+
             try:
                 value = ctx.run_unit(unit_id, {**unit_inputs, "locator": locator, "page": page},
-                                     lambda: fn().model_dump(mode="json"))
+                                     parse_unit)
                 unit = ReadingUnit.model_validate(value)
                 if (unit.unit_id, unit.source_id, unit.locator, unit.page) != (unit_id, source.source_id, locator, page):
                     raise ReadingFailure("READING_CHECKPOINT_IDENTITY_INVALID")
+                if options.native_ignored_objects:
+                    # Recompute identity and decisions even after a page-cache
+                    # hit; the stored exemption is not its own authority.
+                    _verify_native_decisions(source, unit, options, native_evidence)
                 result["units"].append(unit.model_dump(mode="json"))
             except _UnitFailure as exc:
                 result["units"].append(exc.unit.model_dump(mode="json"))
@@ -705,6 +896,16 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
             raise ReadingFailure("READING_SOURCE_CHANGED_DURING_READ")
     output = {"schema_version": "1.0", "producer_version": READER_VERSION,
               "documents": results, "coverage": _summary(results, options)}
+    native_rules = _native_rule_ledger(results, options, native_evidence)
+    invalid_native_rules = any(row["match_count"] != 1 for row in native_rules)
+    if native_rules:
+        output["coverage"]["native_ignore_rules"] = native_rules
+        # Source reading and configured-rule validation have different
+        # denominators. A nonexistent rule target does not invent an unread
+        # source page; it still prevents the N1 node from completing.
+        output["coverage"]["native_ignore_validation"] = {
+            "status": "failed" if invalid_native_rules else "passed", "basis": _NATIVE_IGNORE_BASIS,
+            "rule_count": len(native_rules), "matched_rule_count": sum(row["match_count"] == 1 for row in native_rules)}
     # A fully saved ledger can describe unread source objects. That is a
     # content limitation, not a truncated/missing diagnostic capture.
     capture = ctx.capture("reading-coverage", {"schema_version": "1.0", "content_status": output["coverage"]["status"], "coverage": output["coverage"],
@@ -713,11 +914,18 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                                           for doc in results]})
     if isinstance(capture, dict) and capture.get("status") == "write_failed":
         raise ReadingFailure("READING_CAPTURE_FAILED", output)
+    if invalid_native_rules:
+        code = next((unit["coverage"]["error_code"] for doc in results for unit in doc["units"]
+                     if (unit["coverage"].get("error_code") or "").startswith("READING_NATIVE_IGNORE_")),
+                    "READING_NATIVE_IGNORE_UNMATCHED")
+        raise ReadingFailure(code, output)
     if not output["coverage"]["required_complete"]:
         gaps = output["coverage"]["required_unresolved_units"]
         # Preserve a bounded application failure after saving the entire
         # denominator; the ledger still reports every other unresolved unit.
-        code = next((code for gap in gaps if (code := _bounded_ocr_code(gap.get("error_code")))), None)
+        code = next((gap["error_code"] for gap in gaps
+                     if (gap.get("error_code") or "").startswith("READING_NATIVE_IGNORE_")), None)
+        code = code or next((code for gap in gaps if (code := _bounded_ocr_code(gap.get("error_code")))), None)
         if code is None:
             code = "OCR_REQUIRED" if any(gap["status"] == "needs_ocr" for gap in gaps) else "READING_INCOMPLETE"
         raise ReadingFailure(code, output)
