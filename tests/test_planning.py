@@ -63,7 +63,7 @@ def requirement(block, *, category="technical", mode="writing", **extra):
 
 
 def response(payload, requirements=None, formats=None, **extra):
-    return {"reviewed_block_ids": [b["block_id"] for b in payload["window"]["blocks"]],
+    return {"window_id": payload["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted", "unresolved_block_ids": [],
             "requirements": requirements or [], "format_chapters": formats or [],
             "format_status": "specified" if formats else "none_verified", **extra}
 
@@ -128,7 +128,7 @@ def test_unread_tender_cannot_be_success(tmp_path, status):
 @pytest.mark.parametrize("mutation,code", [
     (lambda value: value["requirements"][0]["citation"].update(quote="并不存在的原文"), "LIVE_CITATION_QUOTE_FORBIDDEN"),
     (lambda value: value["requirements"][0]["citation"].update(locator="elsewhere"), "CITATION_LOCATION"),
-    (lambda value: value.update(reviewed_block_ids=[]), "WINDOW_BLOCK_DENOMINATOR"),
+    (lambda value: value.update(reviewed_block_ids=[]), "LIVE_REVIEWED_BLOCK_IDS_FORBIDDEN"),
     (lambda value: value["requirements"][0].update(required_fact_labels=["未出现字段"]), "LABEL_NOT_GROUNDED"),
 ])
 def test_source_grounding_and_denominator_reject_candidates(tmp_path, mutation, code):
@@ -151,7 +151,8 @@ def test_repeated_quote_requires_unambiguous_larger_excerpt(tmp_path):
     blocks, _, documents = _index(parsed, manifest)
     window = _windows(documents, blocks, {})[0][0]
     with pytest.raises(PlanningError, match="CITATION_QUOTE_NOT_UNIQUE_EXACT"):
-        _validate_window(response({"window": window}, [candidate]), window)
+        _validate_window({"reviewed_block_ids": [b["block_id"] for b in window["blocks"]],
+                          "requirements": [candidate], "format_chapters": [], "format_status": "none_verified"}, window)
 
 
 def test_failed_window_resume_reuses_completed_and_preserves_money_and_negation(tmp_path):

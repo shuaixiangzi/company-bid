@@ -63,7 +63,8 @@ def test_complete_chain_preserves_original_grid_and_trace_and_rerenders_without_
                     requirements.append({"citation": cite(block), "category": "qualification", "response_mode": "attachment", "format_status": "not_prescribed", "attachment_keywords": ["营业执照"]})
                 elif text.startswith("响应文件须"):
                     requirements.append({"citation": cite(block), "category": "procedure", "response_mode": "procedure", "format_status": "not_prescribed"})
-            result = {"reviewed_block_ids": [b["block_id"] for b in blocks], "requirements": requirements, "format_status": "specified",
+            result = {"window_id": data["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted", "unresolved_block_ids": [],
+                      "requirements": requirements, "format_status": "specified",
                       "format_chapters": [{"title": heading["text"], "level": 1, "citation": cite(heading),
                         "content_block_ids": [heading["block_id"], grid["block_id"]], "requirement_indices": [], "status": "prescribed"}]}
         elif data.get("task_type") == "map_form_fields":

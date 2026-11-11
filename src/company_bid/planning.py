@@ -17,7 +17,7 @@ from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
     _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid,
-    _heading_level, _pdf_footer_skips, extract_requirements,
+    _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result,
 )
 
 
@@ -361,7 +361,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     _fail(not isinstance(frozen_window_config, dict) or set(frozen_window_config) != {"window_max_chars", "window_max_blocks"},
           "EXTRACTION_WINDOW_CONFIGURATION_MISSING")
     windows, denominator = _windows(documents, blocks, frozen_window_config)
-    expected_coverage = {"status": "complete", "tender_unit_count": len(denominator), "window_count": len(windows),
+    expected_coverage = {"status": "complete", "semantic_review": "requires_source_review", "tender_unit_count": len(denominator), "window_count": len(windows),
                          "completed_window_count": len(windows), "units": denominator}
     for row in denominator:
         row["window_ids"] = [window["window_id"] for window in windows if row["unit_id"] in window["unit_ids"]]
@@ -375,8 +375,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     verified_results = []
     for result in extracted["window_results"]:
         _fail(result.get("status") != "complete", "EXTRACTION_COVERAGE_INCOMPLETE")
-        validated = _validate_window(_wire_candidate(result["candidate"]), by_window[result["window_id"]])
-        _fail(validated != result.get("validated"), "EXTRACTION_VALIDATION_MISMATCH")
+        validated = _validate_normalized_window_result(result, by_window[result["window_id"]])
         verified_results.append({**result, "validated": validated})
     expected_requirements, expected_formats = _merge_results(verified_results)
     _fail(expected_requirements != extracted.get("requirements") or expected_formats != extracted.get("format_chapters"),

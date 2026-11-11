@@ -8,7 +8,7 @@ from company_bid.extraction import (
     PlanningError, _index, _validate_window, _windows, _wire_candidate,
     extract_requirements, validate_live_window,
 )
-from test_source_selected_citations import Context, fixture, block, selected, candidate, window_for
+from test_source_selected_citations import Context, fixture, block, selected, live_candidate as candidate, internal_candidate, window_for
 
 
 def native_pair(tmp_path, *, left_text="公司应提供完整的项目负责", right_text="人姓名作为明确输入。", source_format="pdf", origin="native"):
@@ -202,6 +202,6 @@ def test_live_cannot_secretly_echo_quote_even_when_internal_recorded_contract_ac
     with pytest.raises(PlanningError, match="LIVE_CITATION_QUOTE_FORBIDDEN"):
         validate_live_window(raw, window)
     if quote is None or quote == source["text"]:
-        assert _validate_window(raw, window)["requirements"][0]["citation"]["quote"] == source["text"]
+        assert _validate_window(internal_candidate(raw, window), window)["requirements"][0]["citation"]["quote"] == source["text"]
     with pytest.raises(PlanningError, match="LIVE_CITATION_QUOTE_FORBIDDEN"):
         extract_requirements(Context(), parsed, manifest, lambda *args: raw, {})

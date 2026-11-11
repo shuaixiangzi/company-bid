@@ -66,6 +66,18 @@ def candidate(payload, citation):
         "format_chapters": [], "format_status": "none_verified"}
 
 
+def live_candidate(payload, citation):
+    value = candidate(payload, citation)
+    value.pop("reviewed_block_ids")
+    return {"window_id": payload["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted",
+            "unresolved_block_ids": [], **value}
+
+
+def internal_candidate(value, window):
+    return {"reviewed_block_ids": [b["block_id"] for b in window["blocks"]],
+            **{key: value[key] for key in ("requirements", "format_chapters", "format_status")}}
+
+
 def window_for(parsed, manifest):
     blocks, _, documents = _index(parsed, manifest)
     return _windows(documents, blocks, {})[0][0]
@@ -95,7 +107,7 @@ def test_omitted_quote_is_copied_in_full_and_revalidated_by_n3(tmp_path, caller_
     ctx = Context()
     def call(ctx, task_type, unit_id, payload, validate):
         assert "quote" not in payload["output_contract"]["$defs"]["_Citation"]["properties"]
-        raw = candidate(payload, selected(first, second))
+        raw = live_candidate(payload, selected(first, second))
         return validate(raw) if caller_returns_validated else raw
     output = extract_requirements(ctx, parsed, manifest, call, {})
     citation = output["requirements"][0]["citations"][0]
@@ -173,7 +185,7 @@ def test_second_validation_rejects_a_caller_that_changes_the_rebuilt_quote(tmp_p
     manifest, parsed = fixture(tmp_path)
     a, b = block(parsed, "B1", "先取得许可，"), block(parsed, "B2", "否则不得操作。")
     def call(ctx, task_type, unit_id, payload, validate):
-        validated = validate(candidate(payload, selected(a, b)))
+        validated = validate(live_candidate(payload, selected(a, b)))
         validated["requirements"][0]["citation"]["quote"] = b["text"]
         return validated
     with pytest.raises(PlanningError, match="JSON_CALLER_VALIDATION_RESULT_MISMATCH"):
@@ -186,7 +198,7 @@ def test_table_selection_copies_the_entire_original_tsv_without_rewriting(tmp_pa
     source = block(parsed, "TABLE", "reader text is not the TSV", kind="table", rows=rows, merges=[], column_widths=[1, 1, 1])
     expected = "\n".join("\t".join(row) for row in rows)
     output = extract_requirements(Context(), parsed, manifest,
-        lambda ctx, task_type, unit_id, payload, validate: validate(candidate(payload, selected(source))), {})
+        lambda ctx, task_type, unit_id, payload, validate: validate(live_candidate(payload, selected(source))), {})
     citation = output["requirements"][0]["citations"][0]
     assert citation["quote"] == expected and citation["basis"] == "table_rows_tsv_v1"
     assert citation["quote"].endswith("\t\t")

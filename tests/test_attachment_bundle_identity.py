@@ -41,7 +41,7 @@ def prepare(tmp_path, candidates):
     parsed = read_documents(ctx, [{**manifest["sources"][0], "role": "tender"}], {})
     def extract(ctx, task_type, unit_id, payload, validate):
         block = payload["window"]["blocks"][0]
-        return validate({"reviewed_block_ids": [b["block_id"] for b in payload["window"]["blocks"]],
+        return validate({"window_id": payload["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted", "unresolved_block_ids": [],
             "requirements": [{"citation": {key: block[key] for key in ("source_id", "block_id", "locator")},
                               "category": "qualification", "response_mode": "attachment", "format_status": "not_prescribed",
                               "attachment_keywords": ["LICENSE"]}], "format_chapters": [], "format_status": "none_verified"})

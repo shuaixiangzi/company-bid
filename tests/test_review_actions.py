@@ -65,7 +65,8 @@ def automatic(tmp_path, monkeypatch, *, explanation=False, unresolved_format=Fal
                 requirements.append(item)
         heading = next(block for block in blocks if block.get("text") == "第二章 报价表")
         grid = next(block for block in blocks if block["kind"] == "table")
-        return validate({"reviewed_block_ids": [block["block_id"] for block in blocks], "requirements": requirements,
+        return validate({"window_id": payload["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted", "unresolved_block_ids": [],
+            "requirements": requirements,
             "format_status": "specified", "format_chapters": [{"title": heading["text"], "level": 1,
                 "citation": {key: heading[key] for key in ("source_id", "block_id", "locator")},
                 "content_block_ids": [grid["block_id"]]}]})

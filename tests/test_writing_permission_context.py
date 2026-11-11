@@ -48,7 +48,8 @@ def prepare(tmp_path, permission, *, previous=None, clipped_quote=None, window_b
                          "format_status": "prescribed", "format_title": title}] if requirement_block["block_id"] in targets else []
         formats = [{"title": title, "level": 1, "citation": heading_citation,
                     "content_block_ids": [block["block_id"] for block in blocks[1:] if block["block_id"] in targets]}] if "B0" in targets else []
-        return validate({"reviewed_block_ids": list(targets), "requirements": requirements, "format_chapters": formats,
+        return validate({"window_id": payload["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted", "unresolved_block_ids": [],
+                         "requirements": requirements, "format_chapters": formats,
                          "format_status": "specified" if formats else "none_verified"})
     ctx = Context()
     extracted = extract_requirements(ctx, parsed, manifest, candidate, {"window_max_blocks": window_blocks})
