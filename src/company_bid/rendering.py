@@ -277,6 +277,7 @@ def _format_table(document, table, weights, style):
                 _indent(paragraph._p, 0, style.table_pt)
                 paragraph.paragraph_format.space_after = paragraph.paragraph_format.space_before = Pt(0)
                 paragraph.paragraph_format.line_spacing = style.body_line_spacing
+                paragraph.paragraph_format.keep_with_next = row_index == 0
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if row_index == 0 else WD_ALIGN_PARAGRAPH.LEFT
                 for run in paragraph.runs:
                     _font(run, name=style.font_family, size=style.table_pt, bold=True if row_index == 0 else None)

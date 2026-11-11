@@ -83,7 +83,9 @@ def test_table_grid_cell_widths_and_borders_match_available_page_area(tmp_path):
     assert all(edge.get(qn("w:color")) == "000000" for edge in table._tbl.tblPr.find(qn("w:tblBorders")))
     assert all(int(c._tc.tcPr.tcW.get(qn("w:w"))) == width for c, width in zip(table.rows[0].cells, grid))
     assert table.rows[0]._tr.xpath("./w:trPr/w:tblHeader")
+    assert all(paragraph.paragraph_format.keep_with_next for cell in table.rows[0].cells for paragraph in cell.paragraphs)
     for row in table.rows:
+        assert row._tr.xpath("./w:trPr/w:cantSplit")
         assert not row._tr.xpath('./w:trPr/w:trHeight[@w:hRule="exact"]')
         for cell in row.cells:
             assert cell.paragraphs[0]._p.xpath('./w:pPr/w:ind[@w:firstLineChars="0"]')
