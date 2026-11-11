@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from .source_clauses import build_clause_catalog
 
 
-EXTRACTION_VERSION = "requirements-window-v8"
+EXTRACTION_VERSION = "requirements-window-v9"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -69,7 +69,8 @@ class _Requirement(_Strict):
     format_title: str | None = None
     required_fact_labels: list[Text] = Field(default_factory=list, max_length=30,
         description="仅待公司/项目填入的事实字段；不列招标已给工程量、方法、固定服务周期、限价或验收标准。引用原字与空白，跨行优先保留LF；不得任意删空白。")
-    attachment_keywords: list[Text] = Field(default_factory=list, max_length=15)
+    attachment_keywords: list[Text] = Field(default_factory=list, max_length=15,
+        description="本条选文中逐字出现的证明名称；保留原字、空格、标点和LF，不能摘要改写，无法定位则为空。")
     reference_keywords: list[Text] = Field(default_factory=list, max_length=15,
         description="仅本条完整选文中可逐字定位的检索词；不能借其它条款标题，无法定位就为空。")
 
@@ -99,7 +100,7 @@ class _LiveWindowResponse(_Strict):
     requirements: list[_Requirement]
     format_chapters: list[_FormatChapter]
     format_status: Literal["none_verified", "specified", "unread", "conflict"] = Field(
-        description="仅本窗目标blocks的实际响应格式：none_verified=none_in_this_window，非全书无格式；其它页catalog不构成本窗unread。")
+        description="仅本窗目标blocks的实际响应格式：specified必须有非空format_chapters；仅提及其它页格式时不得选specified。none_verified=none_in_this_window，非全书无格式；其它页catalog不构成本窗unread。")
 
 
 def source_selected_output_contract() -> dict:
@@ -118,6 +119,10 @@ def source_selected_output_contract() -> dict:
          "then": {"properties": {"category": {"enum": list(categories)}}, "required": ["category"]}}
         for mode, (categories, _) in _RESPONSE_CATEGORY_RULES.items()
     ]
+    schema["allOf"] = [{
+        "if": {"properties": {"format_status": {"const": "specified"}}, "required": ["format_status"]},
+        "then": {"properties": {"format_chapters": {"minItems": 1}}, "required": ["format_chapters"]},
+    }]
     return schema
 
 
@@ -332,6 +337,16 @@ _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不�
 def _heading_only_text(text: str) -> bool:
     text = text.strip()
     if not text or len(text) > 90 or "\n" in text or re.search(r"[。；;！？!?]", text):
+        return False
+    # A year followed by a closing annual-period parenthesis continues a
+    # sentence from the preceding PDF line. It is not a section number.
+    # Keep ordinary year-led titles and every geometry/source check intact.
+    if re.match(r"^\d{4}\s*年度?[）)]", text):
+        return False
+    # A numbered lookup instruction naming a URL and the contents within
+    # that system is operative prose, even before its first sentence end.
+    if (re.match(r"^\d+(?:\.\d+){0,4}\s*(?:查询|检索|查看)", text) and
+            re.search(r"[（(]https?://[^\s（）()]+[）)]中", text)):
         return False
     match = re.match(r"^(?:第[零一二三四五六七八九十百0-9]+[章节篇部]|[（(]?[一二三四五六七八九十百]+[）)、．.]|\d+(?:\.\d+){0,4}[、．.]?\s*)(.{2,70})$", text)
     if not match:
@@ -922,6 +937,7 @@ _EXTRACT_INSTRUCTIONS = (
     "required_fact_labels仅公司/项目待填事实（如公司注册地址、明确报价输入），不能列招标已给工程量/方法/周期/限价/标准；没有待填事实即为空。"
     "三类labels/keywords须逐字来自本条完整选文，不能借其它条标题；reference_keywords无法定位即[]。跨行优先保留LF；只准native_pdf_line_edges证明的软换行接续，保留源内空白/标点。"
     "format_status只判本窗目标blocks的响应格式；none_verified即none_in_this_window，非全书无格式。catalog提到后页不算本窗unread；本窗实际格式未读/冲突才标unread/conflict。"
+    "specified必须同时输出本窗实际格式的非空format_chapters；仅要求关联后窗格式时可在requirement.format_title填写原题，但本窗没有格式正文则format_chapters=[]、format_status=none_verified。"
     "confidence如实标high/medium/low。不得生成事实值、报价、表内容、签章、工具调用或事实ID；无要求可返回空列表。"
 )
 

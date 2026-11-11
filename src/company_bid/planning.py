@@ -22,7 +22,7 @@ from .extraction import (
 )
 
 
-PLANNING_VERSION = "bid-plan-v2"
+PLANNING_VERSION = "bid-plan-v3"
 
 
 class _Fill(_Strict):
@@ -256,6 +256,65 @@ def _reference(requirement: dict, blocks: dict, units: dict, sources: dict) -> d
             "retained_points": hits, "excluded_points": ["历史项目、公司、人员、业绩和设备事实", "旧报价、旧日期和未经本次要求授权的服务承诺"]}
 
 
+def _fixed_letter_items(body: list, anchors: dict) -> dict:
+    """Prove numbered declarations locally without changing source headings.
+
+    Only a prescribed letter with an explicit declaration introducer and a
+    consecutive list starting at one can override the broad heading heuristic.
+    An unknown heading, number gap, other form or chapter ends that proof.
+    """
+    numbered = re.compile(r"^(\d{1,3})([.．、])\s*(?!\d)(\S.*)$")
+    form_title = re.compile(r"(?:表|函|书|资料|材料|方案|声明|承诺|证明|清单|目录)$")
+    declaration = re.compile(r"(?:承诺|声明|保证)\s*[:：]$")
+    clause = re.compile(r"^(?:我(?:公司|方|单位)|本(?:公司|单位|项目)|不存在|未(?:被|在|参与|参加|发生|出现|提供|受到|列入)|不(?:存在|属于|在|得|与)|具有|具备|参加|按照|遵守|承诺|保证|声明)")
+    addition_note = re.compile(r"^[（(][^。；;\n]*可(?:自行)?(?:补充|增加|添加)[^。；;\n]*[）)]$")
+    result = {}
+    for position, anchor in enumerate(body):
+        chapter = anchors.get(anchor["block_id"])
+        if (not chapter or chapter["status"] != "prescribed" or
+                not re.search(r"(?:函|承诺书|声明书|保证书)$", chapter["title"].strip())):
+            continue
+        introducer, previous, first, marker, number = None, None, None, None, 0
+        for block in body[position + 1:]:
+            key, text = block["block_id"], block.get("text", "").strip()
+            level = _heading_level(text)
+            if key in anchors or level == 0 or block["kind"] != "paragraph":
+                break
+            item = numbered.fullmatch(text)
+            if item:
+                value, item_marker, content = int(item[1]), item[2], item[3]
+                if (introducer is None or value != number + 1 or
+                        marker is not None and item_marker != marker or
+                        level is not None and (previous is None or form_title.search(content) or
+                            not (clause.search(content) or addition_note.fullmatch(content)))):
+                    break
+                first = first or key
+                if level is not None:
+                    proof = {"rule": "fixed_letter_consecutive_declarations_v1",
+                             "anchor_block_id": anchor["block_id"], "introducer_block_id": introducer,
+                             "list_start_block_id": first, "previous_item_block_id": previous,
+                             "item_number": value, "number_marker": item_marker,
+                             "original_heading_level": level,
+                             "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()}
+                    result[key] = {**proof, "proof_sha256": _hash(proof)}
+                number, marker, previous = value, item_marker, key
+            elif level is not None:
+                break
+            elif not number and declaration.search(text):
+                introducer = key
+    return result
+
+
+def _writing_instruction_only(text: str) -> bool:
+    """Recognize whole drafting instructions, never a mixed fixed declaration."""
+    return re.fullmatch(
+        r"[（(]?\s*(?:注[：:]\s*)?(?:响应人|投标人|供应商)?\s*(?:可以|可|应当|应|须|需)?\s*"
+        r"(?:本(?:项目)?的?)?(?:(?:技术|服务|施工|实施|设计)?方案)?\s*"
+        r"(?:自行编(?:写|制)(?:技术方案|方案)?|自拟(?:格式|方案)|格式自拟|自定义格式|自定格式)"
+        r"(?:[，,]\s*根据[^。；;！？!?\n]{1,120}(?:要求|规定)编(?:写|制))?\s*[）)]?[。.]?",
+        text.strip()) is not None
+
+
 def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, list, list]:
     """Account for whole structural format regions, including window continuations.
 
@@ -275,6 +334,11 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                 not re.search(r"(?:^|/)(?:header|footer)\d*\.xml", block["locator"])]
         body.sort(key=lambda block: block["ordinal"])
         positions = {block["block_id"]: i for i, block in enumerate(body)}
+        letter_items = _fixed_letter_items(body, anchors)
+
+        def structural_level(block):
+            return None if block["block_id"] in letter_items else _heading_level(block.get("text", ""))
+
         regions = []
         for i, block in enumerate(body):
             text = block.get("text", "").strip()
@@ -289,8 +353,9 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             if any(a <= start < b for a, b, _ in regions):
                 continue
             level = _heading_level(body[start].get("text", ""))
-            end = next((j for j in range(start + 1, len(body)) if _heading_level(body[j].get("text", "")) is not None and
-                        _heading_level(body[j]["text"]) <= (level if level is not None else 1)), len(body))
+            end = next((j for j in range(start + 1, len(body)) if body[j]["block_id"] in anchors or
+                        structural_level(body[j]) is not None and
+                        structural_level(body[j]) <= (level if level is not None else 1)), len(body))
             # A following obvious form heading is not evidence that its format
             # was read. Extend the ledger so a missed form fails explicitly.
             if end < len(body) and body[end]["block_id"] not in anchors and re.search(r"(?:表|函|书|证明|承诺)$", body[end].get("text", "").strip()):
@@ -301,7 +366,7 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                 errors.append({"reason": "format_region_has_no_grounded_chapter", "block_id": body[start]["block_id"],
                                "locator": body[start]["locator"]})
         relevant = {i for start, end, _ in regions for i in range(start, end)}
-        owners = {}
+        owners, boundaries = {}, {}
         for chapter in formats:
             anchor = chapter["citation"]["block_id"]
             if anchor not in positions:
@@ -311,8 +376,9 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             region_end = min((b for _, b in containing), default=len(body))
             source_level = _heading_level(body[anchor_position].get("text", ""))
             boundary = next((j for j in range(anchor_position + 1, region_end)
-                             if body[j]["block_id"] in anchors or (_heading_level(body[j].get("text", "")) is not None and
-                                _heading_level(body[j]["text"]) <= (source_level if source_level is not None else 1))), region_end)
+                             if body[j]["block_id"] in anchors or (structural_level(body[j]) is not None and
+                                structural_level(body[j]) <= (source_level if source_level is not None else 1))), region_end)
+            boundaries[anchor] = boundary
             for block_id in chapter["content_block_ids"]:
                 position = positions.get(block_id)
                 if position is None or not anchor_position <= position < boundary or block_id in owners:
@@ -322,7 +388,7 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
         for i in sorted(relevant):
             block = body[i]
             block_id, text = block["block_id"], block.get("text", "").strip()
-            if (_heading_level(text) is not None and block_id not in anchors and
+            if (structural_level(block) is not None and block_id not in anchors and
                     re.search(r"(?:表|函|书|资料|方案|声明|承诺)$", text) and
                     not (_heading_level(text) == 0 and re.search(r"(?:投标|响应|报价).{0,18}(?:格式|组成)", text))):
                 errors.append({"reason": "unextracted_format_heading", "block_id": block_id, "locator": block["locator"]})
@@ -335,9 +401,10 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             else:
                 candidates = [chapter for chapter in formats if chapter["citation"]["block_id"] in positions and
                               positions[chapter["citation"]["block_id"]] <= i and
+                              i < boundaries[chapter["citation"]["block_id"]] and
                               any(a <= positions[chapter["citation"]["block_id"]] <= i < b for a, b, _ in regions)]
                 owner = max(candidates, key=lambda chapter: positions[chapter["citation"]["block_id"]]) if candidates else None
-                if owner and _heading_level(text) is None and block["kind"] != "image" and owner["status"] == "prescribed":
+                if owner and structural_level(block) is None and block["kind"] != "image" and owner["status"] == "prescribed":
                     owner["content_block_ids"].append(block_id)
                     owner["content_block_ids"].sort(key=lambda key: blocks[key]["ordinal"])
                     status = "structural_continuation"
@@ -346,8 +413,18 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                     errors.append({"reason": "unassigned_format_block", "block_id": block_id, "locator": block["locator"]})
             if block["kind"] == "image" and status not in {"chapter_boundary", "format_region_boundary"}:
                 errors.append({"reason": "unread_editable_format_image", "block_id": block_id, "locator": block["locator"]})
-            ledger.append({"source_id": block["source_id"], "block_id": block_id, "locator": block["locator"],
-                           "kind": block["kind"], "status": status, "format_id": owner["format_id"] if owner else None})
+            row = {"source_id": block["source_id"], "block_id": block_id, "locator": block["locator"],
+                   "kind": block["kind"], "status": status, "format_id": owner["format_id"] if owner else None}
+            if block_id in letter_items:
+                row["continuation_basis"] = letter_items[block_id]
+            if block_id in boundaries:
+                boundary = boundaries[block_id]
+                row["boundary_basis"] = {
+                    "block_id": body[boundary]["block_id"] if boundary < len(body) else None,
+                    "locator": body[boundary]["locator"] if boundary < len(body) else None,
+                    "reason": "next_grounded_format" if boundary < len(body) and body[boundary]["block_id"] in anchors else
+                              "source_heading_or_region_end" if boundary < len(body) else "source_end"}
+            ledger.append(row)
     return formats, ledger, errors
 
 
@@ -463,6 +540,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         table_owners, attachment_owners, section_formats = {}, {}, {}
         placements, table_reports, attachment_reports = [], [], []
         writing_space_reports = []
+        instruction_omissions = []
         factual_response_reports = []
 
         def scoped_source(citation):
@@ -562,6 +640,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             section = new_section(chapter["format_id"], chapter["title"], refs, chapter["level"], structural["source_refs"])
             section_formats[section["section_id"]] = chapter["status"]
             assigned.update(refs)
+            permission_blocks = {key for (format_id, _), citations in writing_spaces.items()
+                                 if format_id == chapter["format_id"] for citation in citations
+                                 for key in citation.get("block_ids", [citation["block_id"]])}
             for block_id in chapter["content_block_ids"]:
                 block = blocks[block_id]
                 source_ref = scoped_source({"source_id": block["source_id"], "block_id": block_id,
@@ -569,10 +650,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 if block["kind"] == "paragraph":
                     if not block.get("text", "").strip() or block["text"].strip() == chapter["title"].strip():
                         continue
-                    if (any(key[0] == chapter["format_id"] for key in writing_spaces) and
-                            re.fullmatch(r"[（(]?(?:响应人|投标人|供应商)?\s*自行编(?:写|制)(?:技术方案|方案)?[）)]?[。.]?", block["text"].strip())):
+                    if block_id in permission_blocks and _writing_instruction_only(block["text"]):
                         # This is the grounded permission to draft, not text
                         # that the final bidder should present as its answer.
+                        instruction_omissions.append({"format_id": chapter["format_id"], "block_id": block_id,
+                            "source_ref": source_ref, "basis": "whole_grounded_drafting_instruction",
+                            "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()})
                         continue
                     section["fixed_content"].append({"kind": "paragraph", "text": block["text"], "source_refs": [source_ref]})
                     if has_fill_marker(block["text"]) or re.search(r"签字|盖章", block["text"]):
@@ -734,6 +817,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
+                  "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
                   "review_actions": review_actions,
                   "counts": {"requirements": len(requirements), "sections": len(sections), "writing_tasks": sum(len(s["writing_tasks"]) for s in sections),

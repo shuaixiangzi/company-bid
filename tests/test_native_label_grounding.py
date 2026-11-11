@@ -75,6 +75,53 @@ def test_unproven_cross_line_label_can_instead_keep_its_original_lf(tmp_path):
     assert result["requirements"][0]["citation"]["label_grounding"][0]["basis"] == "exact_quote"
 
 
+def test_parenthesized_annual_period_continuation_is_not_a_numbered_heading(tmp_path):
+    manifest, parsed, a, b = native_pair(tmp_path,
+        left_text="2025 年度）经审计的财务报表，包括资产负债表、现金",
+        right_text="流量表、利润表。")
+    window = window_for(parsed, manifest)
+    result = validate_live_window(with_label(window, a, b, "现金流量表"), window)
+    citation = result["requirements"][0]["citation"]
+    assert citation["quote"] == a["text"] + "\n" + b["text"]
+    assert citation["label_grounding"][0]["basis"] == "native_pdf_line_join_v1"
+    assert _validate_window(_wire_candidate(result), window) == result
+
+
+def test_numbered_lookup_instruction_is_prose_but_lookup_title_is_not(tmp_path):
+    manifest, parsed, a, b = native_pair(tmp_path,
+        left_text="5.2 查询信用信息系统（https://example.invalid）中公开的经营异常",
+        right_text="名录信息并记录查询时间。")
+    window = window_for(parsed, manifest)
+    result = validate_live_window(with_label(window, a, b, "经营异常名录信息"), window)
+    citation = result["requirements"][0]["citation"]
+    assert citation["quote"] == a["text"] + "\n" + b["text"]
+    assert citation["label_grounding"][0]["basis"] == "native_pdf_line_join_v1"
+    a["text"] = "5.2 查询流程"
+    b["text"] = "记录作为查询依据。"
+    with pytest.raises(PlanningError, match="EXTRACTION_LABEL_NOT_GROUNDED"):
+        validate_live_window(with_label(window_for(parsed, manifest), a, b, "流程记录"), window_for(parsed, manifest))
+
+
+@pytest.mark.parametrize("change", ["year_title", "column", "gap", "ocr", "omitted_character"])
+def test_annual_period_fix_does_not_join_titles_or_unproved_or_rewritten_text(tmp_path, change):
+    manifest, parsed, a, b = native_pair(tmp_path,
+        left_text="2025 年度）经审计的财务报表，包括资产负债表、现金",
+        right_text="流量表、利润表。")
+    label = "现金流量表"
+    if change == "year_title":
+        a["text"] = "2025 年度财务报表和现金"
+    elif change == "column":
+        b["bbox"] = [400, 38, 580, 48]
+    elif change == "gap":
+        b["bbox"] = [40, 110, 220, 120]
+    elif change == "ocr":
+        a["origin"] = b["origin"] = "ocr"
+    else:
+        label = "现金流表"
+    with pytest.raises(PlanningError, match="EXTRACTION_LABEL_NOT_GROUNDED"):
+        validate_live_window(with_label(window_for(parsed, manifest), a, b, label), window_for(parsed, manifest))
+
+
 def test_geometry_evidence_is_frozen_in_context_identity_and_cannot_be_self_reported(tmp_path):
     manifest, parsed, a, b = native_pair(tmp_path)
     first = window_for(parsed, manifest)

@@ -17,3 +17,4 @@
 13. 用户后续明确将当前正式 LLM 测试暂时切换到 OpenCode Go 的 DeepSeek V4.1 Flash 最高推理档。新测试使用 Go 专用 endpoint、`deepseek-v4.1-flash`、`thinking=enabled`、`reasoning_effort=max`；凭据仅来自受控本地文件/环境，不改旧 run 或自动回退到原 DeepSeek API。订阅额度估算与 Provider 报告的余额费用分开；计费来源不符合 Go 或不可确认时停止后续调用。
 14. 用户要求本次 Go 切换收尾后暂停，晚上再继续；暂停期间不继续发起模型/OCR 调用。DeepSeek 直连仅在北京时间 19:00 后的夜间考虑启用，当前 Go 配置不因此自动切回直连。后续变更仍冻结新 run 配置并沿用断点、用量和费用保护。
 15. 用户已恢复执行，并在 Go 两次真实调用后明确要求停止纠结标签校验问题、换回 DeepSeek 直连。当前采用原先直连 `deepseek-flash`、`thinking=enabled`、`reasoning_effort=low`，仅在上述夜间时段运行；Go 记录保留，不再发起 Go 请求。配置变更创建子 run，继续复用有效 N0/N1；不为通过输出而改写旧候选或放宽校验。
+16. 用户再次要求继续推进主链。优先使用已捕获响应做有界离线修复与验证；修正可证明的原生排版误判，不继续服务对比实验，不靠反复真实调用碰运气。当前修复和实际运行结果见 docs/09-full-chain-migration.md 最新记录。
