@@ -85,6 +85,7 @@ class ChatConfig:
     input_usd_per_million: float = 0.30
     output_usd_per_million: float = 1.20
     thinking_mode: str | None = None
+    reasoning_effort: str | None = None
 
     def __post_init__(self):
         url = urlsplit(self.endpoint)
@@ -97,6 +98,9 @@ class ChatConfig:
         if not 1 <= self.max_output_tokens <= 8000 or not 1 <= self.max_input_chars <= 100000:
             raise ProviderFailure("PROVIDER_BUDGET_INVALID")
         if not 1 <= self.max_run_calls <= 200 or self.thinking_mode not in (None, "enabled", "disabled"):
+            raise ProviderFailure("PROVIDER_CONFIG_INVALID")
+        if (self.reasoning_effort not in (None, "low", "high", "max") or
+                self.reasoning_effort is not None and self.thinking_mode != "enabled"):
             raise ProviderFailure("PROVIDER_CONFIG_INVALID")
         if any(not math.isfinite(x) or x <= 0 for x in (self.max_run_usd, self.input_usd_per_million, self.output_usd_per_million)):
             raise ProviderFailure("PROVIDER_BUDGET_INVALID")
@@ -173,6 +177,8 @@ class ChatProposalProvider:
             "response_format": {"type": "json_object"}}
         if self.config.thinking_mode is not None:
             payload["thinking"] = {"type": self.config.thinking_mode}
+        if self.config.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.config.reasoning_effort
         # UTF-8 byte count plus generous framing allowance is a conservative
         # request-token bound. Reserve at frozen configured peak prices; unknown
         # outcomes keep the reservation, so restart cannot reset the run budget.
