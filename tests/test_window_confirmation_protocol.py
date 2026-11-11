@@ -1,4 +1,4 @@
-"""V5 live confirmation accounts for frozen input without claiming semantics."""
+"""Live confirmation accounts for frozen input without claiming semantics."""
 import copy
 
 import pytest
@@ -56,7 +56,7 @@ def test_missing_unresolved_list_and_extra_completion_claim_fail_closed(tmp_path
             validate_live_window(raw, window)
 
 
-def test_unresolved_adjacent_id_is_not_a_target_or_a_later_window_completion(tmp_path):
+def test_unresolved_adjacent_id_is_only_a_deferred_context_not_target_completion(tmp_path):
     manifest, parsed = fixture(tmp_path)
     first = block(parsed, "B1", "应说明巡检方法。")
     second = block(parsed, "B2", "应提交异常复测记录。")
@@ -65,8 +65,9 @@ def test_unresolved_adjacent_id_is_not_a_target_or_a_later_window_completion(tmp
     assert second["block_id"] in {b["block_id"] for b in window["adjacent_context"]}
     raw = live_candidate({"window": window}, selected(first))
     raw["unresolved_block_ids"] = [second["block_id"]]
-    with pytest.raises(PlanningError, match="LIVE_UNRESOLVED_BLOCK_IDS_INVALID"):
-        validate_live_window(raw, window)
+    result = validate_live_window(raw, window)
+    assert result["reviewed_block_ids"] == [first["block_id"]]
+    assert second["block_id"] not in result["reviewed_block_ids"]
 
 
 def test_program_accounts_for_logo_footer_and_body_without_claiming_model_reviewed(tmp_path):

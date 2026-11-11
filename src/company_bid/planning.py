@@ -17,7 +17,7 @@ from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
     _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid,
-    _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result,
+    _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result, _close_deferred_context,
 )
 
 
@@ -377,6 +377,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _fail(result.get("status") != "complete", "EXTRACTION_COVERAGE_INCOMPLETE")
         validated = _validate_normalized_window_result(result, by_window[result["window_id"]])
         verified_results.append({**result, "validated": validated})
+    _fail(extracted.get("deferred_context_closure") != _close_deferred_context(windows, verified_results),
+          "EXTRACTION_DEFERRED_CLOSURE_MISMATCH")
     expected_requirements, expected_formats = _merge_results(verified_results)
     _fail(expected_requirements != extracted.get("requirements") or expected_formats != extracted.get("format_chapters"),
           "EXTRACTION_MERGE_MISMATCH")
