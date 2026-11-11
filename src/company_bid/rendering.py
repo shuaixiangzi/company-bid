@@ -231,7 +231,7 @@ def _issue_text(paragraph, issue, style, *, compact=False):
     _font(paragraph.add_run(marker), name=style.font_family, size=style.body_pt, bold=True, color="A80000")
 
 
-def _format_table(document, table, weights, style):
+def _format_table(document, table, weights, style, header_rows=1):
     page = document.sections[-1]
     width_twips = round((page.page_width - page.left_margin - page.right_margin) / 635)
     total = sum(weights)
@@ -263,7 +263,7 @@ def _format_table(document, table, weights, style):
     table_pr.append(margins)
     for row_index, row in enumerate(table.rows):
         row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
-        if row_index == 0:
+        if row_index < header_rows:
             repeat = OxmlElement("w:tblHeader")
             repeat.set(qn("w:val"), "true")
             row._tr.get_or_add_trPr().append(repeat)
@@ -277,17 +277,19 @@ def _format_table(document, table, weights, style):
                 _indent(paragraph._p, 0, style.table_pt)
                 paragraph.paragraph_format.space_after = paragraph.paragraph_format.space_before = Pt(0)
                 paragraph.paragraph_format.line_spacing = style.body_line_spacing
-                paragraph.paragraph_format.keep_with_next = row_index == 0
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if row_index == 0 else WD_ALIGN_PARAGRAPH.LEFT
+                paragraph.paragraph_format.keep_with_next = row_index < header_rows
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if row_index < header_rows else WD_ALIGN_PARAGRAPH.LEFT
                 for run in paragraph.runs:
-                    _font(run, name=style.font_family, size=style.table_pt, bold=True if row_index == 0 else None)
+                    _font(run, name=style.font_family, size=style.table_pt, bold=True if row_index < header_rows else None)
 
 
 def _render_table(document, spec, issues, style):
     _plain(document, spec.title, style, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, keep_next=True)
-    table = document.add_table(rows=1, cols=len(spec.columns))
-    for cell, label in zip(table.rows[0].cells, spec.columns):
-        cell.text = label
+    offset = int(spec.header_from_columns)
+    table = document.add_table(rows=offset, cols=len(spec.columns))
+    if spec.header_from_columns:
+        for cell, label in zip(table.rows[0].cells, spec.columns):
+            cell.text = label
     seen_issues = set()
     for values in spec.rows:
         row = table.add_row()
@@ -300,9 +302,16 @@ def _render_table(document, spec, issues, style):
                 _issue_text(cell.paragraphs[0], issues[issue_id], style, compact=issue_id in seen_issues)
                 seen_issues.add(issue_id)
     weights = spec.column_widths or ([1, 2.4] if len(spec.columns) == 2 else [1] * len(spec.columns))
-    _format_table(document, table, weights, style)
+    _format_table(document, table, weights, style, spec.repeat_header_rows)
     for merge in spec.merges:
-        table.cell(merge.row + 1, merge.column).merge(table.cell(merge.row + merge.row_span, merge.column + merge.col_span - 1))
+        anchor = table.cell(merge.row + offset, merge.column)
+        paragraph_count = len(anchor.paragraphs)
+        merged = anchor.merge(table.cell(merge.row + merge.row_span - 1 + offset, merge.column + merge.col_span - 1))
+        # python-docx appends the covered empty cells' paragraphs. They are
+        # geometry, not source content, and otherwise inflate the form's row.
+        for paragraph in merged.paragraphs[paragraph_count:]:
+            if not paragraph.text:
+                paragraph._p.getparent().remove(paragraph._p)
     spacer = _plain(document, "", style)
     spacer.paragraph_format.space_after = Pt(3)
     spacer.paragraph_format.line_spacing = 0.3
@@ -347,6 +356,8 @@ def _render_bid(package):
     issues = {issue.issue_id: issue for issue in package.issues}
     attachments = {item.attachment_id: item for item in package.attachments}
     for section_index, section in enumerate(package.sections):
+        if not section.render_body:
+            continue
         if section_index and section.start_on_new_page:
             document.add_page_break()
         document.add_paragraph(section.title, f"Heading {section.level}")
@@ -406,6 +417,8 @@ def _trace_appendix(document, package):
     trace("正文位置与要求映射", bold=True, keep_next=True)
     for section in package.sections:
         trace(f"{section.section_id} {section.title}；要求 {'、'.join(section.requirement_refs)}。")
+        if not section.render_body:
+            trace("该项为程序事项，无需投标正文；保留于制作检查记录。")
         for block in section.blocks:
             if isinstance(block, (HeadingBlock, TableBlock, AttachmentBlock)):
                 if isinstance(block, HeadingBlock):

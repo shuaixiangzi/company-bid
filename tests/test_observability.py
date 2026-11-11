@@ -88,6 +88,15 @@ def test_redaction_handles_structured_headers_signed_urls_and_credentials():
     encoded = json.dumps(result)
     assert "secret" not in encoded and "sid=abc" not in encoded and "user:pass" not in encoded
     assert "safe=yes" in result["url"] and "abc" not in result["url"]
+
+
+def test_redaction_cleans_credential_echoes_in_mapping_keys():
+    secret = "opaque-active-canary-86"
+    value = {"api_key": secret, secret: {"prefix-" + secret: "source text"}, "other": {"sk-testvalue0123456789": "unused"}}
+    result = redact_payload(value)
+    encoded = json.dumps(result)
+    assert secret not in encoded and "sk-testvalue0123456789" not in encoded
+    assert "source text" in encoded
     assert safe_metadata({"source_text": "private", "input_tokens": 3, "total_tokens": 4}) == {"input_tokens": 3, "total_tokens": 4}
 
 

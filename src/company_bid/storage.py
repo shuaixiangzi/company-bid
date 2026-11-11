@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -20,8 +22,45 @@ class RunLockedError(StorageError):
     code = "RUN_LOCKED"
 
 
+_INTEGRITY_REASONS = frozenset({"missing", "unreadable", "invalid_ref", "size_mismatch", "hash_mismatch",
+                                "invalid_json", "metadata_mismatch"})
+# These are application schema keys, never document labels or source IDs.
+# Unknown mapping keys suppress the entire location instead of echoing data.
+_ARTIFACT_SCHEMA_KEYS = frozenset({"data", "prepared", "package", "sources", "attachments", "documents", "units",
+                                   "files", "bid_docx", "issues_docx", "source_artifacts", "snapshot_artifact",
+                                   "source", "artifact", "input_ref", "output_ref"})
+
+
+def _artifact_schema_path(parts) -> str | None:
+    if not isinstance(parts, tuple) or len(parts) > 24:
+        return None
+    location = "$"
+    for part in parts:
+        if isinstance(part, str) and part in _ARTIFACT_SCHEMA_KEYS:
+            location += "." + part
+        elif isinstance(part, int) and not isinstance(part, bool) and 0 <= part < 1_000_000:
+            location += f"[{part}]"
+        else:
+            return None
+    return location
+
+
 class ArtifactIntegrityError(StorageError):
     code = "CHECKPOINT_INVALID"
+
+    def __init__(self, message: str, *, reference=None, reason="metadata_mismatch"):
+        super().__init__(message)
+        identifier = reference.get("artifact_id") if isinstance(reference, dict) else None
+        self.artifact_id = identifier if isinstance(identifier, str) and re.fullmatch(r"[0-9a-f]{32}", identifier) else None
+        self.reason = reason if isinstance(reason, str) and reason in _INTEGRITY_REASONS else "metadata_mismatch"
+        self._schema_parts = None
+
+    def diagnostic_context(self) -> dict:
+        """Only for controlled error capture; never serialize the reference."""
+        return {"artifact_id": self.artifact_id if isinstance(self.artifact_id, str) and
+                re.fullmatch(r"[0-9a-f]{32}", self.artifact_id) else None,
+                "reason": self.reason if isinstance(self.reason, str) and self.reason in _INTEGRITY_REASONS else "metadata_mismatch",
+                "schema_path": _artifact_schema_path(self._schema_parts)}
 
 
 def json_bytes(value: Any) -> bytes:
@@ -44,7 +83,7 @@ def _sync_directory(directory: Path) -> None:
             os.close(descriptor)
 
 
-def atomic_json(path: Path, value: Any) -> None:
+def atomic_json(path: Path, value: Any, *, on_replace_retry=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / ("." + path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
@@ -52,7 +91,22 @@ def atomic_json(path: Path, value: Any) -> None:
             handle.write(json_bytes(value))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        for attempt in range(1, 4):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError as error:
+                # Windows readers/antivirus can briefly deny replacement. Only
+                # state writes with a durable retry recorder opt into retries.
+                if (on_replace_retry is None or os.name != "nt" or attempt == 3
+                        or getattr(error, "winerror", None) not in (5, 32, 33)):
+                    raise
+                on_replace_retry(attempt, error)
+                with temporary.open("wb") as handle:
+                    handle.write(json_bytes(value))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                time.sleep(0.025 * attempt)
         _sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
@@ -106,10 +160,10 @@ class LocalStore:
 
     def resolve(self, relative: str) -> Path:
         if not isinstance(relative, str) or Path(relative).is_absolute():
-            raise ArtifactIntegrityError("Invalid storage reference.")
+            raise ArtifactIntegrityError("Invalid storage reference.", reason="invalid_ref")
         path = (self.root / relative).resolve()
         if not path.is_relative_to(self.root):
-            raise ArtifactIntegrityError("Storage reference leaves its root.")
+            raise ArtifactIntegrityError("Storage reference leaves its root.", reason="invalid_ref")
         return path
 
     def run_dir(self, run_id: str) -> Path:
@@ -127,7 +181,12 @@ class LocalStore:
             raise StorageError("Run state is unavailable or invalid.") from exc
 
     def write_state(self, state: dict) -> None:
-        atomic_json(self.run_dir(state["run_id"]) / "state.json", state)
+        def record_retry(attempt, error):
+            state.setdefault("storage_write_retries", []).append({
+                "operation": "state_replace", "retry_number": attempt,
+                "state_revision": state.get("revision"), "winerror": getattr(error, "winerror", None),
+                "error_code": "FILE_REPLACE_BUSY", "recorded_at": datetime.now(timezone.utc).isoformat()})
+        atomic_json(self.run_dir(state["run_id"]) / "state.json", state, on_replace_retry=record_retry)
 
     def put_bytes(self, run_id: str, name: str, content: bytes, media_type: str = "application/octet-stream") -> dict:
         directory = self.run_dir(run_id) / "artifacts"
@@ -154,27 +213,50 @@ class LocalStore:
         return self.put_bytes(run_id, name + ".json", json_bytes(value), "application/json")
 
     def read_bytes(self, reference: dict) -> bytes:
+        if (not isinstance(reference, dict) or not isinstance(reference.get("path"), str) or not reference["path"]
+                or not isinstance(reference.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", reference["sha256"])
+                or not isinstance(reference.get("size_bytes"), int) or isinstance(reference["size_bytes"], bool)
+                or reference["size_bytes"] < 0):
+            raise ArtifactIntegrityError("An immutable artifact reference is invalid.", reference=reference, reason="invalid_ref")
         try:
-            content = self.resolve(reference["path"]).read_bytes()
-            if len(content) != reference["size_bytes"] or hashlib.sha256(content).hexdigest() != reference["sha256"]:
-                raise ValueError
-            return content
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            raise ArtifactIntegrityError("An immutable artifact is missing or has changed.") from exc
+            target = self.resolve(reference["path"])
+        except (ArtifactIntegrityError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError("An immutable artifact reference is invalid.", reference=reference, reason="invalid_ref") from exc
+        except FileNotFoundError as exc:
+            raise ArtifactIntegrityError("An immutable artifact is missing.", reference=reference, reason="missing") from exc
+        except OSError as exc:
+            raise ArtifactIntegrityError("An immutable artifact is unreadable.", reference=reference, reason="unreadable") from exc
+        try:
+            content = target.read_bytes()
+        except FileNotFoundError as exc:
+            raise ArtifactIntegrityError("An immutable artifact is missing.", reference=reference, reason="missing") from exc
+        except OSError as exc:
+            raise ArtifactIntegrityError("An immutable artifact is unreadable.", reference=reference, reason="unreadable") from exc
+        if len(content) != reference["size_bytes"]:
+            raise ArtifactIntegrityError("An immutable artifact size has changed.", reference=reference, reason="size_mismatch")
+        if hashlib.sha256(content).hexdigest() != reference["sha256"]:
+            raise ArtifactIntegrityError("An immutable artifact hash has changed.", reference=reference, reason="hash_mismatch")
+        return content
 
     def read_json(self, reference: dict) -> Any:
         try:
             return json.loads(self.read_bytes(reference))
         except (ValueError, UnicodeError) as exc:
-            raise ArtifactIntegrityError("An immutable JSON artifact is invalid.") from exc
+            raise ArtifactIntegrityError("An immutable JSON artifact is invalid.", reference=reference, reason="invalid_json") from exc
 
     def validate_embedded_artifacts(self, value: Any) -> None:
         """Validate binary references embedded in a node/unit output as well."""
-        if isinstance(value, dict):
-            if {"artifact_id", "path", "sha256", "size_bytes"}.issubset(value):
-                self.read_bytes(value)
-            for item in value.values():
-                self.validate_embedded_artifacts(item)
-        elif isinstance(value, list):
-            for item in value:
-                self.validate_embedded_artifacts(item)
+        def validate(item, location):
+            if isinstance(item, dict):
+                if {"artifact_id", "path", "sha256", "size_bytes"}.issubset(item):
+                    try:
+                        self.read_bytes(item)
+                    except ArtifactIntegrityError as exc:
+                        exc._schema_parts = location
+                        raise
+                for key, child in item.items():
+                    validate(child, location + (key,))
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    validate(child, location + (index,))
+        validate(value, ())

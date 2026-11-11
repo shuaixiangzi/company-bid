@@ -13,6 +13,8 @@ dependencies = [
   "Pillow==13.0.0",
   "pypdf==6.21.4",
   "pdf2image==1.17.0",
+  "pdfplumber==0.11.9",
+  "pypdfium2==5.14.0",
   "opentelemetry-sdk==1.45.2",
 ]
 

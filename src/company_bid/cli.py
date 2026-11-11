@@ -1,10 +1,11 @@
-"""Single local M1 executor entry point; no web service or daemon threads."""
+"""One local entry point for automatic bids, prepared fixtures and library jobs."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from .pipeline import build_executor
@@ -24,7 +25,7 @@ def safe_summary(state):
 
 
 def parser():
-    command = argparse.ArgumentParser(description="M1 local document prototype; real PostgreSQL Worker follows in M2")
+    command = argparse.ArgumentParser(description="Local full-chain/document/library executor; PostgreSQL Worker follows in M2")
     command.add_argument("--root", type=Path, default=Path(".local/runtime"))
     command.add_argument("--config", type=Path, help="non-secret execution config JSON; secrets only in environment")
     command.add_argument("--credential-file", type=Path, help="optional local untracked key file; never serialized into run config")
@@ -32,18 +33,20 @@ def parser():
     create = actions.add_parser("create")
     create.add_argument("--input", type=Path, required=True)
     create.add_argument("--proposals", type=Path)
-    create.add_argument("--stop-after", choices=["N0", "N4", "N5", "N6"])
+    create.add_argument("--recorded-candidates", type=Path, help="explicit offline JSON candidates bound to request hashes")
+    create.add_argument("--stop-after", choices=[*[f"N{i}" for i in range(7)], "LIBRARY"])
     create.add_argument("--queue-only", action="store_true")
     for action in ("resume", "step"):
         item = actions.add_parser(action)
         item.add_argument("run_id")
-        item.add_argument("--stop-after", choices=["N0", "N4", "N5", "N6"], required=action == "step")
+        item.add_argument("--stop-after", choices=[*[f"N{i}" for i in range(7)], "LIBRARY"], required=action == "step")
     fork = actions.add_parser("rerun")
     fork.add_argument("run_id")
-    fork.add_argument("--from-node", choices=["N0", "N4", "N5", "N6"], required=True)
+    fork.add_argument("--from-node", choices=[*[f"N{i}" for i in range(7)], "LIBRARY"], required=True)
     fork.add_argument("--input", type=Path)
     fork.add_argument("--proposals", type=Path)
-    for action in ("inspect", "result", "repair"):
+    fork.add_argument("--recorded-candidates", type=Path)
+    for action in ("inspect", "result", "repair", "diagnose"):
         actions.add_parser(action).add_argument("run_id")
     compare = actions.add_parser("diff")
     compare.add_argument("old_run")
@@ -63,6 +66,14 @@ def main(argv=None):
             print(json.dumps({"prepared": str(args.directory / "prepared.json"), "synthetic": True}))
             return 0
         config = read_json(args.config) if args.config else {"provider": {"mode": "prepared"}, "debug_capture": True}
+        if args.command == "diagnose":
+            from .diagnostics import inspect_diagnostics
+            report = inspect_diagnostics(args.root, args.run_id)
+            target = args.root / "diagnostics" / f"{args.run_id}-{uuid.uuid4().hex}.json"
+            atomic_json(target, report)
+            print(json.dumps({"diagnostics": str(target.resolve()), "evidence_status": report["evidence_status"],
+                              "gap_count": len(report["gaps"]), "actual_call_attempts": report["actual_call_attempts"]}))
+            return 0
         if args.credential_file:
             auth_env = config.get("provider", {}).get("auth_env", "COMPANY_BID_API_KEY")
             if not auth_env.startswith("COMPANY_BID_"):
@@ -72,20 +83,27 @@ def main(argv=None):
                 raise ProviderFailure("LOCAL_CREDENTIAL_INVALID")
             os.environ[auth_env] = secret
         executor = build_executor(args.root, config)
+        input_key = {"automatic": "manifest", "library": "library_input"}.get(config.get("pipeline"), "prepared")
         if args.command == "create":
-            initial = {"prepared": read_json(args.input), "proposals": read_json(args.proposals) if args.proposals else {}}
+            initial = {input_key: read_json(args.input),
+                       "proposals": read_json(args.proposals) if args.proposals else {}}
+            if args.recorded_candidates:
+                initial["recorded_candidates"] = read_json(args.recorded_candidates)
             run_id = executor.create_run(initial)
             result = executor.inspect(run_id) if args.queue_only else executor.execute(run_id, stop_after=args.stop_after)
         elif args.command in ("resume", "step"):
             result = executor.resume(args.run_id, stop_after=args.stop_after)
         elif args.command == "rerun":
             initial = None
-            if args.input or args.proposals:
-                if args.from_node != "N0":
+            if args.input or args.proposals or args.recorded_candidates:
+                if args.from_node != ("LIBRARY" if input_key == "library_input" else "N0"):
                     raise ProviderFailure("CHANGED_PREPARED_INPUT_REQUIRES_N0")
                 if not args.input:
                     raise ProviderFailure("PREPARED_INPUT_REQUIRED")
-                initial = {"prepared": read_json(args.input), "proposals": read_json(args.proposals) if args.proposals else {}}
+                initial = {input_key: read_json(args.input),
+                           "proposals": read_json(args.proposals) if args.proposals else {}}
+                if args.recorded_candidates:
+                    initial["recorded_candidates"] = read_json(args.recorded_candidates)
             run_id = executor.fork(args.run_id, args.from_node, initial_input=initial, execution_config=config)
             result = executor.inspect(run_id)
         elif args.command == "repair":
@@ -103,6 +121,10 @@ def main(argv=None):
             if state["status"] != "succeeded":
                 raise ProviderFailure("RUN_NOT_PUBLISHED")
             output = executor.output(args.run_id)
+            if config.get("pipeline") == "library":
+                print(json.dumps({"run_id": args.run_id, "snapshot_id": output["snapshot_id"], "library_status": output["status"],
+                                  "counts": output["counts"], "snapshot_path": str(args.root.resolve() / output["snapshot_artifact"]["path"])}, ensure_ascii=False))
+                return 0
             print(json.dumps({"run_id": args.run_id, "files": {k: {**v, "path": str(args.root.resolve() / v["path"])} for k, v in output["files"].items()}, "generation_mode": output["generation_mode"]}, ensure_ascii=False))
             return 0
         else:

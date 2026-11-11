@@ -1,7 +1,7 @@
-"""Strict M1 contracts for explicitly prepared input and editable documents.
+"""Strict contracts for frozen facts, automatic plans and editable documents.
 
-The input is a human prepared snapshot, not a parser result. Providers only
-return ProposalContent; the application owns identities, references and facts.
+The application owns identities, references and adopted facts. Model outputs
+are candidates; prepared M1 fixtures retain their explicit origin label.
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ class Requirement(Contract):
     category: Literal["qualification", "technical", "commercial", "fixed_table", "procedure"]
     source_refs: list[Text] = Field(min_length=1)
     mandatory: bool = True
+    response_mode: Literal["writing", "fixed_text", "table", "attachment", "procedure"] = "writing"
 
 
 class Issue(Contract):
@@ -107,9 +108,15 @@ class TableSpec(Contract):
     requirement_refs: list[Text] = Field(min_length=1)
     column_widths: list[float] = Field(default_factory=list)
     merges: list[TableMerge] = Field(default_factory=list)
+    # Original grids may have no separate header, or merge across their first
+    # row. In that mode columns are internal labels; rows hold the entire grid.
+    header_from_columns: bool = True
+    repeat_header_rows: int = Field(default=1, ge=0, le=10)
 
     @model_validator(mode="after")
     def rectangular(self):
+        if self.repeat_header_rows > len(self.rows) + int(self.header_from_columns):
+            raise ValueError("repeated header exceeds the original grid")
         if any(len(row) != len(self.columns) for row in self.rows):
             raise ValueError("fixed table rows must match the original column count")
         if self.column_widths and (
@@ -146,6 +153,15 @@ class Attachment(Contract):
     requirement_refs: list[Text] = Field(min_length=1)
     synthetic: bool = False
     description: Text
+    bundle_id: Text | None = None
+    page_index: int = Field(default=1, ge=1)
+    page_count: int = Field(default=1, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def page_identity(self):
+        if self.page_index > self.page_count or (not self.bundle_id and (self.page_index != 1 or self.page_count != 1)):
+            raise ValueError("multi-page proof requires a bundle identity and valid page index")
+        return self
 
 
 class ReferenceExcerpt(Contract):
@@ -165,6 +181,18 @@ class ReferenceExcerpt(Contract):
         if hashlib.sha256(self.text.encode("utf-8")).hexdigest() != self.text_sha256:
             raise ValueError("reference excerpt text hash mismatch")
         return self
+
+
+def validate_attachment_bundles(attachments: list[Attachment]) -> None:
+    groups = {}
+    for item in attachments:
+        if item.bundle_id:
+            groups.setdefault(item.bundle_id, []).append(item)
+    for items in groups.values():
+        expected = items[0].page_count
+        if (len(items) != expected or {item.page_index for item in items} != set(range(1, expected + 1))
+                or any(item.page_count != expected or item.title != items[0].title for item in items)):
+            raise ValueError("every selected proof bundle must contain all ordered pages exactly once")
 
 
 class WritingTask(Contract):
@@ -220,6 +248,21 @@ class DocumentStyle(Contract):
         return self
 
 
+class PrescribedBlock(Contract):
+    kind: Literal["paragraph", "table_ref"]
+    text: str = ""
+    table_ref: Text | None = None
+    source_refs: list[Text] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def exactly_one_content(self):
+        if self.kind == "paragraph" and (not self.text.strip() or self.table_ref is not None):
+            raise ValueError("prescribed paragraph requires only source text")
+        if self.kind == "table_ref" and (not self.table_ref or self.text):
+            raise ValueError("prescribed table block requires only a table reference")
+        return self
+
+
 class SectionPlan(Contract):
     section_id: Text
     title: Text
@@ -231,12 +274,23 @@ class SectionPlan(Contract):
     writing_tasks: list[WritingTask] = Field(default_factory=list)
     level: int = Field(default=1, ge=1, le=3)
     start_on_new_page: bool = False
+    source_refs: list[Text] = Field(default_factory=list)
+    fixed_content: list[PrescribedBlock] = Field(default_factory=list)
+    render_body: bool = True
+    nonwriting_requirement_refs: list[Text] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def tasks_belong_to_section(self):
+        if not self.render_body and any((self.fact_refs, self.table_refs, self.attachment_refs, self.writing_tasks, self.fixed_content)):
+            raise ValueError("procedure-only section cannot hide content")
+        fixed_tables = [item.table_ref for item in self.fixed_content if item.kind == "table_ref"]
+        if len(set(fixed_tables)) != len(fixed_tables) or set(fixed_tables) - set(self.table_refs):
+            raise ValueError("prescribed tables must belong to their section exactly once")
         if self.writing_tasks and (self.kind != "technical" or self.level >= 3):
             raise ValueError("writing tasks require a technical section with room for a child heading")
         covered = set()
+        if set(self.nonwriting_requirement_refs) - set(self.requirement_refs):
+            raise ValueError("nonwriting requirements must belong to their section")
         assigned_tables = []
         for task in self.writing_tasks:
             if set(task.requirement_refs) - set(self.requirement_refs):
@@ -245,10 +299,12 @@ class SectionPlan(Contract):
                 raise ValueError("writing task tables must belong to its section")
             covered.update(task.requirement_refs)
             assigned_tables.extend(task.table_refs)
-        if self.writing_tasks and covered != set(self.requirement_refs):
+        if self.writing_tasks and covered | set(self.nonwriting_requirement_refs) != set(self.requirement_refs):
             raise ValueError("writing tasks must cover every requirement assigned to the technical section")
         if len(set(assigned_tables)) != len(assigned_tables):
             raise ValueError("a fixed table may be assigned to only one writing task")
+        if set(assigned_tables) & set(fixed_tables):
+            raise ValueError("a prescribed table cannot also be assigned to writing")
         return self
 
 
@@ -334,9 +390,16 @@ class Section(Contract):
     section_id: Text
     title: Text
     requirement_refs: list[Text] = Field(min_length=1)
-    blocks: list[Block] = Field(min_length=1)
+    blocks: list[Block] = Field(default_factory=list)
     level: int = Field(default=1, ge=1, le=3)
     start_on_new_page: bool = False
+    render_body: bool = True
+
+    @model_validator(mode="after")
+    def visible_content(self):
+        if self.render_body != bool(self.blocks):
+            raise ValueError("visible sections need content; procedure-only sections must be empty")
+        return self
 
 
 def _unique(items, key: str, label: str) -> set[str]:
@@ -370,6 +433,7 @@ class Snapshot(Contract):
         requirement_ids = _unique(self.requirements, "requirement_id", "requirement")
         _unique(self.facts, "fact_id", "fact")
         _unique(self.attachments, "attachment_id", "attachment")
+        validate_attachment_bundles(self.attachments)
         _unique(self.issues, "issue_id", "issue")
         _unique(self.reference_excerpts, "reference_id", "reference excerpt")
         _known(self.style.reference_source_refs, source_ids, "style source")
@@ -385,7 +449,7 @@ class Snapshot(Contract):
 
 
 class PreparedBid(Snapshot):
-    input_kind: Literal["manual_prepared"] = "manual_prepared"
+    input_kind: Literal["manual_prepared", "automatic"] = "manual_prepared"
     preparation_note: Text
     sections: list[SectionPlan] = Field(min_length=1)
     tables: list[TableSpec] = Field(default_factory=list)
@@ -405,6 +469,11 @@ class PreparedBid(Snapshot):
             raise ValueError("writing task identities must not collide with section checkpoint identities")
         covered = set()
         for section in self.sections:
+            _known(section.source_refs, source_ids, "section source")
+            for block in section.fixed_content:
+                _known(block.source_refs, source_ids, "prescribed source")
+            if not section.render_body and any(item.response_mode != "procedure" for item in self.requirements if item.requirement_id in section.requirement_refs):
+                raise ValueError("only procedural requirements may omit body content")
             _known(section.requirement_refs, requirement_ids, "requirement")
             _known(section.fact_refs, fact_ids, "fact")
             _known(section.table_refs, table_ids, "table")
@@ -451,6 +520,8 @@ class DocumentPackage(Snapshot):
         issues_seen = set()
         requirements_seen = set()
         for section in self.sections:
+            if not section.render_body and any(item.response_mode != "procedure" for item in self.requirements if item.requirement_id in section.requirement_refs):
+                raise ValueError("non-procedure requirement hidden from document")
             _known(section.requirement_refs, requirement_ids, "requirement")
             requirements_seen.update(section.requirement_refs)
             for block in section.blocks:

@@ -1,7 +1,4 @@
-"""M1 slice: freeze prepared input -> write -> check/assemble -> render.
-
-N1-N3 are explicitly supplied by a human-prepared snapshot in this milestone.
-"""
+"""One executor for automatic N0-N6 and the retained prepared M1 fixture mode."""
 from __future__ import annotations
 
 import hashlib
@@ -45,6 +42,9 @@ def validate_sources(prepared: PreparedBid) -> None:
 
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
+    if config.get("pipeline") == "library":
+        from .library_pipeline import build_library_executor
+        return build_library_executor(root, config, _version)
 
     def freeze(ctx, value):
         prepared = PreparedBid.model_validate(value["prepared"])
@@ -134,6 +134,12 @@ def build_executor(root: Path, config: dict) -> Executor:
 
             def write_section(plan=plan, plan_data=plan_data, requirements=requirements, task_outputs=task_outputs):
                 blocks = []
+                for prescribed in plan.fixed_content:
+                    if prescribed.kind == "paragraph":
+                        blocks.append(ParagraphBlock(text=prescribed.text, content_role="neutral",
+                                                     source_refs=prescribed.source_refs, requirement_refs=plan.requirement_refs))
+                    else:
+                        blocks.append(TableBlock(table=tables[prescribed.table_ref], requirement_refs=plan.requirement_refs))
                 for fact_id in plan.fact_refs:
                     fact = facts[fact_id]
                     blocks.append(ParagraphBlock(text=f"{fact.label}：{fact.value}", content_role="fact",
@@ -141,7 +147,7 @@ def build_executor(root: Path, config: dict) -> Executor:
                                                  requirement_refs=plan.requirement_refs))
                 for task_output in task_outputs:
                     blocks.extend(task_output["blocks"])
-                if plan.kind == "technical" and not plan.writing_tasks:
+                if plan.kind == "technical" and not plan.writing_tasks and not plan.fixed_content and plan.render_body:
                     proposal = provider.generate(ctx, plan_data, requirements)
                     proposal = ProposalContent.model_validate(proposal.model_dump())
                     for paragraph in proposal.paragraphs:
@@ -149,6 +155,7 @@ def build_executor(root: Path, config: dict) -> Executor:
                     if proposal.steps:
                         blocks.append(ListBlock(items=proposal.steps, content_role="proposal", requirement_refs=plan.requirement_refs))
                 assigned_tables = {ref for task in plan.writing_tasks for ref in task.table_refs}
+                assigned_tables.update(item.table_ref for item in plan.fixed_content if item.kind == "table_ref")
                 for table_id in plan.table_refs:
                     if table_id in assigned_tables:
                         continue
@@ -158,15 +165,18 @@ def build_executor(root: Path, config: dict) -> Executor:
                 for issue in prepared.issues:
                     if issue.section_id == plan.section_id:
                         blocks.append(IssueBlock(issue_id=issue.issue_id, requirement_refs=issue.requirement_refs))
-                if not blocks:
+                if not blocks and plan.render_body:
                     raise PipelineFailure("EMPTY_SECTION")
                 return Section(section_id=plan.section_id, title=plan.title, requirement_refs=plan.requirement_refs,
-                               level=plan.level, start_on_new_page=plan.start_on_new_page, blocks=blocks).model_dump(mode="json")
+                               level=plan.level, start_on_new_page=plan.start_on_new_page,
+                               render_body=plan.render_body, blocks=blocks).model_dump(mode="json")
 
             sections.append(ctx.run_unit(plan.section_id, unit_input, write_section))
         package = DocumentPackage(**prepared.model_dump(exclude={"sections", "tables", "input_kind"}),
                                   title=f"{prepared.project.name} 投标文件", sections=sections)
         return {"package": package.model_dump(mode="json"), "source_artifacts": value["source_artifacts"],
+                "input_kind": prepared.input_kind,
+                "chain_diagnostics": value.get("chain_diagnostics", {}),
                 "writing_review": writing_review, "expected_table_ids": list(tables),
                 "generation_mode": provider_options["mode"], "external_model_verified": provider_options["mode"] == "chat_completions"}
 
@@ -190,7 +200,7 @@ def build_executor(root: Path, config: dict) -> Executor:
         for requirement in package.requirements:
             issues = [i.issue_id for i in package.issues if requirement.requirement_id in i.requirement_refs]
             checks["requirement_coverage"].append({"requirement_id": requirement.requirement_id,
-                                                   "status": "pending_manual" if issues else "drafted_for_review",
+                                                   "status": "pending_manual" if issues else "no_body_required" if requirement.response_mode == "procedure" else "drafted_for_review",
                                                    "issue_ids": issues})
         ctx.capture("validation", checks)
         return {**value, "validation": checks}
@@ -208,7 +218,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         return {"files": files, "validation": value["validation"],
                 "generation_mode": value["generation_mode"], "external_model_verified": value["external_model_verified"],
-                "input_kind": "manual_prepared", "synthetic": package.synthetic,
+                "input_kind": value.get("input_kind", "manual_prepared"), "synthetic": package.synthetic,
+                "chain_diagnostics": value.get("chain_diagnostics", {}),
                 "warnings": rendered["warnings"], "issue_ids": rendered["issue_ids"],
                 "source_artifacts": value["source_artifacts"]}
 
@@ -216,7 +227,12 @@ def build_executor(root: Path, config: dict) -> Executor:
     # changes. A repair/fork is explicit and keeps the original record untouched.
     shared = ("pipeline.py", "models.py", "runtime.py", "storage.py", "observability.py")
     nodes = [NodeSpec("N0", _version(*shared), freeze, config_keys=()),
-             NodeSpec("N4", _version(*shared, "provider.py"), draft, config_keys=("provider",)),
+             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py"), draft, config_keys=("provider",)),
              NodeSpec("N5", _version(*shared), check, config_keys=()),
              NodeSpec("N6", _version(*shared, "rendering.py"), render, config_keys=("document_style",))]
+    if config.get("pipeline", "prepared") == "automatic":
+        from .chain import intake_nodes
+        nodes = intake_nodes(root, _version, config) + nodes[1:]
+    elif config.get("pipeline", "prepared") != "prepared":
+        raise PipelineFailure("PIPELINE_MODE_INVALID")
     return Executor(root, nodes, execution_config=config)

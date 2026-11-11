@@ -65,7 +65,7 @@ def redact_payload(value: Any) -> Any:
 
     def clean(item: Any) -> Any:
         if isinstance(item, dict):
-            return {str(key): "[REDACTED]" if secret_field(key, entry) else clean(entry) for key, entry in item.items()}
+            return {clean(str(key)): "[REDACTED]" if secret_field(key, entry) else clean(entry) for key, entry in item.items()}
         if isinstance(item, (list, tuple)):
             return [clean(entry) for entry in item]
         if isinstance(item, str):
@@ -188,8 +188,12 @@ class Observer:
     def event(self, event: str, metadata: dict | None = None) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9_.]{0,79}", event):
             raise ValueError("Event names must be stable identifiers.")
+        from opentelemetry.trace import get_current_span
+        context = get_current_span().get_span_context()
+        correlation = ({"trace_id": format(context.trace_id, "032x"), "span_id": format(context.span_id, "016x")}
+                       if context.is_valid else {})
         append_json(self.run_dir / "events.jsonl", {"time": utc_now(), "event": event,
-                                                    "run_id": self.run_id, **safe_metadata(metadata)})
+                                                    "run_id": self.run_id, **correlation, **safe_metadata(metadata)})
 
     def check(self) -> None:
         if self.export_error:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import re
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -62,10 +63,29 @@ def _identifier(value: str, label: str) -> str:
 def _safe_error(exc: BaseException) -> dict:
     # Exception text may contain source material, response bodies or secrets.
     # Preserve only a stable code and a bounded Python class identifier.
-    code = getattr(exc, "code", "NODE_EXECUTION_FAILED")
+    code = getattr(exc, "code", "FILE_PERMISSION_DENIED" if isinstance(exc, PermissionError) else "NODE_EXECUTION_FAILED")
     if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", code):
         code = "NODE_EXECUTION_FAILED"
     return {"error_code": code, "error_type": type(exc).__name__[:80]}
+
+
+def _error_diagnostic(exc: BaseException) -> dict:
+    # A useful stack without exception text, source lines, local variables or
+    # request bodies. These frames live only in the controlled capture store.
+    details = {**_safe_error(exc), "frames": [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                                           for frame in traceback.extract_tb(exc.__traceback__)[-30:]]}
+    if isinstance(exc, OSError):
+        details["os_error"] = {key: getattr(exc, key, None) for key in ("errno", "winerror", "filename", "filename2")}
+    cause, seen = exc, set()
+    for _ in range(8):
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        if isinstance(cause, ArtifactIntegrityError):
+            details["artifact_integrity"] = cause.diagnostic_context()
+            break
+        cause = cause.__cause__
+    return details
 
 
 class NodeContext:
@@ -77,12 +97,14 @@ class NodeContext:
         self.artifact_dir = executor.store.run_dir(self.run_id) / "work" / self.attempt_id
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self._capture_failed = False
+        self._active_unit: dict = {}
 
     def _persist(self) -> None:
         self.executor._save(self._state)
 
     def _metadata(self, **extra) -> dict:
-        return {"node_key": self.node_key, "node_attempt_id": self.attempt_id, "trace_id": self.trace_id, **extra}
+        return {"node_key": self.node_key, "node_attempt_id": self.attempt_id, "trace_id": self.trace_id,
+                "job_attempt_id": self._attempt.get("job_attempt_id"), **self._active_unit, **extra}
 
     def call_event(self, event: str, metadata: dict | None = None) -> None:
         """Record only allowlisted metadata. Full requests belong in capture()."""
@@ -99,7 +121,7 @@ class NodeContext:
         never puts its payload, exception message, or filename into events.
         """
         _identifier(name, "Capture name")
-        record = {"name": name, "time": utc_now(), "status": "disabled_by_policy"}
+        record = {"name": name, "time": utc_now(), "status": "disabled_by_policy", **self._metadata()}
         if self._state["capture_policy"]:
             try:
                 reference = self.executor.store.put_json(self.run_id, "capture", redact_payload(payload))
@@ -181,7 +203,11 @@ class NodeContext:
                 output = self.executor._checkpoint_data(record)
             except ArtifactIntegrityError as exc:
                 raise CheckpointInvalidError(self.node_key) from exc
-            self.call_event("unit.reused", {"unit_id": unit_id, "output_hash": record["output_hash"]})
+            reuse_metadata = self._metadata(unit_id=unit_id, unit_attempt_id=record["attempts"][-1]["attempt_id"],
+                                            output_hash=record["output_hash"], reused_from_run_id=self.run_id)
+            with self._observer.span("unit.reuse", reuse_metadata,
+                                     links=record["attempts"][-1:]):
+                self._observer.event("unit.reused", reuse_metadata)
             return output
 
         attempt = {"attempt_id": uuid.uuid4().hex, "node_attempt_id": self.attempt_id, "started_at": utc_now(),
@@ -191,10 +217,12 @@ class NodeContext:
         self._persist()
         began = time.monotonic()
         metadata = self._metadata(unit_id=unit_id, unit_attempt_id=attempt["attempt_id"], input_hash=input_hash)
-        self._observer.event("unit.started", metadata)
         checkpointed = False
+        previous_unit = self._active_unit
         try:
             with self._observer.span("unit." + self.node_key, metadata) as span:
+                self._active_unit = {"unit_id": unit_id, "unit_attempt_id": attempt["attempt_id"]}
+                self._observer.event("unit.started", metadata)
                 attempt["trace_id"] = format(span.get_span_context().trace_id, "032x")
                 attempt["span_id"] = format(span.get_span_context().span_id, "016x")
                 self._persist()
@@ -206,21 +234,32 @@ class NodeContext:
                 output = redact_payload(output)
                 self.executor.store.validate_embedded_artifacts(output)
                 reference = self.executor._write_checkpoint(self._state, self._record, attempt, input_hash, output, unit_id)
+                span.set_attribute("output_hash", digest(output))
+                span.set_attribute("validation_status", "passed")
             self._observer.check()
             record.update(status="succeeded", output_ref=reference, output_hash=digest(output))
             attempt.update(status="succeeded", ended_at=utc_now(), output_hash=record["output_hash"],
                            duration_ms=round((time.monotonic() - began) * 1000, 3))
             self._persist()
             checkpointed = True
-            self._observer.event("unit.checkpointed", {**metadata, "output_hash": record["output_hash"]})
+            self._observer.event("unit.checkpointed", {**metadata, "span_id": attempt["span_id"],
+                                  "output_hash": record["output_hash"], "duration_ms": attempt["duration_ms"]})
             return output
         except Exception as exc:
+            try:
+                self.capture("unit-error", _error_diagnostic(exc))
+            except Exception:
+                self._capture_failed = True
+                self._state["observability"]["capture_status"] = "write_failed"
             if not checkpointed:
-                attempt.update(status="failed", ended_at=utc_now(), **_safe_error(exc))
+                attempt.update(status="failed", ended_at=utc_now(), duration_ms=round((time.monotonic()-began)*1000, 3), **_safe_error(exc))
                 record["status"] = "failed"
                 self._persist()
-            self._observer.event("unit.failed", {**metadata, **_safe_error(exc)})
+            self._observer.event("unit.failed", {**metadata, "span_id": attempt.get("span_id"),
+                                  "duration_ms": attempt.get("duration_ms"), **_safe_error(exc)})
             raise
+        finally:
+            self._active_unit = previous_unit
 
 
 class Executor:
@@ -359,6 +398,7 @@ class Executor:
             observer = Observer(self.store.run_dir(run_id), run_id)
             job_attempt = {"attempt_id": uuid.uuid4().hex, "status": "running", "started_at": utc_now(), "trace_status": "partial"}
             previous_links = [{"trace_id": item.get("trace_id"), "span_id": item.get("span_id")} for item in state["execution_attempts"][-1:]]
+            previous_links.extend(item["reused_trace"] for item in state["nodes"] if item.get("reused_trace"))
             for item in state["execution_attempts"]:
                 if item["status"] == "running":
                     item.update(status="interrupted", ended_at=utc_now(), error_code="PROCESS_INTERRUPTED", trace_status="partial")
@@ -376,15 +416,22 @@ class Executor:
             self._save(state)
             current_attempt = None
             current_record = None
+            context = None
             try:
                 with observer.span("job.execute", {"run_id": run_id, "job_attempt_id": job_attempt["attempt_id"]}, previous_links) as job_span:
                     job_attempt.update(trace_id=format(job_span.get_span_context().trace_id, "032x"),
                                        span_id=format(job_span.get_span_context().span_id, "016x"))
                     self._save(state)
                     observer.event("job.claimed", {"job_attempt_id": job_attempt["attempt_id"], "trace_id": job_attempt["trace_id"]})
+                    for reused in state["nodes"][:state["cursor"]]:
+                        observer.event("node.reused", {"node_key": reused["key"], "node_version": reused["version"],
+                                       "input_hash": reused["input_hash"], "output_hash": reused["output_hash"],
+                                       "artifact_id": reused["output_ref"]["artifact_id"],
+                                       "reused_from_run_id": reused.get("reused_from_run_id", run_id)})
                     for index in range(state["cursor"], len(self.nodes)):
                         spec, record = self.nodes[index], state["nodes"][index]
                         current_record = record
+                        context = None
                         input_data = (self.store.read_json(state["initial_input_ref"]) if index == 0 else
                                       self._checkpoint_data(state["nodes"][index - 1]))
                         input_hash = digest(input_data)
@@ -397,9 +444,9 @@ class Executor:
                         self._save(state)
                         metadata = {"node_key": spec.key, "node_attempt_id": attempt["attempt_id"], "node_version": spec.version,
                                     "input_hash": input_hash, "trace_id": job_attempt["trace_id"]}
-                        observer.event("node.started", metadata)
                         began = time.monotonic()
                         with observer.span("node." + spec.key, metadata) as node_span:
+                            observer.event("node.started", metadata)
                             attempt.update(trace_id=format(node_span.get_span_context().trace_id, "032x"),
                                            span_id=format(node_span.get_span_context().span_id, "016x"))
                             self._save(state)
@@ -416,6 +463,8 @@ class Executor:
                             if context._capture_failed:
                                 raise CaptureFailedError("Required debug capture did not persist.")
                             reference = self._write_checkpoint(state, record, attempt, input_hash, result)
+                            node_span.set_attribute("output_hash", digest(result))
+                            node_span.set_attribute("validation_status", "passed")
                         observer.check()
                         attempt.update(status="succeeded", ended_at=utc_now(), output_hash=digest(result),
                                        duration_ms=round((time.monotonic() - began) * 1000, 3))
@@ -427,7 +476,13 @@ class Executor:
                         self._save(state)
                         current_attempt = None
                         current_record = None
-                        observer.event("node.checkpointed", {**metadata, "output_hash": digest(result)})
+                        observer.event("node.checkpointed", {**metadata, "span_id": attempt["span_id"],
+                                       "output_hash": digest(result), "duration_ms": attempt["duration_ms"]})
+                        if state["status"] == "paused_debug":
+                            observer.event("node.paused", {**metadata, "span_id": attempt["span_id"], "status": "paused_debug"})
+                        if state["status"] == "succeeded":
+                            observer.event("artifact.published", {**metadata, "span_id": attempt["span_id"],
+                                           "artifact_id": reference["artifact_id"], "output_hash": digest(result)})
                         if spec.key == stop_after:
                             break
                     job_attempt.update(status="succeeded" if state["status"] == "succeeded" else "paused_debug", ended_at=utc_now())
@@ -435,17 +490,25 @@ class Executor:
                 job_attempt["trace_status"] = "captured"
             except Exception as exc:
                 error = _safe_error(exc)
+                if context is not None:
+                    try:
+                        context.capture("node-error", _error_diagnostic(exc))
+                    except Exception:
+                        state["observability"]["capture_status"] = "write_failed"
                 if isinstance(exc, ObservabilityWriteError) and not observer.export_error:
                     state["observability"]["event_status"] = "write_failed"
                 state.update(status="failed", **error)
                 job_attempt.update(status="failed", ended_at=utc_now(), **error)
                 if current_attempt is not None:
-                    current_attempt.update(status="failed", ended_at=utc_now(), **error)
+                    current_attempt.update(status="failed", ended_at=utc_now(), duration_ms=round((time.monotonic()-began)*1000, 3), **error)
                     current_record["status"] = "failed"
                 job_attempt["trace_status"] = observer.trace_status
                 try:
                     observer.event("node.failed" if current_record else "job.failed", {"node_key": current_record["key"] if current_record else None,
-                                                                                      "trace_id": job_attempt.get("trace_id"), **error})
+                        "node_attempt_id": current_attempt.get("attempt_id") if current_attempt else None,
+                        "span_id": current_attempt.get("span_id") if current_attempt else job_attempt.get("span_id"),
+                        "job_attempt_id": job_attempt["attempt_id"],
+                        "trace_id": job_attempt.get("trace_id"), **error})
                 except ObservabilityWriteError:
                     state["observability"]["event_status"] = "write_failed"
             finally:
@@ -502,7 +565,12 @@ class Executor:
                 old_config = parent["execution_config"]
                 # Capture policy changes affect diagnostics, not node output.
                 config_keys = self.nodes[index].config_keys
-                consumed_keys = (set(old_config) | set(new_config)) - {"debug_capture"} if config_keys is None else set(config_keys)
+                old_manifest = parent["node_manifest"][index]
+                old_keys = old_manifest.get("config_keys")
+                if old_manifest.get("key") != record["key"] or old_keys != (list(config_keys) if config_keys is not None else None):
+                    raise ConfigurationChangedError("The selected prefix has changed configuration dependencies; fork earlier.")
+                consumed_keys = ((set(old_config) | set(new_config)) - {"debug_capture"}
+                                 if config_keys is None or old_keys is None else set(config_keys) | set(old_keys))
                 if any(old_config.get(key) != redact_payload(new_config).get(key) for key in consumed_keys):
                     raise ConfigurationChangedError("The selected prefix consumes changed configuration; fork earlier.")
             if not repair:
@@ -518,6 +586,8 @@ class Executor:
                 original = parent["nodes"][index]
                 reused = copy.deepcopy(original)
                 reused.update(attempts=[], reused_from_run_id=run_id, reused_from_artifact_id=original["output_ref"]["artifact_id"])
+                origin_attempt = original["attempts"][-1] if original["attempts"] else original.get("reused_trace", {})
+                reused["reused_trace"] = {key: origin_attempt.get(key) for key in ("trace_id", "span_id")}
                 child["nodes"][index] = reused
             # The caller chooses the earliest affected node for config changes.
             # The exact config diff is retained for review, never hidden.
