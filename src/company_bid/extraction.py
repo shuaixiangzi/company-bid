@@ -19,7 +19,7 @@ from .source_clauses import build_clause_catalog
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-EXTRACTION_VERSION = "requirements-window-v12"
+EXTRACTION_VERSION = "requirements-window-v13"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -68,7 +68,8 @@ class _Requirement(_Strict):
         description="writing用于拟实施技术方法；指定函/承诺用fixed_text、报价原表用table、明确证明要求用attachment；qualification/commercial的事实条件未指定格式/附件时用factual_response，有来源事实才采用，否则待补。procedure仅限procedure/commercial且确无需单独正文，不能隐藏资格响应。")
     mandatory: bool = True
     confidence: Literal["high", "medium", "low"] = "medium"
-    format_status: Literal["not_prescribed", "prescribed", "unread", "conflict"]
+    format_status: Literal["not_prescribed", "prescribed", "unread", "conflict"] = Field(
+        description="仅该条要求的格式状态：未指定响应格式填not_prescribed，指定填prescribed，关键格式未读填unread，冲突填conflict。none_verified和specified只属于根级窗口字段，绝不能填到requirements[].format_status。")
     format_title: str | None = None
     required_fact_labels: list[Text] = Field(default_factory=list, max_length=30,
         description="仅待公司/项目填入的事实字段；不列招标已给工程量、方法、固定服务周期、限价或验收标准。引用原字与空白，跨行优先保留LF；不得任意删空白。")
@@ -103,7 +104,7 @@ class _LiveWindowResponse(_Strict):
     requirements: list[_Requirement]
     format_chapters: list[_FormatChapter]
     format_status: Literal["none_verified", "specified", "unread", "conflict"] = Field(
-        description="仅本窗目标blocks的实际响应格式：specified必须有非空format_chapters；仅提及其它页格式时不得选specified。none_verified=none_in_this_window，非全书无格式；其它页catalog不构成本窗unread。")
+        description="仅根级窗口的实际响应格式：specified必须有非空format_chapters；仅提及其它页格式时不得选specified。none_verified=none_in_this_window，非全书无格式；其它页catalog不构成本窗unread。此枚举不能填入requirements[].format_status；单条未指定格式用not_prescribed。")
 
 
 def source_selected_output_contract() -> dict:
@@ -1086,6 +1087,7 @@ _EXTRACT_INSTRUCTIONS = (
     "required_fact_labels仅公司/项目待填事实（如公司注册地址、明确报价输入），不能列招标已给工程量/方法/周期/限价/标准；没有待填事实即为空。"
     "reference_keywords只供writing检索历史技术方法，其余模式一律[]，不要给商务待办、资格或附件填技术参考词。三类labels/keywords须逐字来自本条完整选文，不能借其它条标题；reference_keywords无法定位即[]。跨行优先保留LF；只准native_pdf_line_edges证明的软换行接续，保留源内空白/标点。"
     "format_status只判本窗目标blocks的响应格式；none_verified即none_in_this_window，非全书无格式。catalog提到后页不算本窗unread；本窗实际格式未读/冲突才标unread/conflict。"
+    "区分两层字段：requirements[].format_status仅not_prescribed/prescribed/unread/conflict；根级format_status仅none_verified/specified/unread/conflict。单条无指定格式必须写not_prescribed，不能复制根级none_verified；指定单条格式写prescribed而非specified。"
     "specified必须同时输出本窗实际格式的非空format_chapters；仅要求关联后窗格式时可在requirement.format_title填写原题，但本窗没有格式正文则format_chapters=[]、format_status=none_verified。"
     "confidence如实标high/medium/low。不得生成事实值、报价、表内容、签章、工具调用或事实ID；无要求可返回空列表。"
 )

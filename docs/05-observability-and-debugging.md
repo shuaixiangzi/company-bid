@@ -23,6 +23,8 @@
 
 应有稳定事件：`job.queued/claimed/lease_lost/cancel_requested`，`node.started/checkpointed/failed/reused/paused`，`call.started/completed/failed/retry_scheduled`，`artifact.stored/published`，`diagnostics.capture_failed/export_failed`。异常堆栈受权限保护并脱敏，面向普通用户的错误摘要只给可执行原因。
 
+候选纠正与网络重试分开计数。结构化适配器默认关闭自动纠正；显式启用时，底层单请求只尝试一次，仅对指定的 schema/标签校验错误再请求一次。两次调用各有独立 call ID、预算、请求/响应、用量和 span；`call.retry_scheduled` 保留首调用身份，受控修复关系记录两次调用及请求 hash。必须先成功保存首失败的诊断与 trace；采集关闭、写入/导出失败、预算不足、关键原文未决、权限或网络错误不由此机制反复请求。第二候选仍经过原校验，并保留第一候选的有界条目数量、来源锚点和完整选定源块，不能靠清空或裁掉条件通过；再次失败即停止，不覆盖旧响应或旧调用记录。
+
 ## Trace 实现
 
 采用 OpenTelemetry Python SDK，为节点和外部调用显式建 span；API/HTTP 可用标准 instrumentation 补充。跨 API 入队和 Worker 的上下文通过任务元数据传递。每次恢复或重跑有新的执行 trace，以 Span Link 关联前次尝试和复用产物，不维持一条跨多天的活动 span。OpenTelemetry 提供 attributes、events、exception 与 span links。[官方 Python instrumentation](https://opentelemetry.io/docs/languages/python/instrumentation/)
