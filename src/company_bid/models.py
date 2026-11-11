@@ -148,6 +148,78 @@ class Attachment(Contract):
     description: Text
 
 
+class ReferenceExcerpt(Contract):
+    """Frozen, scoped reference text. It is a method reference, not a company fact."""
+
+    reference_id: Text
+    source_id: Text
+    locator: Text
+    text: Text
+    text_sha256: Sha256
+    applicability: Text
+    retained_points: list[Text] = Field(min_length=1)
+    excluded_points: list[Text] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def excerpt_hash(self):
+        if hashlib.sha256(self.text.encode("utf-8")).hexdigest() != self.text_sha256:
+            raise ValueError("reference excerpt text hash mismatch")
+        return self
+
+
+class WritingTask(Contract):
+    """Application-owned writing unit, adapted from the reviewed task contract."""
+
+    unit_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:-]{1,100}$")]
+    title: Text
+    objective: Text
+    must_cover: list[Text] = Field(min_length=1, max_length=30)
+    requirement_refs: list[Text] = Field(min_length=1)
+    reference_refs: list[Text] = Field(default_factory=list)
+    forbidden_fields: list[Text] = Field(min_length=1)
+    completion_criteria: list[Text] = Field(min_length=1)
+    operation: Literal["reference_adaptation", "bounded_new_draft"]
+    format_status: Literal["not_prescribed", "prescribed", "unread", "conflict"] = "not_prescribed"
+    no_reference_reason: Text | None = None
+    table_refs: list[Text] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def explicit_reference_decision(self):
+        if self.operation == "reference_adaptation" and not self.reference_refs:
+            raise ValueError("reference adaptation requires frozen reference excerpts")
+        if self.operation == "bounded_new_draft" and (self.reference_refs or not self.no_reference_reason):
+            raise ValueError("bounded drafting requires an explicit no-reference reason and no claimed adaptation")
+        if len(set(self.reference_refs)) != len(self.reference_refs) or len(set(self.table_refs)) != len(self.table_refs):
+            raise ValueError("writing unit references must not repeat")
+        return self
+
+
+class DocumentStyle(Contract):
+    profile_id: Text = "bid-a4-v1"
+    reference_source_refs: list[Text] = Field(default_factory=list)
+    page_size: Literal["A4", "Letter"] = "A4"
+    margin_cm: float = Field(default=2.5, ge=1, le=4)
+    font_family: Text = "宋体"
+    body_pt: float = Field(default=12, ge=9, le=18)
+    body_line_spacing: float = Field(default=1.5, ge=1, le=2.5)
+    body_first_line_chars: float = Field(default=2, ge=0, le=4)
+    heading_pt: tuple[float, float, float] = (16, 15, 14)
+    table_pt: float = Field(default=10.5, ge=8, le=16)
+    cover_title_pt: float = Field(default=48, ge=20, le=60)
+    cover_meta_pt: float = Field(default=16, ge=10, le=22)
+    header_cm: float = Field(default=1.5, ge=0.5, le=3)
+    footer_cm: float = Field(default=1.75, ge=0.5, le=3)
+    table_border_color: Annotated[str, StringConstraints(pattern=r"^[0-9A-Fa-f]{6}$")] = "000000"
+
+    @model_validator(mode="after")
+    def heading_sizes(self):
+        if any(not 10 <= size <= 26 for size in self.heading_pt):
+            raise ValueError("heading sizes must be between 10 and 26 points")
+        if self.header_cm >= self.margin_cm or self.footer_cm >= self.margin_cm:
+            raise ValueError("header/footer distances must fit within margins")
+        return self
+
+
 class SectionPlan(Contract):
     section_id: Text
     title: Text
@@ -156,6 +228,42 @@ class SectionPlan(Contract):
     fact_refs: list[Text] = Field(default_factory=list)
     table_refs: list[Text] = Field(default_factory=list)
     attachment_refs: list[Text] = Field(default_factory=list)
+    writing_tasks: list[WritingTask] = Field(default_factory=list)
+    level: int = Field(default=1, ge=1, le=3)
+    start_on_new_page: bool = False
+
+    @model_validator(mode="after")
+    def tasks_belong_to_section(self):
+        if self.writing_tasks and (self.kind != "technical" or self.level >= 3):
+            raise ValueError("writing tasks require a technical section with room for a child heading")
+        covered = set()
+        assigned_tables = []
+        for task in self.writing_tasks:
+            if set(task.requirement_refs) - set(self.requirement_refs):
+                raise ValueError("writing task requirements must belong to its section")
+            if set(task.table_refs) - set(self.table_refs):
+                raise ValueError("writing task tables must belong to its section")
+            covered.update(task.requirement_refs)
+            assigned_tables.extend(task.table_refs)
+        if self.writing_tasks and covered != set(self.requirement_refs):
+            raise ValueError("writing tasks must cover every requirement assigned to the technical section")
+        if len(set(assigned_tables)) != len(assigned_tables):
+            raise ValueError("a fixed table may be assigned to only one writing task")
+        return self
+
+
+class CoverageClaim(Contract):
+    item_index: int = Field(ge=0)
+    paragraph_indices: list[int] = Field(default_factory=list)
+    step_indices: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def has_locations(self):
+        if not self.paragraph_indices and not self.step_indices:
+            raise ValueError("coverage claim must point to content")
+        if any(index < 0 for index in [*self.paragraph_indices, *self.step_indices]):
+            raise ValueError("coverage indices must be nonnegative")
+        return self
 
 
 class ProposalContent(Contract):
@@ -163,6 +271,16 @@ class ProposalContent(Contract):
 
     paragraphs: list[Text] = Field(min_length=1, max_length=30)
     steps: list[Text] = Field(default_factory=list, max_length=30)
+    coverage: list[CoverageClaim] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def valid_coverage_locations(self):
+        if len({item.item_index for item in self.coverage}) != len(self.coverage):
+            raise ValueError("duplicate must-cover item")
+        for item in self.coverage:
+            if any(i >= len(self.paragraphs) for i in item.paragraph_indices) or any(i >= len(self.steps) for i in item.step_indices):
+                raise ValueError("coverage location does not exist")
+        return self
 
 
 class BlockReferences(Contract):
@@ -217,6 +335,8 @@ class Section(Contract):
     title: Text
     requirement_refs: list[Text] = Field(min_length=1)
     blocks: list[Block] = Field(min_length=1)
+    level: int = Field(default=1, ge=1, le=3)
+    start_on_new_page: bool = False
 
 
 def _unique(items, key: str, label: str) -> set[str]:
@@ -241,6 +361,8 @@ class Snapshot(Contract):
     requirements: list[Requirement] = Field(min_length=1)
     attachments: list[Attachment] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list)
+    reference_excerpts: list[ReferenceExcerpt] = Field(default_factory=list)
+    style: DocumentStyle = Field(default_factory=DocumentStyle)
 
     @model_validator(mode="after")
     def shared_references(self):
@@ -249,6 +371,10 @@ class Snapshot(Contract):
         _unique(self.facts, "fact_id", "fact")
         _unique(self.attachments, "attachment_id", "attachment")
         _unique(self.issues, "issue_id", "issue")
+        _unique(self.reference_excerpts, "reference_id", "reference excerpt")
+        _known(self.style.reference_source_refs, source_ids, "style source")
+        for reference in self.reference_excerpts:
+            _known([reference.source_id], source_ids, "reference source")
         for item in [self.project, self.company, *self.facts, *self.requirements, *self.attachments]:
             _known(item.source_refs, source_ids, "source")
         for item in [*self.attachments, *self.issues]:
@@ -273,6 +399,10 @@ class PreparedBid(Snapshot):
         requirement_ids = {item.requirement_id for item in self.requirements}
         attachment_ids = {item.attachment_id for item in self.attachments}
         issue_ids = {item.issue_id for item in self.issues}
+        reference_ids = {item.reference_id for item in self.reference_excerpts}
+        task_ids = _unique([task for section in self.sections for task in section.writing_tasks], "unit_id", "writing task")
+        if task_ids & section_ids:
+            raise ValueError("writing task identities must not collide with section checkpoint identities")
         covered = set()
         for section in self.sections:
             _known(section.requirement_refs, requirement_ids, "requirement")
@@ -280,6 +410,8 @@ class PreparedBid(Snapshot):
             _known(section.table_refs, table_ids, "table")
             _known(section.attachment_refs, attachment_ids, "attachment")
             covered.update(section.requirement_refs)
+            for task in section.writing_tasks:
+                _known(task.reference_refs, reference_ids, "reference excerpt")
         if requirement_ids - covered:
             raise ValueError("every requirement must have a planned section")
         for item in [*self.tables, *self.attachments, *self.issues]:

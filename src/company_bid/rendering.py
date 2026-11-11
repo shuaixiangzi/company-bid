@@ -1,4 +1,9 @@
-"""Deterministic M1 DOCX assembly; images are embedded, not linked placeholders."""
+"""Editable documents assembled from a frozen package and explicit typography.
+
+Reference-derived layout and OOXML compatibility decisions are documented in
+our design records; no original signatures, prices or document package parts
+are copied into a new bid.
+"""
 
 from __future__ import annotations
 
@@ -9,42 +14,66 @@ import tempfile
 from pathlib import Path
 
 from docx import Document
+from docx.enum.section import WD_SECTION_START
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Cm, Inches, Pt, RGBColor
 from PIL import Image
 
-from .models import (
-    AttachmentBlock,
-    DocumentPackage,
-    HeadingBlock,
-    IssueBlock,
-    ListBlock,
-    ParagraphBlock,
-    TableBlock,
-    file_sha256,
-)
+from .models import (AttachmentBlock, DocumentPackage, HeadingBlock, IssueBlock,
+                     ListBlock, ParagraphBlock, TableBlock, file_sha256)
 
 
 class RenderingError(ValueError):
-    """Input or assembly failed; no successful result manifest is returned."""
+    """Input or assembly failed; no successful manifest is returned."""
+
+
+def _typeface(r_pr, name, size=None):
+    fonts = r_pr.get_or_add_rFonts()
+    for attribute in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+        fonts.attrib.pop(qn(f"w:{attribute}"), None)
+    for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+        fonts.set(qn(f"w:{attribute}"), name)
+    fonts.set(qn("w:hint"), "eastAsia")
+    if size is not None:
+        for tag in ("sz", "szCs"):
+            element = r_pr.find(qn(f"w:{tag}"))
+            if element is None:
+                element = OxmlElement(f"w:{tag}")
+                r_pr.append(element)
+            element.set(qn("w:val"), str(round(size * 2)))
 
 
 def _font(run, *, name="宋体", size=None, bold=None, color=None):
     run.font.name = name
-    run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), name)
     if size is not None:
         run.font.size = Pt(size)
+    _typeface(run._element.get_or_add_rPr(), name, size)
     if bold is not None:
         run.bold = bold
-    if color:
+    if color is not None:
         run.font.color.rgb = RGBColor.from_string(color)
     return run
 
 
-def _field(paragraph, instruction: str, placeholder: str = ""):
+def _indent(element, chars, size):
+    properties = element.get_or_add_pPr()
+    indent = properties.find(qn("w:ind"))
+    if indent is None:
+        indent = OxmlElement("w:ind")
+        properties.append(indent)
+    for tag in ("firstLine", "firstLineChars", "hanging", "hangingChars", "left", "leftChars", "right", "rightChars"):
+        indent.attrib.pop(qn(f"w:{tag}"), None)
+    indent.set(qn("w:firstLineChars"), str(round(chars * 100)))
+    indent.set(qn("w:firstLine"), str(round(chars * size * 20)))
+    indent.set(qn("w:left"), "0")
+    indent.set(qn("w:right"), "0")
+
+
+def _field(paragraph, instruction, placeholder="", *, font="宋体", size=12):
     begin = OxmlElement("w:fldChar")
     begin.set(qn("w:fldCharType"), "begin")
     begin.set(qn("w:dirty"), "true")
@@ -55,158 +84,227 @@ def _field(paragraph, instruction: str, placeholder: str = ""):
     separate.set(qn("w:fldCharType"), "separate")
     end = OxmlElement("w:fldChar")
     end.set(qn("w:fldCharType"), "end")
-    for element in [begin, code, separate]:
-        paragraph.add_run()._r.append(element)
+    for element in (begin, code, separate):
+        _font(paragraph.add_run(), name=font, size=size)._r.append(element)
     if placeholder:
-        _font(paragraph.add_run(placeholder), size=10)
-    paragraph.add_run()._r.append(end)
+        _font(paragraph.add_run(placeholder), name=font, size=size)
+    _font(paragraph.add_run(), name=font, size=size)._r.append(end)
 
 
-def _base_document(package: DocumentPackage, title: str):
+def _geometry(section, style):
+    if style.page_size == "A4":
+        section.page_width, section.page_height = Cm(21), Cm(29.7)
+    else:
+        section.page_width, section.page_height = Inches(8.5), Inches(11)
+    section.left_margin = section.right_margin = Cm(style.margin_cm)
+    section.top_margin = section.bottom_margin = Cm(style.margin_cm)
+    section.header_distance = Cm(style.header_cm)
+    section.footer_distance = Cm(style.footer_cm)
+
+
+def _page_furniture(section, style, *, numbered, start=None):
+    section.different_first_page_header_footer = False
+    section.header.is_linked_to_previous = False
+    section.footer.is_linked_to_previous = False
+    for part in (section.header, section.footer):
+        for paragraph in part.paragraphs:
+            paragraph.clear()
+            _indent(paragraph._p, 0, style.body_pt)
+    if numbered:
+        footer = section.footer.paragraphs[0]
+        footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _font(footer.add_run("第 "), name=style.font_family, size=10.5)
+        _field(footer, "PAGE", font=style.font_family, size=10.5)
+        _font(footer.add_run(" 页"), name=style.font_family, size=10.5)
+        numbering = section._sectPr.find(qn("w:pgNumType"))
+        if numbering is None:
+            numbering = OxmlElement("w:pgNumType")
+            section._sectPr.insert_element_before(numbering, "w:cols", "w:docGrid")
+        if start is None:
+            numbering.attrib.pop(qn("w:start"), None)
+        else:
+            numbering.set(qn("w:start"), str(start))
+        numbering.set(qn("w:fmt"), "decimal")
+
+
+def _base_document(package, title):
     document = Document()
+    style = package.style
     document.core_properties.title = title
     document.core_properties.subject = package.project.name
     document.core_properties.author = "公司内部标书制作系统"
     document.core_properties.comments = ""
-    page = document.sections[0]
-    page.page_width = Inches(8.5)
-    page.page_height = Inches(11)
-    page.left_margin = page.right_margin = Inches(0.8)
-    page.top_margin = page.bottom_margin = Inches(0.75)
-    page.header_distance = page.footer_distance = Inches(0.3)
-    normal = document.styles["Normal"]
-    normal.font.name = "宋体"
-    normal.font.size = Pt(11)
-    normal.font.color.rgb = RGBColor(0, 0, 0)
-    normal._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), "宋体")
-    normal.paragraph_format.line_spacing = 1.25
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.widow_control = True
-    for style_name in ["Title", "Subtitle", "Heading 1", "Heading 2", "Heading 3"]:
-        style = document.styles[style_name]
-        style.font.name = "黑体"
-        style.font.color.rgb = RGBColor(0, 0, 0)
-        style._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), "黑体")
-        style.paragraph_format.keep_with_next = True
-        style.paragraph_format.space_before = Pt(12)
-        style.paragraph_format.space_after = Pt(7)
-        for border in list(style._element.xpath("./w:pPr/w:pBdr")):
+    _geometry(document.sections[0], style)
+    defaults = document.styles.element.find(qn("w:docDefaults"))
+    if defaults is None:
+        defaults = OxmlElement("w:docDefaults")
+        document.styles.element.insert(0, defaults)
+    r_default = defaults.find(qn("w:rPrDefault"))
+    if r_default is None:
+        r_default = OxmlElement("w:rPrDefault")
+        defaults.append(r_default)
+    r_pr = r_default.find(qn("w:rPr"))
+    if r_pr is None:
+        r_pr = OxmlElement("w:rPr")
+        r_default.append(r_pr)
+    _typeface(r_pr, style.font_family, style.body_pt)
+    for name in ("Normal", "Title", "Subtitle", "Heading 1", "Heading 2", "Heading 3"):
+        paragraph_style = document.styles[name]
+        paragraph_style.font.name = style.font_family
+        paragraph_style.font.color.rgb = RGBColor(0, 0, 0)
+        size = style.body_pt
+        if name.startswith("Heading"):
+            size = style.heading_pt[int(name[-1]) - 1]
+        elif name == "Title":
+            size = style.cover_title_pt
+        paragraph_style.font.size = Pt(size)
+        _typeface(paragraph_style._element.get_or_add_rPr(), style.font_family, size)
+        formatting = paragraph_style.paragraph_format
+        formatting.space_before = formatting.space_after = Pt(0)
+        formatting.line_spacing = style.body_line_spacing
+        formatting.widow_control = True
+        formatting.keep_with_next = name != "Normal"
+        formatting.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY if name == "Normal" else WD_ALIGN_PARAGRAPH.LEFT
+        _indent(paragraph_style._element, style.body_first_line_chars if name == "Normal" else 0, size)
+        if name.startswith("Heading"):
+            paragraph_style.font.bold = True
+            if name == "Heading 1":
+                formatting.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            formatting.space_before = formatting.space_after = Pt(6)
+        for border in list(paragraph_style._element.xpath("./w:pPr/w:pBdr")):
             border.getparent().remove(border)
-    document.styles["Title"].font.size = Pt(22)
-    document.styles["Heading 1"].font.size = Pt(16)
-    document.styles["Heading 2"].font.size = Pt(13)
-    document.styles["Heading 3"].font.size = Pt(11)
+    content_width = document.sections[0].page_width.cm - 2 * style.margin_cm
+    for level in (1, 2, 3):
+        name = f"TOC {level}"
+        if name not in document.styles:
+            document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        toc_style = document.styles[name]
+        toc_style.font.name = style.font_family
+        toc_style.font.size = Pt(style.body_pt)
+        toc_style.font.color.rgb = RGBColor(0, 0, 0)
+        _typeface(toc_style._element.get_or_add_rPr(), style.font_family, style.body_pt)
+        formatting = toc_style.paragraph_format
+        formatting.line_spacing = style.body_line_spacing
+        formatting.space_before = formatting.space_after = Pt(0)
+        _indent(toc_style._element, 0, style.body_pt)
+        formatting.left_indent = Cm((level - 1) * 0.74)
+        formatting.tab_stops.add_tab_stop(Cm(content_width), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
     update = OxmlElement("w:updateFields")
     update.set(qn("w:val"), "true")
     document.settings.element.append(update)
-    footer = page.footer.paragraphs[0]
-    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _font(footer.add_run("第 "), size=9)
-    _field(footer, "PAGE")
-    _font(footer.add_run(" 页"), size=9)
-    title_paragraph = document.add_paragraph(title, "Title")
-    for border in list(title_paragraph._p.xpath("./w:pPr/w:pBdr")):
-        border.getparent().remove(border)
-    if package.synthetic:
-        _font(document.add_paragraph().add_run("合成测试样本 仅用于系统验证 不可用于投标"), bold=True, color="A80000")
-    document.add_paragraph(f"项目名称：{package.project.name}")
-    document.add_paragraph(f"投标主体：{package.company.name}")
-    document.add_paragraph(package.preparation_note)
-    if package.issues:
-        _font(document.add_paragraph().add_run("生成完成，需线下补充。正文待补编号与待补清单逐项对应。"), bold=True, color="A80000")
-    else:
-        document.add_paragraph("系统检查完成。提交前请由使用者线下审阅、核对并办理签字盖章。")
     return document
 
 
-def _refs(document, *, fact_refs=(), source_refs=(), requirement_refs=()):
-    parts = []
-    if fact_refs:
-        parts.append("事实 " + "、".join(dict.fromkeys(fact_refs)))
-    if source_refs:
-        parts.append("来源 " + "、".join(dict.fromkeys(source_refs)))
-    if requirement_refs:
-        parts.append("响应要求 " + "、".join(dict.fromkeys(requirement_refs)))
-    if parts:
-        paragraph = document.add_paragraph()
-        paragraph.paragraph_format.space_after = Pt(8)
-        _font(paragraph.add_run("；".join(parts) + "。对应原件及定位见文末来源与事实追溯。"), size=9, color="555555")
+def _plain(document, text, style, *, size=None, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, keep_next=False):
+    paragraph = document.add_paragraph()
+    _indent(paragraph._p, 0, style.body_pt)
+    paragraph.alignment = align
+    paragraph.paragraph_format.keep_with_next = keep_next
+    _font(paragraph.add_run(text), name=style.font_family, size=size or style.body_pt, bold=bold)
+    return paragraph
 
 
-def _issue_text(paragraph, issue, *, compact=False):
+def _cover(document, package):
+    style = package.style
+    _page_furniture(document.sections[0], style, numbered=True, start=1)
+    title = document.add_paragraph("投 标 文 件", "Title")
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_before = Pt(60)
+    title.paragraph_format.space_after = Pt(84)
+    title.paragraph_format.keep_with_next = False
+    _font(title.runs[0], name=style.font_family, size=style.cover_title_pt, bold=True)
+    project = _plain(document, f"项目名称：{package.project.name}", style, size=style.cover_meta_pt, align=WD_ALIGN_PARAGRAPH.CENTER)
+    project.paragraph_format.space_after = Pt(72)
+    _plain(document, f"投标人：{package.company.name}", style, size=style.cover_meta_pt, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    sign = _plain(document, "签字盖章按招标文件要求线下办理", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+    sign.paragraph_format.space_before = Pt(12)
+    if package.issues:
+        paragraph = _plain(document, "本文件含待补事项 详见配套待补清单", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+        paragraph.paragraph_format.space_before = Pt(24)
+    if package.synthetic:
+        paragraph = _plain(document, "合成测试样本 仅用于系统验证 不可用于投标", style, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+        _font(paragraph.runs[0], name=style.font_family, color="A80000")
+
+
+def _issue_text(paragraph, issue, style, *, compact=False):
     marker = f"【待补 {issue.issue_id}】" if compact else issue.marker
-    _font(paragraph.add_run(marker), bold=True, color="A80000")
+    _font(paragraph.add_run(marker), name=style.font_family, size=style.body_pt, bold=True, color="A80000")
 
 
-def _format_table(table, weights):
-    table.autofit = False
-    width = 6.9
+def _format_table(document, table, weights, style):
+    page = document.sections[-1]
+    width_twips = round((page.page_width - page.left_margin - page.right_margin) / 635)
     total = sum(weights)
-    for column, weight in zip(table.columns, weights):
-        column.width = Inches(width * weight / total)
+    widths = [round(width_twips * weight / total) for weight in weights]
+    widths[-1] += width_twips - sum(widths)
+    table.autofit = False
     table_pr = table._tbl.tblPr
+    table_width = table_pr.find(qn("w:tblW"))
+    if table_width is None:
+        table_width = OxmlElement("w:tblW")
+        table_pr.append(table_width)
+    table_width.set(qn("w:type"), "dxa")
+    table_width.set(qn("w:w"), str(width_twips))
+    for column, width in zip(table.columns, widths):
+        column.width = Pt(width / 20)
     borders = OxmlElement("w:tblBorders")
-    for edge in ["top", "left", "bottom", "right", "insideH", "insideV"]:
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         element = OxmlElement(f"w:{edge}")
-        for attr, value in [("val", "single"), ("sz", "5"), ("color", "D9D9D9")]:
+        for attr, value in (("val", "single"), ("sz", "4"), ("color", style.table_border_color)):
             element.set(qn(f"w:{attr}"), value)
         borders.append(element)
     table_pr.append(borders)
     margins = OxmlElement("w:tblCellMar")
-    for edge in ["top", "left", "bottom", "right"]:
+    for edge in ("top", "left", "bottom", "right"):
         margin = OxmlElement(f"w:{edge}")
-        margin.set(qn("w:w"), "100")
+        margin.set(qn("w:w"), "90")
         margin.set(qn("w:type"), "dxa")
         margins.append(margin)
     table_pr.append(margins)
     for row_index, row in enumerate(table.rows):
-        cant_split = OxmlElement("w:cantSplit")
-        row._tr.get_or_add_trPr().append(cant_split)
+        row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
         if row_index == 0:
             repeat = OxmlElement("w:tblHeader")
             repeat.set(qn("w:val"), "true")
             row._tr.get_or_add_trPr().append(repeat)
-        for cell_index, cell in enumerate(row.cells):
-            cell.width = Inches(width * weights[cell_index] / total)
+        for column_index, cell in enumerate(row.cells):
+            cell.width = Pt(widths[column_index] / 20)
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             shade = OxmlElement("w:shd")
-            shade.set(qn("w:fill"), "E8EEF3" if row_index == 0 else "FFFFFF")
+            shade.set(qn("w:fill"), "FFFFFF")
             cell._tc.get_or_add_tcPr().append(shade)
             for paragraph in cell.paragraphs:
-                paragraph.paragraph_format.space_after = Pt(3)
-                paragraph.paragraph_format.space_before = Pt(3)
-                paragraph.paragraph_format.line_spacing = 1.15
+                _indent(paragraph._p, 0, style.table_pt)
+                paragraph.paragraph_format.space_after = paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.line_spacing = style.body_line_spacing
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if row_index == 0 else WD_ALIGN_PARAGRAPH.LEFT
                 for run in paragraph.runs:
-                    _font(run, size=10, bold=True if row_index == 0 else None)
+                    _font(run, name=style.font_family, size=style.table_pt, bold=True if row_index == 0 else None)
 
 
-def _render_table(document, spec, issues):
-    caption = document.add_paragraph(spec.title)
-    caption.paragraph_format.keep_with_next = True
-    _font(caption.runs[0], bold=True)
+def _render_table(document, spec, issues, style):
+    _plain(document, spec.title, style, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, keep_next=True)
     table = document.add_table(rows=1, cols=len(spec.columns))
     for cell, label in zip(table.rows[0].cells, spec.columns):
         cell.text = label
-    fact_refs = []
-    table_issue_ids = set()
+    seen_issues = set()
     for values in spec.rows:
         row = table.add_row()
         for cell, value in zip(row.cells, values):
             text = value.text
-            # Prepared inputs may already contain a human-readable placeholder.
-            # Render the canonical marker exactly once, preserving other text.
             for issue_id in value.issue_refs:
                 text = re.sub(r"【待补\s+" + re.escape(issue_id) + r"(?:\s*[:：][^】]*)?】", "", text)
             cell.text = text.strip()
             for issue_id in value.issue_refs:
-                _issue_text(cell.paragraphs[0], issues[issue_id], compact=issue_id in table_issue_ids)
-                table_issue_ids.add(issue_id)
-            fact_refs.extend(value.fact_refs)
+                _issue_text(cell.paragraphs[0], issues[issue_id], style, compact=issue_id in seen_issues)
+                seen_issues.add(issue_id)
     weights = spec.column_widths or ([1, 2.4] if len(spec.columns) == 2 else [1] * len(spec.columns))
-    _format_table(table, weights)
+    _format_table(document, table, weights, style)
     for merge in spec.merges:
         table.cell(merge.row + 1, merge.column).merge(table.cell(merge.row + merge.row_span, merge.column + merge.col_span - 1))
-    return fact_refs
+    spacer = _plain(document, "", style)
+    spacer.paragraph_format.space_after = Pt(3)
+    spacer.paragraph_format.line_spacing = 0.3
 
 
 def _validate_files(package):
@@ -235,110 +333,144 @@ def _validate_files(package):
 
 def _render_bid(package):
     document = _base_document(package, package.title)
-    _font(document.add_paragraph().add_run("目录"), name="黑体", size=16, bold=True)
-    _field(document.add_paragraph(), 'TOC \\o "1-3" \\h \\z \\u', "请在 Word 或 WPS 中更新目录字段以显示实际页码。")
-    document.add_page_break()
+    style = package.style
+    _cover(document, package)
+    toc_page = document.add_section(WD_SECTION_START.NEW_PAGE)
+    _geometry(toc_page, style)
+    _page_furniture(toc_page, style, numbered=True)
+    _plain(document, "目 录", style, size=style.heading_pt[0], bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _field(_plain(document, "", style), 'TOC \\o "1-3" \\h \\z \\u', "请在 Word 或 WPS 中更新目录字段以显示实际页码。", font=style.font_family, size=style.body_pt)
+    body_page = document.add_section(WD_SECTION_START.NEW_PAGE)
+    _geometry(body_page, style)
+    _page_furniture(body_page, style, numbered=True)
     issues = {issue.issue_id: issue for issue in package.issues}
     attachments = {item.attachment_id: item for item in package.attachments}
     for section_index, section in enumerate(package.sections):
-        if section_index and any(isinstance(block, AttachmentBlock) for block in section.blocks):
+        if section_index and section.start_on_new_page:
             document.add_page_break()
-        document.add_paragraph(section.title, "Heading 1")
-        section_fact_refs = []
-        section_source_refs = []
-        section_requirement_refs = list(section.requirement_refs)
+        document.add_paragraph(section.title, f"Heading {section.level}")
         for block in section.blocks:
             if isinstance(block, HeadingBlock):
                 document.add_paragraph(block.text, f"Heading {block.level}")
             elif isinstance(block, ParagraphBlock):
-                document.add_paragraph(block.text)
+                if block.content_role == "proposal":
+                    document.add_paragraph(block.text)
+                else:
+                    _plain(document, block.text, style)
             elif isinstance(block, ListBlock):
                 for index, item in enumerate(block.items, 1):
-                    document.add_paragraph(f"{index}. {item}" if block.ordered else f"• {item}")
+                    _plain(document, f"（{index}）{item}" if block.ordered else f"• {item}", style)
             elif isinstance(block, TableBlock):
-                section_fact_refs.extend(_render_table(document, block.table, issues))
-                section_source_refs.extend(block.table.source_refs)
-                section_requirement_refs.extend(block.table.requirement_refs)
+                _render_table(document, block.table, issues, style)
             elif isinstance(block, IssueBlock):
-                paragraph = document.add_paragraph()
+                paragraph = _plain(document, "", style)
                 issue = issues[block.issue_id]
-                _issue_text(paragraph, issue)
-                paragraph.add_run(f" {issue.action} 详见待补清单同编号。")
+                _issue_text(paragraph, issue, style)
+                _font(paragraph.add_run(f" {issue.action} 详见待补清单同编号。"), name=style.font_family, size=style.body_pt)
             elif isinstance(block, AttachmentBlock):
                 attachment = attachments[block.attachment_id]
-                document.add_paragraph(attachment.title, "Heading 2")
-                document.add_paragraph(attachment.description)
+                if attachment.title != section.title:
+                    document.add_paragraph(attachment.title, f"Heading {min(section.level + 1, 3)}")
                 if attachment.synthetic:
-                    _font(document.add_paragraph().add_run("以下图片为合成测试用途，不是实际公司证明或证照。"), color="A80000", bold=True)
+                    paragraph = _plain(document, "以下图片为合成测试用途，不是实际公司证明或证照。", style, bold=True, keep_next=True)
+                    _font(paragraph.runs[0], name=style.font_family, color="A80000")
                 with Image.open(attachment.path) as image:
                     image_width, image_height = image.size
-                scale = min(6.7 / image_width, 6.2 / image_height)
-                paragraph = document.add_paragraph()
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                run = paragraph.add_run()
-                picture = run.add_picture(str(attachment.path), width=Inches(image_width * scale), height=Inches(image_height * scale))
+                page = document.sections[-1]
+                max_width = page.page_width.cm - 2 * style.margin_cm
+                max_height = page.page_height.cm - 2 * style.margin_cm - 5
+                scale = min(max_width / image_width, max_height / image_height)
+                paragraph = _plain(document, "", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+                picture = paragraph.add_run().add_picture(str(attachment.path), width=Cm(image_width * scale), height=Cm(image_height * scale))
                 picture._inline.docPr.set("descr", attachment.description)
-                section_source_refs.extend(attachment.source_refs)
-                section_requirement_refs.extend(attachment.requirement_refs)
             for issue_id in block.issue_refs:
-                _issue_text(document.add_paragraph(), issues[issue_id])
-            section_fact_refs.extend(block.fact_refs)
-            section_source_refs.extend(block.source_refs)
-            section_requirement_refs.extend(block.requirement_refs)
-        _refs(document, fact_refs=section_fact_refs, source_refs=section_source_refs, requirement_refs=section_requirement_refs)
-    document.add_page_break()
-    document.add_paragraph("来源与事实追溯", "Heading 1")
-    document.add_paragraph("下列编号对应冻结输入中的原件、定位和文件校验值。事实采用与技术拟实施方法分开记录。")
-    def trace_paragraph(text, *, bold=False, keep_next=False, size=9.5):
-        paragraph = document.add_paragraph()
-        paragraph.paragraph_format.space_before = Pt(0)
-        paragraph.paragraph_format.space_after = Pt(3)
-        paragraph.paragraph_format.line_spacing = 1.1
-        paragraph.paragraph_format.keep_with_next = keep_next
-        _font(paragraph.add_run(text), size=size, bold=bold)
-        return paragraph
-
-    trace_paragraph("采用事实", bold=True, keep_next=True)
-    for fact in package.facts:
-        trace_paragraph(f"{fact.fact_id} {fact.label}：{fact.value}；来源 {'、'.join(fact.source_refs)}。")
-    # The frozen manifest can contain multiple locators for identical bytes.
-    # Print each original hash once, without losing any source ID or locator.
-    source_groups = {}
-    for source in package.sources:
-        source_groups.setdefault(source.sha256, []).append(source)
-    for group_index, (digest, sources) in enumerate(source_groups.items(), 1):
-        trace_paragraph(f"原件组 {group_index} 文件 {sources[0].path.name}", bold=True, keep_next=True)
-        trace_paragraph(f"SHA-256：{digest}", size=8, keep_next=True)
-        for source in sources:
-            trace_paragraph(f"{source.source_id} {source.title}；定位：{source.locator}；来源类型：{source.provenance}。")
-    trace_paragraph("响应要求", bold=True, keep_next=True)
-    for requirement in package.requirements:
-        trace_paragraph(f"{requirement.requirement_id} {requirement.text} 来源 {'、'.join(requirement.source_refs)}。")
+                _issue_text(_plain(document, "", style), issues[issue_id], style)
     return document
 
 
+def _trace_appendix(document, package):
+    style = package.style
+    document.add_page_break()
+    document.add_paragraph("制作范围与来源追溯", "Heading 1")
+    _plain(document, package.preparation_note, style)
+    _plain(document, f"样式配置：{style.profile_id}。参考来源：{'、'.join(style.reference_source_refs) or '默认样式'}。", style)
+    _plain(document, "下列编号对应冻结输入中的原件、定位和校验值。正文事实与技术拟实施方法分开记录。", style)
+
+    def trace(text, *, bold=False, keep_next=False, size=None):
+        paragraph = _plain(document, text, style, size=size or style.table_pt, bold=bold, keep_next=keep_next)
+        paragraph.paragraph_format.space_after = Pt(4)
+        paragraph.paragraph_format.line_spacing = 1.2
+        return paragraph
+
+    trace("正文位置与要求映射", bold=True, keep_next=True)
+    for section in package.sections:
+        trace(f"{section.section_id} {section.title}；要求 {'、'.join(section.requirement_refs)}。")
+        for block in section.blocks:
+            if isinstance(block, (HeadingBlock, TableBlock, AttachmentBlock)):
+                if isinstance(block, HeadingBlock):
+                    label = block.text
+                elif isinstance(block, TableBlock):
+                    label = f"表格 {block.table.table_id} {block.table.title}"
+                else:
+                    label = f"附件 {block.attachment_id}"
+                trace(f"位置 {label}；要求 {'、'.join(block.requirement_refs) or '见所属章节'}。")
+    trace("采用事实", bold=True, keep_next=True)
+    for fact in package.facts:
+        trace(f"{fact.fact_id} {fact.label}：{fact.value}；来源 {'、'.join(fact.source_refs)}。")
+    groups = {}
+    for source in package.sources:
+        groups.setdefault(source.sha256, []).append(source)
+    for group_index, (digest, sources) in enumerate(groups.items(), 1):
+        trace(f"原件组 {group_index} 文件 {sources[0].path.name}", bold=True, keep_next=True)
+        trace(f"SHA-256：{digest}", size=8, keep_next=True)
+        for source in sources:
+            trace(f"{source.source_id} {source.title}；定位：{source.locator}；来源类型：{source.provenance}。")
+    trace("响应要求", bold=True, keep_next=True)
+    for requirement in package.requirements:
+        trace(f"{requirement.requirement_id} {requirement.text} 来源 {'、'.join(requirement.source_refs)}。")
+    trace("实际装配附件", bold=True, keep_next=True)
+    for attachment in package.attachments:
+        trace(f"{attachment.attachment_id} {attachment.title}；正文位置 {attachment.section_id}；来源 {'、'.join(attachment.source_refs)}。")
+        trace(attachment.description)
+        trace(f"装配图像 SHA-256：{attachment.sha256}", size=8)
+
+
 def _render_issues(package):
-    document = _base_document(package, f"{package.project.name} 待补清单")
+    title = f"{package.project.name} 待补清单"
+    document = _base_document(package, title)
+    style = package.style
+    _page_furniture(document.sections[0], style, numbered=True, start=1)
+    heading = document.add_paragraph(title, "Title")
+    _font(heading.runs[0], name=style.font_family, size=18, bold=True)
+    heading.paragraph_format.space_after = Pt(12)
+    if package.synthetic:
+        paragraph = _plain(document, "合成测试样本 仅用于系统验证 不可用于投标", style, bold=True)
+        _font(paragraph.runs[0], name=style.font_family, color="A80000")
+    _plain(document, f"项目名称：{package.project.name}", style)
+    _plain(document, f"投标人：{package.company.name}", style)
+    if package.issues:
+        _plain(document, "需线下补充的事项如下。正文和清单使用同一待补编号。", style, bold=True)
+    else:
+        _plain(document, "本次未自动检出待补项。提交前仍须线下核对原件、报价及签字盖章。", style)
     titles = {section.section_id: section.title for section in package.sections}
-    if not package.issues:
-        document.add_paragraph("本次未自动检出待补项。仍须线下核对原件、报价和签字盖章。")
     for issue in package.issues:
-        document.add_paragraph(f"{issue.issue_id} {issue.title}", "Heading 1")
-        _issue_text(document.add_paragraph(), issue)
-        document.add_paragraph(f"正文位置：{titles[issue.section_id]}（{issue.section_id}）。在投标文件中搜索同编号即可定位。")
-        document.add_paragraph(f"对应要求：{'、'.join(issue.requirement_refs)}")
-        document.add_paragraph(f"缺项原因：{issue.reason}")
-        document.add_paragraph(f"来源要求：{issue.source_requirement}")
-        document.add_paragraph(f"补充动作：{issue.action}")
+        heading = document.add_paragraph(f"{issue.issue_id} {issue.title}", "Heading 2")
+        heading.paragraph_format.space_before = Pt(12)
+        _issue_text(_plain(document, "", style), issue, style)
+        _plain(document, f"正文位置：{titles[issue.section_id]}（{issue.section_id}）。在投标文件中搜索同编号即可定位。", style)
+        _plain(document, f"对应要求：{'、'.join(issue.requirement_refs)}", style)
+        _plain(document, f"缺项原因：{issue.reason}", style)
+        _plain(document, f"来源要求：{issue.source_requirement}", style)
+        _plain(document, f"补充动作：{issue.action}", style)
+    _trace_appendix(document, package)
     return document
 
 
 def render_package(package: DocumentPackage, output_dir: Path) -> dict:
-    """Return paths/hashes after complete assembly; never overwrite existing output.
+    """Assemble both files completely and exclusively; never overwrite results.
 
-    Pagination and TOC numbers are Word fields, not estimated display numbers.
-    The caller must visually verify a target Word/WPS render before claiming
-    document acceptance. M1 supports real PNG/JPEG attachment bytes only.
+    Pagination uses real Word fields. The caller must visually verify the
+    target Word/WPS render. M1 embeds only verified PNG/JPEG attachment bytes.
     """
     package = DocumentPackage.model_validate(package.model_dump())
     output_dir = Path(output_dir)
@@ -365,7 +497,7 @@ def render_package(package: DocumentPackage, output_dir: Path) -> dict:
             path.unlink(missing_ok=True)
         raise
     result = {key: {"path": str(path.resolve()), "sha256": file_sha256(path), "size_bytes": path.stat().st_size} for key, path in targets.items()}
-    result["warnings"] = ["目录与页码使用 Word 字段。请在 Word/WPS 中更新全部字段并人工检查排版；不提供估算页码。"]
+    result["warnings"] = ["目录与页码使用 Word 字段。请在 Word/WPS 中更新全部字段并人工检查排版；不提供估算页码。", "来源定位、事实映射及制作范围见待补清单的追溯附录。"]
     result["attachment_count"] = len(package.attachments)
     result["issue_ids"] = [issue.issue_id for issue in package.issues]
     return result

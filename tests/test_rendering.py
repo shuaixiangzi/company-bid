@@ -51,13 +51,17 @@ def test_editable_text_tables_actual_image_fields_and_two_way_missing_ids(tmp_pa
     text = "\n".join(p.text for p in bid.paragraphs)
     assert "拟在现场核对设备边界" in text
     assert "合成测试样本" in text
-    assert prepared.sources[0].sha256 in text
-    assert prepared.sources[0].locator in text
-    assert "F-NAME" in text
+    assert prepared.preparation_note not in text
+    assert prepared.sources[0].sha256 not in text
+    assert "F-NAME" not in text
     issues = Document(output["issues_docx"]["path"])
     issues_text = "\n".join(p.text for p in issues.paragraphs)
     assert "【待补 M-001：服务总价】" in issues_text
     assert "三 服务报价（S3）" in issues_text
+    assert prepared.preparation_note in issues_text
+    assert prepared.sources[0].sha256 in issues_text
+    assert prepared.sources[0].locator in issues_text
+    assert "F-NAME" in issues_text
     with ZipFile(output["bid_docx"]["path"]) as archive:
         media = [name for name in archive.namelist() if name.startswith("word/media/")]
         assert len(media) == 1
@@ -67,7 +71,8 @@ def test_editable_text_tables_actual_image_fields_and_two_way_missing_ids(tmp_pa
         assert "w:tblHeader" in xml
         assert "w:drawing" in xml
         assert "w:documentProtection" not in archive.read("word/settings.xml").decode()
-        assert "PAGE" in archive.read("word/footer1.xml").decode()
+        footers = [name for name in archive.namelist() if name.startswith("word/footer") and name.endswith(".xml")]
+        assert any("PAGE" in archive.read(name).decode() for name in footers)
 
 
 def test_existing_result_is_not_overwritten(tmp_path):
