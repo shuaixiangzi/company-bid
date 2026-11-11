@@ -16,3 +16,4 @@
 12. 用户允许按任务选择子 agent；也可使用本机 OpenCode CLI 的 `opencode-go/deepseek-v4.1-flash` 执行适合的独立子任务。用户说明 Go 订阅额度较大，但不将其视为已验证的无限或免费额度。委派须限定目录、输入和写入范围，保留实际模型及结果；项目正式流水线仍使用各 run 的冻结 Provider 配置和费用记录。
 13. 用户后续明确将当前正式 LLM 测试暂时切换到 OpenCode Go 的 DeepSeek V4.1 Flash 最高推理档。新测试使用 Go 专用 endpoint、`deepseek-v4.1-flash`、`thinking=enabled`、`reasoning_effort=max`；凭据仅来自受控本地文件/环境，不改旧 run 或自动回退到原 DeepSeek API。订阅额度估算与 Provider 报告的余额费用分开；计费来源不符合 Go 或不可确认时停止后续调用。
 14. 用户要求本次 Go 切换收尾后暂停，晚上再继续；暂停期间不继续发起模型/OCR 调用。DeepSeek 直连仅在北京时间 19:00 后的夜间考虑启用，当前 Go 配置不因此自动切回直连。后续变更仍冻结新 run 配置并沿用断点、用量和费用保护。
+15. 用户已恢复执行，并在 Go 两次真实调用后明确要求停止纠结标签校验问题、换回 DeepSeek 直连。当前采用原先直连 `deepseek-flash`、`thinking=enabled`、`reasoning_effort=low`，仅在上述夜间时段运行；Go 记录保留，不再发起 Go 请求。配置变更创建子 run，继续复用有效 N0/N1；不为通过输出而改写旧候选或放宽校验。
