@@ -26,7 +26,7 @@ from .table_continuations import build_table_continuations, build_table_row_cata
 from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
 
 
-PLANNING_VERSION = "bid-plan-v17"
+PLANNING_VERSION = "bid-plan-v18"
 
 
 class _Fill(_Strict):
@@ -317,6 +317,15 @@ def _writing_instruction_only(text: str) -> bool:
         r"(?:自行编(?:写|制)(?:技术方案|方案)?|自拟(?:格式|方案)|格式自拟|自定义格式|自定格式)"
         r"(?:[，,]\s*根据[^。；;！？!?\n]{1,120}(?:要求|规定)编(?:写|制))?\s*[）)]?[。.]?",
         text.strip()) is not None
+
+
+def _signable_drafting_instruction_only(text: str) -> bool:
+    """A whole drafting/signing instruction is not a bidder declaration."""
+    return re.fullmatch(
+        r"[（(]?\s*(?:格式自拟|格式自定|自定格式|自拟格式)[，,]\s*"
+        r"(?:要求|须有|应有|须|应)(?:响应人|投标人|供应商)?"
+        r"(?:法定代表人|法人代表)(?:或授权代表)?(?:签字|签署)并加盖(?:单位)?公章"
+        r"\s*[）)]?[。.]?", text.strip()) is not None
 
 
 _SOURCE_LINE = re.compile(r"^pdf/page\[(\d+)\]/line\[(\d+)\]$")
@@ -865,6 +874,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             "n2_candidate_mutation": False, "n2_requirements_sha256": _hash(extracted["requirements"]),
             "status": "pending_review"})
         writing_spaces = {}
+        pending_response_bodies = set()
+        pending_body_reports = []
         format_links = []
         remote_format_resolutions = []
         for requirement in planned_requirements:
@@ -917,6 +928,14 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 if resolution is not None:
                     remote_format_resolutions.append(resolution)
                     unresolved = False
+            if (format_sources_complete and not matching_formats and requirement["response_mode"] == "fixed_text" and
+                    requirement["category"] in {"qualification", "commercial"} and
+                    requirement["format_status"] == "not_prescribed" and not requirement.get("format_title")):
+                # The source requirement is read; the bidder's complete
+                # declaration is missing. Preserve every facet as pending,
+                # without drafting a claim or classifying it as a procedure.
+                needs_format = False
+                pending_response_bodies.add(requirement["requirement_id"])
             if unresolved or (needs_format and not located):
                 format_errors.append({"reason": "required_response_format_unresolved", "requirement_id": requirement["requirement_id"],
                                       "citations": requirement["citations"]})
@@ -1098,6 +1117,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             permission_blocks = {key for (format_id, _), citations in writing_spaces.items()
                                  if format_id == chapter["format_id"] for citation in citations
                                  for key in citation.get("block_ids", [citation["block_id"]])}
+            body_blocks = [blocks[key] for key in chapter["content_block_ids"]
+                           if blocks[key].get("text", "").strip() and blocks[key]["text"].strip() != chapter["title"].strip()]
+            instruction_only = bool(body_blocks) and all(block["kind"] == "paragraph" and (
+                _signable_drafting_instruction_only(block["text"]) or _writing_instruction_only(block["text"]))
+                for block in body_blocks)
             for block_id in chapter["content_block_ids"]:
                 block = blocks[block_id]
                 source_ref = scoped_source({"source_id": block["source_id"], "block_id": block_id,
@@ -1111,6 +1135,21 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                         instruction_omissions.append({"format_id": chapter["format_id"], "block_id": block_id,
                             "source_ref": source_ref, "basis": "whole_grounded_drafting_instruction",
                             "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()})
+                        continue
+                    if instruction_only and (_signable_drafting_instruction_only(block["text"]) or _writing_instruction_only(block["text"])):
+                        # The section and the original instruction remain
+                        # accounted for, but no declaration body was supplied.
+                        # This route never licenses writing a company fact.
+                        instruction_omissions.append({"format_id": chapter["format_id"], "block_id": block_id,
+                            "source_ref": source_ref, "basis": "whole_drafting_instruction_body_pending",
+                            "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()})
+                        marker = issue(section, refs, "本章节完整响应正文待补", "原文仅提供编写说明，尚无可装配的承诺或响应正文。",
+                                       "依据全部招标要求补充完整正文，核实公司声明并按原文完成签字盖章；不能只提交编写说明。")
+                        next(value for value in issues if value["issue_id"] == marker)["source_requirement"] = block["text"]
+                        pending_body_reports.append({"section_id": section["section_id"], "requirement_refs": refs,
+                            "source_refs": [source_ref], "source_instruction": block["text"],
+                            "decision": "instruction_preserved_as_evidence_body_missing", "issue_id": marker,
+                            "satisfaction_status": "not_determined"})
                         continue
                     section["fixed_content"].append({"kind": "paragraph", "text": block["text"], "source_refs": [source_ref]})
                     cover_blank = (chapter.get("source_role") == "prescribed_cover" and (
@@ -1250,7 +1289,17 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     else:
                         issue(section, [rid], "所需证明附件未能唯一匹配", "冻结库无匹配证明或存在多个候选，未按文件名猜选。", "补充或明确选择符合本次要求的证明页。")
                 elif mode in {"table", "fixed_text"}:
-                    if not section["fixed_content"]:
+                    if rid in pending_response_bodies:
+                        requirement = next(item for item in requirements if item["requirement_id"] == rid)
+                        section["fixed_content"].append({"kind": "paragraph", "text": "响应要求（招标原文）：\n" + detail["text"],
+                                                         "source_refs": requirement["source_refs"]})
+                        marker = issue(section, [rid], "本条全文响应正文待补", "已完整读取要求，但尚无经确认的公司声明或承诺正文。",
+                                       "逐项完成本条全部声明、告知及申报义务，核实事实并签章；未生成或确认任何公司结论。")
+                        pending_body_reports.append({"section_id": section["section_id"], "requirement_refs": [rid],
+                            "source_refs": requirement["source_refs"], "decision": "read_requirement_full_response_missing",
+                            "source_requirement": detail["text"], "issue_id": marker, "satisfaction_status": "not_determined"})
+                    elif not section["fixed_content"] and not any(
+                            rid in item["requirement_refs"] and item["severity"] == "missing" for item in issues):
                         issue(section, [rid], "指定响应格式未定位", "要求需要原文格式，但没有通过引用校验的格式内容。", "补充并定位指定格式，不能改为自由写作。")
                 else:
                     adopt_facts_or_mark_missing(section, rid, detail)
@@ -1297,6 +1346,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _capture(ctx, "n3-instruction-handling", {"items": instruction_handling, "errors": instruction_errors,
                                                "status": "failed" if instruction_errors else "mapped_pending"})
         _fail(bool(instruction_errors), "PREPARATION_INSTRUCTION_HANDLING_UNRESOLVED")
+        _capture(ctx, "n3-pending-response-bodies", {"producer_version": PLANNING_VERSION,
+            "items": pending_body_reports, "n2_candidate_mutation": False, "status": "pending_manual" if pending_body_reports else "not_needed"})
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
