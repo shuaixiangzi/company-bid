@@ -256,6 +256,10 @@ def _prescribed_cover(document, package, section):
                 paragraph.add_run(" ")
             _issue_text(paragraph, issues[issue_id], style, compact=True)
         _plain(document, "详见待补清单同编号。", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+    if package.synthetic:
+        paragraph = _plain(document, "合成测试样本 仅用于系统验证 不可用于投标", style,
+                           bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+        _font(paragraph.runs[0], name=style.font_family, color="A80000")
 
 
 def _format_table(document, table, weights, style, header_rows=1):
