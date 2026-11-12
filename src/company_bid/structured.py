@@ -39,6 +39,9 @@ def _repair_coverage(candidate: dict, request: dict) -> dict | None:
     window = request.get("window", {})
     if not isinstance(window, dict):
         window = {}
+    candidate = _normalized_repair_candidate(candidate, request)
+    if candidate is None:
+        return None
     available = {block["block_id"]: block for block in [*window.get("blocks", []), *window.get("adjacent_context", [])]
                  if isinstance(block, dict) and isinstance(block.get("block_id"), str)}
     coverage = {"counts": {}, "anchors": {}}
@@ -92,7 +95,22 @@ def _repair_coverage(candidate: dict, request: dict) -> dict | None:
     return coverage
 
 
-def _covers_rejected_candidate(candidate, coverage) -> bool:
+def _normalized_repair_candidate(candidate, request) -> dict | None:
+    """Apply the live selector rule without changing the provider candidate."""
+    from .extraction import PlanningError, _normalize_source_selectors
+
+    if not isinstance(candidate, dict) or not isinstance(request, dict) or not isinstance(request.get("window"), dict):
+        return None
+    try:
+        normalized, _ = _normalize_source_selectors(candidate, request["window"])
+    except (PlanningError, KeyError, TypeError, AttributeError):
+        return None
+    return normalized
+
+
+def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
+    if request is not None:
+        candidate = _normalized_repair_candidate(candidate, request)
     if not isinstance(candidate, dict):
         return False
     for field, count in coverage["counts"].items():
@@ -254,7 +272,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
         second_context = _RepairContext(ctx)
 
         def repaired(candidate):
-            if not _covers_rejected_candidate(candidate, rejected[2]):
+            if not _covers_rejected_candidate(candidate, rejected[2], second_request):
                 raise PlanningError("VALIDATION_REPAIR_COVERAGE_LOST")
             return validate(copy.deepcopy(candidate))
 

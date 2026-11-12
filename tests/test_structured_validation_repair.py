@@ -52,7 +52,7 @@ def setup_run(tmp_path, monkeypatch, *, repair=1, mode="chat_completions", valid
             raise PlanningError("EXTRACTION_LABEL_NOT_GROUNDED", CONTEXT)
         return value
     gateway = JsonTaskGateway(options, transport=send)
-    original = {"window": {"window_id": "W", "blocks": [{"source_id": "S", "block_id": "B", "text": SOURCE}]},
+    original = {"window": {"window_id": "W", "blocks": [{"source_id": "S", "block_id": "B", "locator": "test/block[B]", "text": SOURCE}]},
                 "task_instructions": "Return all original requirements.", "output_contract": {"type": "object"}}
     payload = copy.deepcopy(original)
     def handler(ctx, value):
@@ -316,12 +316,12 @@ def test_feedback_drops_unbounded_or_unknown_paths_instead_of_copying_diagnostic
 
 @pytest.mark.parametrize("damage", ["drop_count", "drop_anchor", "drop_format", "drop_clause_id", "drop_table_row_id", "drop_condition_block"])
 def test_repair_cannot_pass_by_deleting_candidates_anchors_or_previously_selected_conditions(tmp_path, monkeypatch, damage):
-    citation = {"source_id": "S", "block_id": "B", "block_ids": ["B", "TAIL"]}
+    citation = {"source_id": "S", "block_id": "B", "locator": "test/block[B]", "block_ids": ["B", "TAIL"]}
     key = "clause_id" if damage == "drop_clause_id" else "table_row_id" if damage == "drop_table_row_id" else None
     if key:
         citation[key] = "CLAUSE-1" if key == "clause_id" else "TROW-1"
     first = {"requirements": [{"citation": citation, "private_raw": "OLD-CANDIDATE-ONLY-CANARY"}],
-             "format_chapters": [{"citation": {"source_id": "S", "block_id": "B"}}]}
+             "format_chapters": [{"citation": {"source_id": "S", "block_id": "B", "locator": "test/block[B]"}}]}
     second = copy.deepcopy(first)
     if damage == "drop_count":
         second["requirements"] = []
@@ -352,7 +352,7 @@ def test_repair_cannot_pass_by_deleting_candidates_anchors_or_previously_selecte
 
 @pytest.mark.parametrize("damage", ["too_many", "unknown_source", "bad_item", "too_many_refs", "unbounded_ref"])
 def test_unbounded_or_ambiguous_first_inventory_disables_automatic_repair(tmp_path, monkeypatch, damage):
-    first = {"requirements": [{"citation": {"source_id": "S", "block_id": "B"}}], "format_chapters": []}
+    first = {"requirements": [{"citation": {"source_id": "S", "block_id": "B", "locator": "test/block[B]"}}], "format_chapters": []}
     if damage == "too_many":
         first["requirements"] *= 65
     elif damage == "unknown_source":

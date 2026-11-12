@@ -91,7 +91,9 @@ def test_live_schema_omits_quote_but_internal_legacy_schema_is_not_relaxed():
     schema = source_selected_output_contract()
     citation = schema["$defs"]["_Citation"]
     assert "quote" not in citation["properties"] and "quote" not in citation["required"]
-    assert set(citation["required"]) == {"source_id", "block_id", "locator"}
+    assert set(citation["required"]) == {"block_ids"}
+    assert not {"source_id", "block_id", "locator", "quote"} & set(citation["properties"])
+    assert citation["properties"]["block_ids"]["minItems"] == 1
     assert citation["additionalProperties"] is False and schema["additionalProperties"] is False
     assert all(value["additionalProperties"] is False for value in schema["$defs"].values() if value.get("type") == "object")
     citation["properties"]["quote"] = {"type": "string"}
