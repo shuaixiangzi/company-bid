@@ -6,6 +6,8 @@
 
 当前为本地 CLI 整链阶段，PostgreSQL、独立 Worker 服务、账号权限、网页及三人并行尚未实现。正式合同仍以 [架构](04-architecture.md) 和 [日志/恢复](05-observability-and-debugging.md) 为准；本地状态文件与 OS 锁不能代替事务、租约和 fencing。
 
+当前 LLM 保持 DeepSeek 官网直连 `deepseek-flash`。用户于 2026-11-12 再次确认暂不考虑 OpenCode Go，正式流水线和辅助 LLM 任务均不选用 Go；下文 Go 试验仅为历史。已准备的新 run 的提取、映射和写作端点均为 `api.deepseek.com`，无需改动冻结配置。累计 3 美元保护、有限重试及北京时间 19 点后夜间调用限制继续有效。
+
 ## 实现与证据
 
 | 环节 | 已接入的能力 | 诊断与边界 |
