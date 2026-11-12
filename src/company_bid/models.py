@@ -7,6 +7,7 @@ are candidates; prepared M1 fixtures retain their explicit origin label.
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -444,6 +445,41 @@ def _known(refs, identities: set[str], label: str) -> None:
         raise ValueError(f"unknown {label} reference: {sorted(set(refs) - identities)}")
 
 
+def _cover_source(source: SourceRef, text: str) -> tuple[Path, str]:
+    """Bind prescribed text to the frozen, scoped tender quote, not a file ID alone."""
+    quotes = re.findall(r"(?:^|;\s*)quote_sha256=([^;]*)(?=;|$)", source.locator)
+    if (source.kind != "tender" or source.provenance not in {"original", "synthetic"}
+            or quotes != [hashlib.sha256(text.encode("utf-8")).hexdigest()]):
+        raise ValueError("prescribed cover text requires its exact scoped tender source")
+    return source.path, source.sha256
+
+
+def _prescribed_cover(snapshot, section, paragraphs) -> set[str]:
+    """Check the whole source template as well as each original body paragraph."""
+    if not section.render_body or not paragraphs:
+        raise ValueError("prescribed cover must be visible and contain original paragraphs")
+    requirements = {item.requirement_id: item for item in snapshot.requirements}
+    sources = {item.source_id: item for item in snapshot.sources}
+    text = "\n".join([section.title, *(item.text for item in paragraphs)])
+    matches = [requirements[ref] for ref in section.requirement_refs
+               if requirements[ref].response_mode == "fixed_text" and requirements[ref].text == text]
+    if not matches:
+        raise ValueError("prescribed cover title and paragraphs must equal a complete fixed-text requirement")
+    originals = {_cover_source(sources[ref], text) for requirement in matches for ref in requirement.source_refs}
+    if len(originals) != 1:
+        raise ValueError("prescribed cover must have one original source identity")
+    for paragraph in paragraphs:
+        if not paragraph.source_refs or any(_cover_source(sources[ref], paragraph.text) not in originals
+                                            for ref in paragraph.source_refs):
+            raise ValueError("prescribed cover paragraph must retain its scoped original source")
+    for issue in snapshot.issues:
+        if issue.section_id == section.section_id:
+            if (set(issue.requirement_refs) - set(section.requirement_refs)
+                    or issue.source_requirement != "；".join(requirements[ref].text for ref in issue.requirement_refs)):
+                raise ValueError("prescribed cover issue must retain its source requirements")
+    return {requirement.requirement_id for requirement in matches}
+
+
 class Snapshot(Contract):
     schema_version: Literal["1.0"] = "1.0"
     synthetic: bool = False
@@ -456,6 +492,7 @@ class Snapshot(Contract):
     issues: list[Issue] = Field(default_factory=list)
     review_actions: list[ReviewAction] = Field(default_factory=list)
     reference_excerpts: list[ReferenceExcerpt] = Field(default_factory=list)
+    prescribed_cover_section_id: Text | None = None
     style: DocumentStyle = Field(default_factory=DocumentStyle)
 
     @model_validator(mode="after")
@@ -552,6 +589,16 @@ class PreparedBid(Snapshot):
             target = next(section for section in self.sections if section.section_id == attachment.section_id)
             if attachment.attachment_id not in target.attachment_refs:
                 raise ValueError("attachment must be assigned to its declared section")
+        if self.prescribed_cover_section_id is not None:
+            _known([self.prescribed_cover_section_id], section_ids, "prescribed cover section")
+            cover = next(item for item in self.sections if item.section_id == self.prescribed_cover_section_id)
+            if (any((cover.fact_refs, cover.writing_tasks, cover.table_refs, cover.attachment_refs))
+                    or any(item.kind != "paragraph" for item in cover.fixed_content)):
+                raise ValueError("prescribed cover permits only original fixed paragraphs and issues")
+            requirement_ids = _prescribed_cover(self, cover, cover.fixed_content)
+            if not any(set(cover.source_refs) == set(item.source_refs) for item in self.requirements
+                       if item.requirement_id in requirement_ids):
+                raise ValueError("prescribed cover section must retain its complete template sources")
         return self
 
 
@@ -615,4 +662,23 @@ class DocumentPackage(Snapshot):
             present = any(issue.issue_id in block.issue_refs or (isinstance(block, IssueBlock) and block.issue_id == issue.issue_id) or (isinstance(block, TableBlock) and any(issue.issue_id in cell.issue_refs for row in block.table.rows for cell in row)) for block in target.blocks)
             if not present:
                 raise ValueError("issue marker must occur in its declared section")
+        if self.prescribed_cover_section_id is not None:
+            _known([self.prescribed_cover_section_id], section_ids, "prescribed cover section")
+            cover = next(item for item in self.sections if item.section_id == self.prescribed_cover_section_id)
+            if any(not isinstance(block, (ParagraphBlock, IssueBlock)) or block.fact_refs
+                   or (isinstance(block, ParagraphBlock) and block.content_role != "neutral")
+                   for block in cover.blocks):
+                raise ValueError("prescribed cover permits only original neutral paragraphs and issues")
+            paragraphs = [block for block in cover.blocks if isinstance(block, ParagraphBlock)]
+            requirement_ids = _prescribed_cover(self, cover, paragraphs)
+            issues = {item.issue_id: item for item in self.issues}
+            for block in cover.blocks:
+                if (not block.requirement_refs or set(block.requirement_refs) - set(cover.requirement_refs)
+                        or (isinstance(block, ParagraphBlock) and not requirement_ids.intersection(block.requirement_refs))):
+                    raise ValueError("prescribed cover blocks must retain their template requirements")
+                refs = [*block.issue_refs, *([block.issue_id] if isinstance(block, IssueBlock) else [])]
+                if any(issues[ref].section_id != cover.section_id for ref in refs):
+                    raise ValueError("prescribed cover cannot display another section's issue")
+                if isinstance(block, IssueBlock) and block.requirement_refs != issues[block.issue_id].requirement_refs:
+                    raise ValueError("prescribed cover issue block must retain its issue requirements")
         return self

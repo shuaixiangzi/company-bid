@@ -24,7 +24,7 @@ from .extraction import (
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-PLANNING_VERSION = "bid-plan-v14"
+PLANNING_VERSION = "bid-plan-v15"
 
 
 class _Fill(_Strict):
@@ -626,11 +626,6 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             if source_role:
                 row.update(copy.deepcopy(source_role))
                 row["instruction_requirements"] = instruction_requirements
-                if (source_role["source_role"] == "prescribed_cover" and
-                        block_id == source_role["role_proof"]["members"][0]["block_id"]):
-                    errors.append({"reason": "unsupported_prescribed_cover", "block_id": block_id,
-                                   "locator": block["locator"],
-                                   "detail": "Source cover fields require a source-backed cover renderer; generic cover is not proof."})
             if block_id in letter_items:
                 row["continuation_basis"] = letter_items[block_id]
             if block_id in boundaries:
@@ -641,6 +636,21 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                     "reason": "next_grounded_format" if boundary < len(body) and body[boundary]["block_id"] in anchors else
                               "source_heading_or_region_end" if boundary < len(body) else "source_end"}
             ledger.append(row)
+    covers = [row for row in ledger if row.get("source_role") == "prescribed_cover" and
+              row["block_id"] == row["role_proof"]["members"][0]["block_id"]]
+    if len(covers) > 1:
+        errors.append({"reason": "multiple_prescribed_covers", "block_ids": [row["block_id"] for row in covers]})
+    for row in covers:
+        chapter = anchors.get(row["block_id"])
+        member_ids = [item["block_id"] for item in row["role_proof"]["members"]]
+        expected = set(member_ids)
+        if (chapter is None or chapter["status"] != "prescribed" or
+                {chapter["citation"]["block_id"], *chapter["content_block_ids"]} != expected or
+                any(blocks[key]["kind"] != "paragraph" for key in member_ids)):
+            errors.append({"reason": "prescribed_cover_source_incomplete", "block_id": row["block_id"]})
+            continue
+        chapter["source_role"] = "prescribed_cover"
+        chapter["cover_source_proof"] = copy.deepcopy(row["role_proof"])
     return formats, ledger, errors
 
 
@@ -813,6 +823,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         fact_map = {fact["fact_id"]: fact for fact in facts}
         requirements, details = [], {}
         sections, tables, attachments, issues, references = [], [], [], [], []
+        prescribed_cover_section_id = None
         table_owners, attachment_owners, section_formats = {}, {}, {}
         placements, table_reports, attachment_reports = [], [], []
         writing_space_reports = []
@@ -910,15 +921,24 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             refs = [ref for ref in refs if ref not in assigned]
             # The prescribed chapter itself is a grounded structural obligation,
             # even if no semantic requirement was extracted beside its heading.
-            structural_id = _id("R-FORM-", [chapter["format_id"], chapter["citation"]])
-            structural = {"requirement_id": structural_id, "text": chapter["citation"]["quote"],
+            structural_citation = chapter["citation"]
+            if chapter.get("source_role") == "prescribed_cover":
+                cover_ids = [item["block_id"] for item in chapter["cover_source_proof"]["members"]]
+                first = blocks[cover_ids[0]]
+                structural_citation = _citation({"source_id": first["source_id"], "block_id": cover_ids[0],
+                    "locator": first["locator"], "block_ids": cover_ids}, blocks, _pdf_footer_skips(blocks))
+            structural_id = _id("R-FORM-", [chapter["format_id"], structural_citation])
+            structural = {"requirement_id": structural_id, "text": structural_citation["quote"],
                           "category": "fixed_table" if any(blocks[key]["kind"] == "table" for key in chapter["content_block_ids"]) else "procedure",
                           "mandatory": True, "response_mode": "fixed_text",
-                          "source_refs": [scoped_source(chapter["citation"])]}
+                          "source_refs": [scoped_source(structural_citation)]}
             requirements.append(structural)
             details[structural_id] = {**structural, "format_status": chapter["status"]}
             refs.append(structural_id)
             section = new_section(chapter["format_id"], chapter["title"], refs, chapter["level"], structural["source_refs"])
+            if chapter.get("source_role") == "prescribed_cover":
+                _fail(prescribed_cover_section_id is not None, "MULTIPLE_PRESCRIBED_COVERS")
+                prescribed_cover_section_id = section["section_id"]
             section_formats[section["section_id"]] = chapter["status"]
             assigned.update(refs)
             permission_blocks = {key for (format_id, _), citations in writing_spaces.items()
@@ -939,7 +959,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                             "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()})
                         continue
                     section["fixed_content"].append({"kind": "paragraph", "text": block["text"], "source_refs": [source_ref]})
-                    if has_fill_marker(block["text"]) or re.search(r"签字|盖章", block["text"]):
+                    cover_blank = (chapter.get("source_role") == "prescribed_cover" and (
+                        re.fullmatch(r"[^：:\n]{1,60}[：:]\s*", block["text"]) or
+                        re.fullmatch(r"\s*年\s*月\s*日\s*", block["text"]) or "盖单位章" in block["text"]))
+                    if has_fill_marker(block["text"]) or re.search(r"签字|盖章", block["text"]) or cover_blank:
                         issue(section, refs, "指定文字格式仍有待填写或签章字段", "原文格式按原样保留；未推定空白、日期或签章。", "按原格式填写明确输入并依法完成签章。")
                 elif block["kind"] == "table":
                     _fail(block_id in table_owners, "PRESCRIBED_TABLE_MULTIPLE_OWNERS")
@@ -1097,6 +1120,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
                     "review_actions": review_actions,
+                    "prescribed_cover_section_id": prescribed_cover_section_id,
                     "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
                     "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
@@ -1105,6 +1129,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "instruction_handling": instruction_handling,
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
                   "remote_format_resolutions": remote_format_resolutions,
+                  "prescribed_cover": {"section_id": prescribed_cover_section_id,
+                      "source_proofs": [chapter["cover_source_proof"] for chapter in planned_formats
+                                        if chapter.get("source_role") == "prescribed_cover"],
+                      "values_policy": "preserve_source_slots_with_explicit_missing_issues_no_guessed_values"},
                   "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
                   "review_actions": review_actions,

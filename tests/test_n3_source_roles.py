@@ -291,7 +291,7 @@ def test_conditional_sibling_replaces_prior_condition_and_gaps_stay_ambiguous(tm
                 item["block_id"] == "PROOF" for item in errors)) is ambiguous
 
 
-def test_original_cover_is_an_explicit_unsupported_gate_not_generic_cover_success(tmp_path):
+def test_original_cover_has_complete_source_contract_not_generic_cover_success(tmp_path):
     _, _, extracted, blocks, documents = prepared(tmp_path)
     cover = copy.deepcopy(blocks["FORM"])
     values = []
@@ -306,8 +306,11 @@ def test_original_cover_is_an_explicit_unsupported_gate_not_generic_cover_succes
     extracted["format_chapters"].append({"format_id": "SOURCE-COVER", "title": values[0]["text"],
         "citation": selected(values[0]), "level": 1, "status": "prescribed", "requirement_refs": [],
         "content_block_ids": [value["block_id"] for value in values]})
-    _, ledger, errors = _format_plan(extracted, blocks, documents)
-    assert any(item["reason"] == "unsupported_prescribed_cover" for item in errors)
+    formats, ledger, errors = _format_plan(extracted, blocks, documents)
+    assert not any("cover" in item["reason"] for item in errors)
+    recognized = next(item for item in formats if item["format_id"] == "SOURCE-COVER")
+    assert recognized["source_role"] == "prescribed_cover"
+    assert [item["block_id"] for item in recognized["cover_source_proof"]["members"]] == [value["block_id"] for value in values]
     assert all(next(row for row in ledger if row["block_id"] == value["block_id"])["source_role"] == "prescribed_cover" for value in values)
 
 

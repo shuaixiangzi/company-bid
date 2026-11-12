@@ -231,6 +231,33 @@ def _issue_text(paragraph, issue, style, *, compact=False):
     _font(paragraph.add_run(marker), name=style.font_family, size=style.body_pt, bold=True, color="A80000")
 
 
+def _prescribed_cover(document, package, section):
+    style = package.style
+    _page_furniture(document.sections[0], style, numbered=True, start=1)
+    title = document.add_paragraph(section.title, "Title")
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_before = Pt(60)
+    title.paragraph_format.space_after = Pt(84)
+    title.paragraph_format.keep_with_next = False
+    _font(title.runs[0], name=style.font_family, size=style.cover_title_pt, bold=True)
+    for block in section.blocks:
+        if isinstance(block, ParagraphBlock):
+            paragraph = _plain(document, block.text, style, size=style.cover_meta_pt,
+                               align=WD_ALIGN_PARAGRAPH.CENTER)
+            paragraph.paragraph_format.space_after = Pt(18)
+    issues = {issue.issue_id: issue for issue in package.issues}
+    issue_ids = list(dict.fromkeys(ref for block in section.blocks
+                                  for ref in [*block.issue_refs, *([block.issue_id] if isinstance(block, IssueBlock) else [])]))
+    if issue_ids:
+        paragraph = _plain(document, "", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+        paragraph.paragraph_format.space_before = Pt(12)
+        for index, issue_id in enumerate(issue_ids):
+            if index:
+                paragraph.add_run(" ")
+            _issue_text(paragraph, issues[issue_id], style, compact=True)
+        _plain(document, "详见待补清单同编号。", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+
 def _format_table(document, table, weights, style, header_rows=1):
     page = document.sections[-1]
     width_twips = round((page.page_width - page.left_margin - page.right_margin) / 635)
@@ -345,7 +372,11 @@ def _validate_files(package):
 def _render_bid(package):
     document = _base_document(package, package.title)
     style = package.style
-    _cover(document, package)
+    cover_id = package.prescribed_cover_section_id
+    if cover_id is None:
+        _cover(document, package)
+    else:
+        _prescribed_cover(document, package, next(section for section in package.sections if section.section_id == cover_id))
     toc_page = document.add_section(WD_SECTION_START.NEW_PAGE)
     _geometry(toc_page, style)
     _page_furniture(toc_page, style, numbered=True)
@@ -356,11 +387,14 @@ def _render_bid(package):
     _page_furniture(body_page, style, numbered=True)
     issues = {issue.issue_id: issue for issue in package.issues}
     attachments = {item.attachment_id: item for item in package.attachments}
+    body_sections_seen = 0
     for section_index, section in enumerate(package.sections):
-        if not section.render_body:
+        if not section.render_body or section.section_id == cover_id:
             continue
-        if section_index and section.start_on_new_page:
+        preceding = section_index if cover_id is None else body_sections_seen
+        if preceding and section.start_on_new_page:
             document.add_page_break()
+        body_sections_seen += 1
         document.add_paragraph(section.title, f"Heading {section.level}")
         for block in section.blocks:
             if isinstance(block, HeadingBlock):
