@@ -21,7 +21,7 @@ from .table_continuations import (
 )
 
 
-EXTRACTION_VERSION = "requirements-window-v18"
+EXTRACTION_VERSION = "requirements-window-v19"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -63,7 +63,7 @@ class _Citation(_Strict):
 
 
 class _Requirement(_Strict):
-    citation: _Citation
+    citation: _Citation = Field(description="只选择本条义务或待填格式自身的连续原文；不能把异处的要求条款与响应格式拼成同一引文。关系使用format_title或格式的requirement_indices，不跨段凑齐字段。")
     category: Literal["qualification", "technical", "commercial", "fixed_table", "procedure"] = Field(
         description="要求的业务类别；招标给定工期、限价属于commercial，不能误作公司事实。")
     response_mode: Literal["writing", "fixed_text", "table", "attachment", "factual_response", "procedure"] = Field(
@@ -74,7 +74,7 @@ class _Requirement(_Strict):
         description="仅该条要求的格式状态：未指定响应格式填not_prescribed，指定填prescribed，关键格式未读填unread，冲突填conflict。none_verified和specified只属于根级窗口字段，绝不能填到requirements[].format_status。")
     format_title: str | None = None
     required_fact_labels: list[Text] = Field(default_factory=list, max_length=30,
-        description="仅待公司/项目填入的事实字段；不列招标已给工程量、方法、固定服务周期、限价或验收标准。引用原字与空白，跨行优先保留LF；不得任意删空白。")
+        description="仅本条连续选文中待公司/项目填入的事实字段；不得借其它要求或远处格式的字段名。格式有独立待填事实时可另列引用该格式的要求。不列招标已给工程量、方法、固定服务周期、限价或验收标准。引用原字与空白，跨行优先保留LF；不得任意删空白。")
     attachment_keywords: list[Text] = Field(default_factory=list, max_length=15,
         description="本条选文中逐字出现的证明名称；保留原字、空格、标点和LF，不能摘要改写，无法定位则为空。")
     reference_keywords: list[Text] = Field(default_factory=list, max_length=15,
@@ -82,10 +82,11 @@ class _Requirement(_Strict):
 
 
 class _FormatChapter(_Strict):
-    title: Text
+    title: Text = Field(description="实际响应模板的原题（封面、函、表、承诺或技术方案模板）；总章容器、编写说明和招标给出的目录索引不是可直接装入标书的格式正文。")
     level: int = Field(ge=1, le=3)
     citation: _Citation
-    content_block_ids: list[Text] = Field(default_factory=list)
+    content_block_ids: list[Text] = Field(default_factory=list,
+        description="仅按原序列出本窗window.blocks中的格式正文ID；禁止adjacent_context或其它上下文ID。不能为补齐跨窗格式虚报目标归属，源结构续文由后续完整来源核验。")
     requirement_indices: list[int] = Field(default_factory=list)
     status: Literal["prescribed", "unread", "conflict"] = "prescribed"
 
@@ -1370,12 +1371,15 @@ _EXTRACT_INSTRUCTIONS = (
     "未选择table_row_id而引用整表时：普通table只选该表block；source_table_continuations列出的跨页表格（前附表或评分表）必须完整选择该证明的两个block_ids，不可单选一页而漏掉否定、勾选或证明材料条件。应用复制两个完整原表TSV并以LF连接，不是裁剪单行或合并改单元格。"
     "保持☑/□原意，未勾选分支的金额或条件不能变成无条件义务；条件和例外引用完整保留。表格TSV按制表符分列、LF分行，保留空格/空单元格/单位，不得自造行列或改rows；TSV并非原PDF连续文字。"
     "一条要求的说明段落与紧邻表格共同表达条件时，可按原顺序完整选择连续段落和一张完整表（或一对已证明续表）；应用分别保留段落原文、表的完整TSV和每块来源，以LF连接，不改造成一句话。不能跨过正文/图片、颠倒块、把页脚选入或拼接不相邻内容。"
+    "要求条款与异处响应格式必须分开选源，不可因为存在关联就拼接两处citation。要求引用自身完整连续条款，以format_title或format_chapters.requirement_indices关联格式；格式有独立待填事实时，另列仅引用该格式连续原文的要求，其required_fact_labels只能来自自己的选文。"
     "writing仅拟实施技术方法；招标已给服务期限/限价属于commercial，可在确无需单独正文时用procedure交约束清单，不能归为公司待补事实或实际报价。"
     "采购估算金额不是限价或实际报价；必须连同其金额正文引用。"
     "要求投标函/承诺书/报价表时仍用fixed_text/table且prescribed；未支持或不明确的商务说明保留未决，不得用procedure隐藏应有响应。资格和技术要求不得用procedure省略正文/证明。"
     "资格/商务中的公司事实条件若未指定响应格式或证明附件，用factual_response；它保留正文响应与待补，不代表已满足。"
     "例如信用状态条件只陈述否决情形而没有要求截图时，不得自造截图、承诺书或事实值；完整保留核查时点、已解除/已移出等例外，有明确指定格式时仍关联该格式。"
     "提取所有指定响应格式章节及其原顺序content_block_ids（包括段落和表）；保留原题，不发明目录。"
+    "format_chapters只列实际待填写/保留的响应模板：封面、函、表、固定声明或有明确模板正文的章节。‘响应文件要求及格式’这类总章标题只是容器，编写/组成说明仍须逐条提取真实响应义务，不能把整页说明作为fixed_text格式；招标原目录仅是索引，不当作响应模板装入正文。实际封面与后续各模板仍须分别提取，不能用目录条目代替它们。"
+    "format_chapters.content_block_ids仅允许window.blocks中的目标ID，不得包含adjacent_context、目录上下文或其它章节上下文ID。跨窗格式只声明当前实际拥有的目标内容，后续N3依据全量已读取来源独立核验结构续文；无法处理的内容仍如实列入unresolved_block_ids。"
     "requirement_indices是本窗口requirements的0起索引。可用format_title连接同名格式章节。"
     "required_fact_labels仅公司/项目待填事实（如公司注册地址、明确报价输入），不能列招标已给工程量/方法/周期/限价/标准；没有待填事实即为空。"
     "reference_keywords只供writing检索历史技术方法，其余模式一律[]，不要给商务待办、资格或附件填技术参考词。三类labels/keywords须逐字来自本条完整选文，不能借其它条标题；reference_keywords无法定位即[]。跨行优先保留LF；只准native_pdf_line_edges证明的软换行接续，保留源内空白/标点。"
