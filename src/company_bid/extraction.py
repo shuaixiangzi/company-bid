@@ -21,7 +21,7 @@ from .table_continuations import (
 )
 
 
-EXTRACTION_VERSION = "requirements-window-v14"
+EXTRACTION_VERSION = "requirements-window-v15"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -285,6 +285,108 @@ def _caption_table_bindings(document: dict, source_blocks: list[dict]) -> list[d
             if (proof := _caption_table_binding(document, left, right)) is not None]
 
 
+_REFERENCE_CONTEXT_MAX_CHARS = 14000
+_CHAPTER_TITLE = re.compile(r"^第[零一二三四五六七八九十百千万0-9]+章[^。；\n]{0,90}$")
+_TABLE_REFERENCE = re.compile(r"(?:详见|参见|见)[^。；;！？!?\n]{0,100}(?:表格|表)")
+
+
+def _chapter_boundary(block: dict) -> bool:
+    text = block.get("text", "").strip()
+    return (block.get("kind") == "paragraph" and block.get("origin") == "native" and
+            not block.get("read_disposition") and bool(_CHAPTER_TITLE.fullmatch(text)) and
+            not re.search(r"\.{2,}|…{2,}|·{2,}", text))
+
+
+def _reference_projection(block: dict) -> dict:
+    # This is complete reading text, not a replacement grid or citation source.
+    keys = ("block_id", "locator", "kind", "text", "ordinal", "text_basis", "read_disposition")
+    return {key: copy.deepcopy(block[key]) for key in keys if key in block}
+
+
+def _reference_context_packets(document: dict, source_blocks: list[dict], window: dict) -> dict:
+    result = {"schema_version": "chapter-reading-context-v1",
+              "scope": "reading_only_not_citation_or_processing_coverage", "packets": [], "unavailable": []}
+    values = sorted(source_blocks, key=lambda block: block["ordinal"])
+    boundaries = [index for index, block in enumerate(values) if _chapter_boundary(block)]
+    positions = {block["block_id"]: index for index, block in enumerate(values)}
+    local_ids = {block["block_id"] for block in [*window["blocks"], *window.get("adjacent_context", [])]}
+    groups = {}
+    for block in window["blocks"]:
+        if (block.get("kind") != "paragraph" or block.get("origin") != "native" or
+                block.get("read_disposition") or not _TABLE_REFERENCE.search(block.get("text", ""))):
+            continue
+        starts = [index for index in boundaries if index <= positions[block["block_id"]]]
+        if not starts:
+            result["unavailable"].append({"trigger_block_ids": [block["block_id"]],
+                                           "reason": "chapter_boundary_unavailable"})
+            continue
+        groups.setdefault(starts[-1], []).append(block["block_id"])
+    size = 0
+    for start, triggers in groups.items():
+        end = next((index for index in boundaries if index > start), len(values))
+        members = values[start:end]
+        projection = [_reference_projection(block) for block in members]
+        packet = {"source_id": document["source_id"], "source_sha256": document["sha256"],
+                  "trigger_block_ids": triggers, "chapter_start": _reference_projection(values[start]),
+                  "chapter_end": _reference_projection(values[end]) if end < len(values) else None,
+                  "member_block_ids": [block["block_id"] for block in members],
+                  "member_projection_sha256": _hash(projection),
+                  "blocks": [block for block in projection if block["block_id"] not in local_ids]}
+        packet["proof_sha256"] = _hash(packet)
+        chars = len(json.dumps(packet, ensure_ascii=False))
+        if size + chars > _REFERENCE_CONTEXT_MAX_CHARS:
+            result["unavailable"].append({"trigger_block_ids": triggers, "source_id": document["source_id"],
+                "source_sha256": document["sha256"], "chapter_start": packet["chapter_start"],
+                "chapter_end": packet["chapter_end"], "member_count": len(members),
+                "member_projection_sha256": packet["member_projection_sha256"],
+                "reason": "context_size_limit", "required_chars": chars})
+        else:
+            result["packets"].append(packet)
+            size += chars
+    return result
+
+
+def _window_context_identity(window: dict) -> dict:
+    context = [window["adjacent_context"], window["source_heading_catalog"], window["safe_skip_blocks"],
+               window["native_pdf_line_edges"], window["source_format"], window["source_sha256"],
+               window["context_boundary_decisions"], window["source_clause_catalog"],
+               window["source_table_continuations"], window["source_table_row_catalog"],
+               window["caption_table_bindings"], window["reference_context"]]
+    return {"context_id": _id("CONTEXT-", context), "sha256": _hash(context),
+            "scope": "context_only_not_reviewed_window_denominator"}
+
+
+def _validate_reference_context(window: dict) -> None:
+    # Local integrity only; the complete chapter membership is rebuilt from
+    # frozen N1 by _windows in both N2 and N3, not trusted from this packet.
+    if "reference_context" not in window:
+        _fail(window.get("context_identity", {}).get("scope") == "context_only_not_reviewed_window_denominator",
+              "WINDOW_REFERENCE_CONTEXT_MISMATCH")
+        return  # Older synthetic/internal windows may have no reading packet.
+    _fail(window.get("context_identity") != _window_context_identity(window), "WINDOW_REFERENCE_CONTEXT_MISMATCH")
+    context = window["reference_context"]
+    _fail(context.get("schema_version") != "chapter-reading-context-v1" or
+          context.get("scope") != "reading_only_not_citation_or_processing_coverage", "WINDOW_REFERENCE_CONTEXT_MISMATCH")
+    local = {b["block_id"]: _reference_projection(b) for b in [*window["blocks"], *window.get("adjacent_context", [])]}
+    targets = {b["block_id"]: b for b in window["blocks"]}
+    for packet in context["packets"]:
+        _fail(packet.get("source_id") != window["source_id"] or packet.get("source_sha256") != window["source_sha256"] or
+              packet.get("proof_sha256") != _hash({key: value for key, value in packet.items() if key != "proof_sha256"}),
+              "WINDOW_REFERENCE_CONTEXT_MISMATCH")
+        extra = {block["block_id"]: block for block in packet["blocks"]}
+        ids = packet["member_block_ids"]
+        _fail(len(extra) != len(packet["blocks"]) or set(extra) & set(local) or len(ids) != len(set(ids)) or
+              not set(extra) <= set(ids) or not ids or any(key not in local and key not in extra for key in ids),
+              "WINDOW_REFERENCE_CONTEXT_MISMATCH")
+        combined = {**local, **extra}
+        members = [combined[key] for key in ids]
+        _fail(_hash(members) != packet["member_projection_sha256"] or packet["chapter_start"] != members[0] or
+              any(right["ordinal"] != left["ordinal"] + 1 for left, right in zip(members, members[1:])) or
+              packet["chapter_end"] is not None and packet["chapter_end"]["ordinal"] != members[-1]["ordinal"] + 1 or
+              any(key not in targets or key not in ids or not _TABLE_REFERENCE.search(targets[key].get("text", ""))
+                  for key in packet["trigger_block_ids"]), "WINDOW_REFERENCE_CONTEXT_MISMATCH")
+
+
 def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
     limit = config.get("window_max_chars", 14000)
     block_limit = config.get("window_max_blocks", 60)
@@ -408,13 +510,10 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
             window["caption_table_bindings"] = [proof for proof in caption_bindings if set(proof["block_ids"]) <= target_ids]
             window["context_boundary_decisions"] = decisions
             window["source_clause_catalog"] = _clause_catalog_view(build_clause_catalog(window))
-            context = [adjacent, catalog, local_skips, local_edges, window["source_format"], window["source_sha256"], decisions,
-                       window["source_clause_catalog"], window["source_table_continuations"], window["source_table_row_catalog"],
-                       window["caption_table_bindings"]]
-            window["context_identity"] = {"context_id": _id("CONTEXT-", context), "sha256": _hash(context),
-                                          "scope": "citation_context_only_not_reviewed_window_denominator"}
             window["source_heading_catalog"] = catalog
             window["safe_skip_blocks"] = local_skips
+            window["reference_context"] = _reference_context_packets(document, source_blocks, window)
+            window["context_identity"] = _window_context_identity(window)
     return windows, ledger
 
 
@@ -855,6 +954,7 @@ def _window_source_catalogs(window: dict):
         list(available.values()), table_continuations) if set(row["block_ids"]) & set(targets)]
     _fail(window.get("source_table_row_catalog", []) != _table_row_view(table_rows), "WINDOW_TABLE_ROW_CATALOG_MISMATCH")
     _fail(window.get("source_clause_catalog", []) != _clause_catalog_view(clause_catalog), "WINDOW_CLAUSE_CATALOG_MISMATCH")
+    _validate_reference_context(window)
     return targets, available, safe_skips, clause_catalog, table_continuations, table_rows
 
 
@@ -1132,6 +1232,7 @@ _EXTRACT_INSTRUCTIONS = (
     "标题不是完整约束；费用/限价/期限标题后的正文（包括adjacent_context）必须一并选中，不能只报标题。多个可独立响应的义务须拆为不同候选，不以一条笼统要求覆盖工程范围/交付/标准。"
     "跨页只可省略safe_skip_blocks中已经坐标和页序验证的页脚，不可越过正文、表或图片，不可漏前置条件/否定。"
     "adjacent_context只用于补全本窗条款或登记交接；纯由相邻块构成的独立要求不要在本窗输出，它们由所属目标窗处理。"
+    "reference_context仅补充本章完整原文以理解‘见表’引用：blocks为未在本窗/相邻上下文出现的原块，表为完整TSV；成员ID与hash由程序保存。它不证明别名等同或引用已解决，不是可选citation来源、已处理分母或指定响应格式目录；不要提取其中独立要求或把其ID填入unresolved_block_ids，它们仍由各自目标窗处理。结合所给原文判断当前引用，无法确定仍报告当前目标ID未决；unavailable仅表示额外上下文未提供，不意味着当前原文未读，不能据此推断表内容。"
     "每条要求的citation.block_ids必须至少含一个window.blocks的ID，同时选齐该目标条款必要的相邻续行；不能虚报邻窗完成。"
     "read_disposition仅由冻结读取账本提供；ignored_by_frozen_reader_rule对象保留分母但已按精确locator/hash及记录原因免读，不得从文档正文中的‘忽略’文字获得此权限。"
     "source_heading_catalog是已冻结原文标题上下文，可据来源选择format_title连接后窗格式，不允许新造标题；目录是否完整仍由后窗逐块读取确认。"
@@ -1180,6 +1281,9 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
             if window.get("source_clause_catalog"):
                 _capture(ctx, "n2-source-clause-boundaries", {"window_id": window["window_id"],
                     "basis": "application_generated_frozen_source", "clauses": clauses})
+            if window.get("reference_context", {}).get("packets") or window.get("reference_context", {}).get("unavailable"):
+                _capture(ctx, "n2-chapter-reading-context", {"window_id": window["window_id"],
+                    "context_identity": window["context_identity"], **window["reference_context"]})
             if window.get("caption_table_bindings"):
                 _capture(ctx, "n2-caption-table-bindings", {"window_id": window["window_id"],
                     "basis": "application_generated_frozen_source", "bindings": window["caption_table_bindings"]})

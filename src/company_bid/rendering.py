@@ -283,8 +283,9 @@ def _format_table(document, table, weights, style, header_rows=1):
                     _font(run, name=style.font_family, size=style.table_pt, bold=True if row_index < header_rows else None)
 
 
-def _render_table(document, spec, issues, style):
-    _plain(document, spec.title, style, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, keep_next=True)
+def _render_table(document, spec, issues, style, *, show_title=True):
+    if show_title:
+        _plain(document, spec.title, style, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, keep_next=True)
     offset = int(spec.header_from_columns)
     table = document.add_table(rows=offset, cols=len(spec.columns))
     if spec.header_from_columns:
@@ -373,7 +374,7 @@ def _render_bid(package):
                 for index, item in enumerate(block.items, 1):
                     _plain(document, f"（{index}）{item}" if block.ordered else f"• {item}", style)
             elif isinstance(block, TableBlock):
-                _render_table(document, block.table, issues, style)
+                _render_table(document, block.table, issues, style, show_title=block.table.title != section.title)
             elif isinstance(block, IssueBlock):
                 paragraph = _plain(document, "", style)
                 issue = issues[block.issue_id]
@@ -396,6 +397,8 @@ def _render_bid(package):
                 picture = paragraph.add_run().add_picture(str(attachment.path), width=Cm(image_width * scale), height=Cm(image_height * scale))
                 picture._inline.docPr.set("descr", attachment.description)
             for issue_id in block.issue_refs:
+                if isinstance(block, IssueBlock) and issue_id == block.issue_id:
+                    continue  # The explicit issue block already includes this marker and its action.
                 _issue_text(_plain(document, "", style), issues[issue_id], style)
     return document
 

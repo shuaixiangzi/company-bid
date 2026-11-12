@@ -131,6 +131,12 @@ def test_geometry_evidence_is_frozen_in_context_identity_and_cannot_be_self_repo
     assert first["context_identity"]["sha256"] != second["context_identity"]["sha256"]
     damaged = copy.deepcopy(second)
     damaged["native_pdf_line_edges"][0]["boxes"][1][1] += .2
+    with pytest.raises(PlanningError, match="WINDOW_REFERENCE_CONTEXT_MISMATCH"):
+        validate_live_window(with_label(damaged, a, b), damaged)
+    # Even refreshing the outer context hash cannot turn damaged geometry
+    # into valid line-join evidence.
+    from company_bid.extraction import _window_context_identity
+    damaged["context_identity"] = _window_context_identity(damaged)
     with pytest.raises(PlanningError, match="NATIVE_LINE_JOIN_EVIDENCE_INVALID"):
         validate_live_window(with_label(damaged, a, b), damaged)
     raw = with_label(second, a, b)
