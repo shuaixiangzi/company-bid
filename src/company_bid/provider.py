@@ -29,6 +29,8 @@ from .writing_prompt import PROMPT_VERSION, SYSTEM_PROMPT
 OPENCODE_GO_ENDPOINT = "https://opencode.ai/inference/go/openai/v1/chat/completions"
 OPENCODE_GO_MODEL = "deepseek-v4.1-flash"
 OPENCODE_GO_USER_AGENT = "company-bid-test/0.1"
+DEEPSEEK_DIRECT_ENDPOINT = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_DIRECT_MODEL = "deepseek-flash"
 
 
 class ProviderFailure(RuntimeError):
@@ -105,6 +107,8 @@ class ChatConfig:
         if self.service == "opencode_go" and (self.endpoint != OPENCODE_GO_ENDPOINT or self.model != OPENCODE_GO_MODEL):
             raise ProviderFailure("PROVIDER_SERVICE_ENDPOINT_MODEL_INVALID")
         timeout_limit, output_limit = (600, 65536) if self.service == "opencode_go" else (180, 16000)
+        if self.endpoint == DEEPSEEK_DIRECT_ENDPOINT and self.model == DEEPSEEK_DIRECT_MODEL:
+            output_limit = 32000
         if not self.model or not 1 <= self.max_attempts <= 3 or type(self.timeout_seconds) is not int or not 1 <= self.timeout_seconds <= timeout_limit:
             raise ProviderFailure("PROVIDER_CONFIG_INVALID")
         if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= output_limit or not 1 <= self.max_input_chars <= 100000:

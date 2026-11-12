@@ -21,7 +21,7 @@ from .table_continuations import (
 )
 
 
-EXTRACTION_VERSION = "requirements-window-v17"
+EXTRACTION_VERSION = "requirements-window-v18"
 CALLER_CANDIDATE_LOCATION = "caller structured candidate captured in this N2 unit; transport provenance is in call captures"
 
 # The live output contract and deterministic guard use the same combinations.
@@ -485,6 +485,10 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
                 block = {key: value for key, value in block.items() if key not in {"image_ref", "bbox"}}
                 cost = len(json.dumps(block, ensure_ascii=False))
                 _fail(cost > limit, "SOURCE_BLOCK_EXCEEDS_WINDOW_LIMIT")
+                # Never mix separate native PDF chapters merely to fill capacity.
+                # This changes ownership, not original blocks or source semantics.
+                if pending and document.get("format") == "pdf" and _chapter_boundary(block):
+                    flush()
                 if pending and (size + cost > limit or len(pending) >= block_limit):
                     binding = _caption_table_binding(document, pending[-1], block)
                     if binding:
@@ -1382,6 +1386,102 @@ _EXTRACT_INSTRUCTIONS = (
 )
 
 
+def extraction_window_payload(window: dict, window_config: dict) -> dict:
+    """Build the same frozen request for full extraction and isolated diagnostics."""
+    return {"producer_version": EXTRACTION_VERSION, "window_config": window_config,
+            "task_instructions": _EXTRACT_INSTRUCTIONS, "output_contract": source_selected_output_contract(),
+            "window": _model_window(window), "source_sha256": window["source_sha256"]}
+
+
+def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> dict:
+    """Execute one durable unit; this alone never declares the full N2 complete."""
+    payload = extraction_window_payload(window, window_config)
+
+    def execute():
+        _capture(ctx, "n2-window-partition", {"window_id": window["window_id"],
+            "rule": "native_pdf_chapter_then_bounded_capacity_v1", "source_sha256": window["source_sha256"],
+            "source_window_sha256": _hash(window), "window_config": window_config,
+            "target_block_ids": [block["block_id"] for block in window["blocks"]],
+            "scope": "one_window_not_whole_extraction_or_semantic_acceptance"})
+        # Deterministic source faults must stop before a paid request.
+        try:
+            _, _, _, clauses, proofs, table_rows = _window_source_catalogs(window)
+        except PlanningError as exc:
+            _capture(ctx, "n2-source-context-preflight", {"window_id": window["window_id"],
+                "error_code": exc.code, "diagnostic_context": exc.diagnostic_context,
+                "actual_call_started": False})
+            raise
+        if window.get("source_clause_catalog"):
+            _capture(ctx, "n2-source-clause-boundaries", {"window_id": window["window_id"],
+                "basis": "application_generated_frozen_source", "clauses": clauses})
+        if window.get("reference_context", {}).get("packets") or window.get("reference_context", {}).get("unavailable"):
+            _capture(ctx, "n2-chapter-reading-context", {"window_id": window["window_id"],
+                "context_identity": window["context_identity"], **window["reference_context"]})
+        if window.get("caption_table_bindings"):
+            _capture(ctx, "n2-caption-table-bindings", {"window_id": window["window_id"],
+                "basis": "application_generated_frozen_source", "bindings": window["caption_table_bindings"]})
+        if window.get("source_table_continuations"):
+            _capture(ctx, "n2-table-continuation-proofs", {"window_id": window["window_id"],
+                "basis": "application_generated_frozen_source", "proofs": proofs})
+        if window.get("source_table_row_catalog"):
+            _capture(ctx, "n2-table-row-proofs", {"window_id": window["window_id"],
+                "basis": "application_generated_frozen_source", "rows": table_rows})
+        _fail(bool(getattr(ctx, "_capture_failed", False)), "DIAGNOSTICS_CAPTURE_FAILED")
+        observer = getattr(ctx, "_observer", None)
+        if observer is not None:
+            observer.check()
+        processing = _window_processing_ledger(window, [])
+        source_selection = _normalize_source_selectors({}, window)[1]
+        live_confirmation = None
+        raw_model_candidate = None
+        if not window["blocks"]:
+            candidate = {"reviewed_block_ids": [], "requirements": [], "format_chapters": [], "format_status": "none_verified"}
+        else:
+            validated_by_caller = []
+            def validate_live(value):
+                nonlocal processing, live_confirmation, raw_model_candidate, source_selection
+                selection = _normalize_source_selectors(value, window)[1]
+                _capture_source_selection(ctx, selection)
+                result = validate_live_window(value, window)
+                source_selection = selection
+                raw_model_candidate = copy.deepcopy(value)
+                processing = _window_processing_ledger(window, value["unresolved_block_ids"])
+                live_confirmation = {key: value[key] for key in ("window_id", "processing_declaration", "unresolved_block_ids")}
+                live_confirmation["raw_structured_candidate_sha256"] = _hash(value)
+                validated_by_caller.append(copy.deepcopy(result))
+                return result
+            candidate = call_json(ctx, "extract_requirements", window["window_id"], payload,
+                                  validate_live)
+            if validated_by_caller:
+                _fail(candidate != validated_by_caller[-1], "JSON_CALLER_VALIDATION_RESULT_MISMATCH")
+            else:
+                candidate = validate_live(candidate)
+            # The supplied caller is not trusted to have invoked validate.
+            # A validator's enriched citations are stripped to the wire
+            # fields so the same check works with either caller convention.
+            candidate = _wire_candidate(candidate)
+        validated = _validate_window(candidate, window)
+        inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
+        if inactive_hints["ignored_fields"]:
+            _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
+        _capture(ctx, "n2-" + window["window_id"], {"candidate": candidate, "candidate_origin": "application_normalized",
+            "raw_model_candidate_location": CALLER_CANDIDATE_LOCATION if live_confirmation else "no model call: empty frozen window",
+            "live_confirmation": live_confirmation,
+            "raw_model_candidate": raw_model_candidate,
+            "processing": processing, "inactive_reference_hints": inactive_hints,
+            "source_selection_normalization": source_selection, "validated": validated})
+        return {"window_id": window["window_id"], "unit_ids": window["unit_ids"],
+                "candidate": candidate, "candidate_origin": "application_normalized",
+                "format_status_scope": "window_target_blocks", "none_verified_means": "none_in_this_window",
+                "raw_model_candidate_location": CALLER_CANDIDATE_LOCATION if live_confirmation else "no model call: empty frozen window",
+                "raw_model_candidate": raw_model_candidate,
+                "live_confirmation": live_confirmation, "processing": processing, "inactive_reference_hints": inactive_hints,
+                "source_selection_normalization": source_selection,
+                "validated": validated, "status": "complete"}
+
+    return ctx.run_unit(window["window_id"], payload, execute)
+
+
 def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: dict) -> dict:
     """N2: extract every tender window, then merge only identical assertions."""
     manifest = _json(manifest)
@@ -1392,84 +1492,7 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
     windows, ledger = _windows(documents, blocks, window_config)
     results = []
     for window in windows:
-        payload = {"producer_version": EXTRACTION_VERSION, "window_config": window_config, "task_instructions": _EXTRACT_INSTRUCTIONS,
-                   "output_contract": source_selected_output_contract(), "window": _model_window(window),
-                   "source_sha256": next(d["sha256"] for d in documents if d["source_id"] == window["source_id"])}
-
-        def execute(window=window, payload=payload):
-            # Deterministic source faults must stop before a paid request.
-            try:
-                _, _, _, clauses, proofs, table_rows = _window_source_catalogs(window)
-            except PlanningError as exc:
-                _capture(ctx, "n2-source-context-preflight", {"window_id": window["window_id"],
-                    "error_code": exc.code, "diagnostic_context": exc.diagnostic_context,
-                    "actual_call_started": False})
-                raise
-            if window.get("source_clause_catalog"):
-                _capture(ctx, "n2-source-clause-boundaries", {"window_id": window["window_id"],
-                    "basis": "application_generated_frozen_source", "clauses": clauses})
-            if window.get("reference_context", {}).get("packets") or window.get("reference_context", {}).get("unavailable"):
-                _capture(ctx, "n2-chapter-reading-context", {"window_id": window["window_id"],
-                    "context_identity": window["context_identity"], **window["reference_context"]})
-            if window.get("caption_table_bindings"):
-                _capture(ctx, "n2-caption-table-bindings", {"window_id": window["window_id"],
-                    "basis": "application_generated_frozen_source", "bindings": window["caption_table_bindings"]})
-            if window.get("source_table_continuations"):
-                _capture(ctx, "n2-table-continuation-proofs", {"window_id": window["window_id"],
-                    "basis": "application_generated_frozen_source", "proofs": proofs})
-            if window.get("source_table_row_catalog"):
-                _capture(ctx, "n2-table-row-proofs", {"window_id": window["window_id"],
-                    "basis": "application_generated_frozen_source", "rows": table_rows})
-            processing = _window_processing_ledger(window, [])
-            source_selection = _normalize_source_selectors({}, window)[1]
-            live_confirmation = None
-            raw_model_candidate = None
-            if not window["blocks"]:
-                candidate = {"reviewed_block_ids": [], "requirements": [], "format_chapters": [], "format_status": "none_verified"}
-            else:
-                validated_by_caller = []
-                def validate_live(value):
-                    nonlocal processing, live_confirmation, raw_model_candidate, source_selection
-                    selection = _normalize_source_selectors(value, window)[1]
-                    _capture_source_selection(ctx, selection)
-                    result = validate_live_window(value, window)
-                    source_selection = selection
-                    raw_model_candidate = copy.deepcopy(value)
-                    processing = _window_processing_ledger(window, value["unresolved_block_ids"])
-                    live_confirmation = {key: value[key] for key in ("window_id", "processing_declaration", "unresolved_block_ids")}
-                    live_confirmation["raw_structured_candidate_sha256"] = _hash(value)
-                    validated_by_caller.append(copy.deepcopy(result))
-                    return result
-                candidate = call_json(ctx, "extract_requirements", window["window_id"], payload,
-                                      validate_live)
-                if validated_by_caller:
-                    _fail(candidate != validated_by_caller[-1], "JSON_CALLER_VALIDATION_RESULT_MISMATCH")
-                else:
-                    candidate = validate_live(candidate)
-                # The supplied caller is not trusted to have invoked validate.
-                # A validator's enriched citations are stripped to the wire
-                # fields so the same check works with either caller convention.
-                candidate = _wire_candidate(candidate)
-            validated = _validate_window(candidate, window)
-            inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
-            if inactive_hints["ignored_fields"]:
-                _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
-            _capture(ctx, "n2-" + window["window_id"], {"candidate": candidate, "candidate_origin": "application_normalized",
-                "raw_model_candidate_location": CALLER_CANDIDATE_LOCATION if live_confirmation else "no model call: empty frozen window",
-                "live_confirmation": live_confirmation,
-                "raw_model_candidate": raw_model_candidate,
-                "processing": processing, "inactive_reference_hints": inactive_hints,
-                "source_selection_normalization": source_selection, "validated": validated})
-            return {"window_id": window["window_id"], "unit_ids": window["unit_ids"],
-                    "candidate": candidate, "candidate_origin": "application_normalized",
-                    "format_status_scope": "window_target_blocks", "none_verified_means": "none_in_this_window",
-                    "raw_model_candidate_location": CALLER_CANDIDATE_LOCATION if live_confirmation else "no model call: empty frozen window",
-                    "raw_model_candidate": raw_model_candidate,
-                    "live_confirmation": live_confirmation, "processing": processing, "inactive_reference_hints": inactive_hints,
-                    "source_selection_normalization": source_selection,
-                    "validated": validated, "status": "complete"}
-
-        results.append(ctx.run_unit(window["window_id"], payload, execute))
+        results.append(run_extraction_window(ctx, window, window_config, call_json))
 
     try:
         deferred_closure = _close_deferred_context(windows, results)
