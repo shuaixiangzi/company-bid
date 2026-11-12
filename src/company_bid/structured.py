@@ -50,13 +50,117 @@ _ADJACENT_REPAIR_INSTRUCTIONS = (
     "但必须至少包含一个目标ID；仅format_chapters.content_block_ids禁止相邻ID，不能混淆这两个范围。"
     "保留原候选按索引的全部条目、来源序列和protected_fields，只可在requirements尾部新增完整处理这些组的候选。"
     "每个新增候选必须包含至少一组全部原ID，完整保留否定、条件、金额和例外；需要的其它连续前后文也要保留。"
+    "带source_witnesses的组来自本run已冻结前窗的完整原文引用，只是本次引用不得缩减的来源下限，"
+    "不是已证明的语义边界或业务答案；必须重新判断本窗要求，不复制前窗分类或声称其已经满足。"
     "只有被新增完整引用处理的组才能从原unresolved_block_ids移除，其余未决原序保留，禁止仅清空标记。"
     "格式条目和其它根字段不变，不得把实质义务降成程序事项、捏造格式或借用远章阅读上下文的ID。"
     "若仍有语义冲突、不能确定要求或完整范围，保留未决并停止；返回完整JSON重新接受全部校验。"
 )
 
 
-def _adjacent_resolution_groups(candidate: dict, window: dict) -> list | None:
+def _prior_source_span_witnesses(ctx, request: dict, candidate: dict) -> list:
+    """Read verified same-run units as source-span witnesses, never answers.
+
+    A prior model-selected span is a minimum source-preservation group for
+    another model review. It is not an independently proved semantic boundary.
+    No provider-supplied witness field is consulted.
+    """
+    from .extraction import _Requirement, _citation, _label_grounding, _wire_candidate
+    from .runtime import CheckpointInvalidError
+    from .storage import ArtifactIntegrityError
+
+    window = request.get("window", {})
+    normalized = _normalized_repair_candidate(candidate, request)
+    if normalized is None or window.get("source_format") != "pdf":
+        return []
+    unresolved = set(normalized.get("unresolved_block_ids", []))
+    targets = {block["block_id"] for block in window.get("blocks", [])}
+    available = {block["block_id"]: block for block in [*window.get("blocks", []), *window.get("adjacent_context", [])]}
+    record, executor = getattr(ctx, "_record", {}), getattr(ctx, "executor", None)
+    if executor is None or not unresolved & targets:
+        return []
+    found = {}
+    for prior in record.get("units", {}).values():
+        if prior.get("status") != "succeeded" or prior.get("version") != record.get("version"):
+            continue
+        try:
+            original_input = executor.store.read_json(prior["input_ref"])
+            if digest(original_input) != prior["input_hash"]:
+                raise ArtifactIntegrityError("Frozen unit input changed.")
+            envelope = executor.store.read_json(prior["output_ref"])
+            if (envelope.get("run_id") != ctx.run_id or envelope.get("node_key") != ctx.node_key or
+                    envelope.get("unit_id") != prior.get("unit_id")):
+                raise ArtifactIntegrityError("Source witness checkpoint belongs to another execution.")
+            data = executor._checkpoint_data(prior)
+        except (ArtifactIntegrityError, KeyError, TypeError) as error:
+            raise CheckpointInvalidError(ctx.node_key) from error
+        attempts = prior.get("attempts", [])
+        if not attempts:
+            continue
+        attempt = attempts[-1]
+        if (attempt.get("status") != "succeeded" or
+                any(not re.fullmatch(r"[a-f0-9]{" + str(length) + r"}", str(attempt.get(key, ""))) or
+                    attempt.get(key) == "0" * length for key, length in (("trace_id", 32), ("span_id", 16), ("attempt_id", 32))) or
+                attempt.get("node_attempt_id") != envelope.get("node_attempt_id") or
+                attempt.get("node_attempt_id") not in {item.get("attempt_id") for item in record.get("attempts", [])} or
+                attempt.get("input_hash") != prior["input_hash"] or attempt.get("output_hash") != prior["output_hash"]):
+            continue
+        old_window = original_input.get("window", {})
+        if (old_window.get("source_sha256") != window.get("source_sha256") or
+                old_window.get("source_id") != window.get("source_id") or old_window.get("source_format") != "pdf" or
+                data.get("status") != "complete" or data.get("candidate_origin") != "application_normalized" or
+                data.get("window_id") != old_window.get("window_id") or data.get("window_id") != prior.get("unit_id")):
+            continue
+        old_normalized = _normalized_repair_candidate(data.get("raw_model_candidate"), original_input)
+        validated = data.get("validated", {})
+        if (old_normalized is None or data.get("candidate") != _wire_candidate(validated) or
+                len(old_normalized.get("requirements", [])) != len(validated.get("requirements", []))):
+            continue
+        old_available = {block["block_id"]: block for block in [*old_window.get("blocks", []), *old_window.get("adjacent_context", [])]}
+        for index, item in enumerate(validated.get("requirements", [])):
+            citation = item.get("citation", {})
+            ids = citation.get("block_ids") or [citation.get("block_id")]
+            if (not 2 <= len(ids) <= 24 or not set(ids) <= set(available) or
+                    not set(ids) & unresolved & targets or not set(ids) - targets or
+                    citation.get("clause_id") or citation.get("table_row_id") or
+                    any(old_available.get(key) != available[key] for key in ids)):
+                continue
+            span = [available[key] for key in ids]
+            lines = [re.fullmatch(r"pdf/page\[(\d+)\]/line\[(\d+)\]", str(block.get("locator", ""))) for block in span]
+            if (not all(lines) or any(block.get("kind") != "paragraph" or block.get("origin") != "native" or
+                    block.get("read_disposition") or not block.get("text", "").strip() or
+                    "\n" in block["text"] or "\r" in block["text"] or
+                    block.get("page") != int(line[1]) or type(block.get("ordinal")) is not int
+                    for block, line in zip(span, lines)) or
+                    any(right["ordinal"] != left["ordinal"] + 1 or right["page"] != left["page"] or
+                        int(right_line[2]) != int(left_line[2]) + 1
+                        for left, right, left_line, right_line in zip(span, span[1:], lines, lines[1:]))):
+                continue
+            try:
+                original = _Requirement.model_validate(old_normalized["requirements"][index], strict=True).model_dump(mode="json")
+                original["citation"] = _citation(original["citation"], available)
+                original["citation"]["label_grounding"] = _label_grounding(original, available, window)
+                if original["response_mode"] != "writing":
+                    original["reference_keywords"] = []
+            except (ValidationError, ValueError, KeyError, TypeError):
+                continue
+            if original != item:
+                continue
+            witness = {"run_id": ctx.run_id, "unit_id": prior["unit_id"], "producer_version": prior["version"],
+                "input_ref": prior["input_ref"], "input_hash": prior["input_hash"],
+                "output_ref": prior["output_ref"], "output_hash": prior["output_hash"],
+                "candidate_index": index, "quote_sha256": citation["quote_sha256"],
+                "source_sha256": window["source_sha256"], "trace_id": attempt.get("trace_id"), "span_id": attempt.get("span_id"),
+                "semantic_boundary_proven": False, "business_answer_reused": False}
+            group = found.setdefault(tuple(ids), {"block_ids": ids, "required_target_ids": [key for key in ids if key in unresolved & targets],
+                "basis": "verified_prior_window_source_span_minimum_preservation_not_semantic_boundary", "source_witnesses": []})
+            group["source_witnesses"].append(witness)
+    # Different prior spans for the same unresolved target are ambiguous.
+    return [group for ids, group in found.items() if all(
+        sum(key in other["required_target_ids"] for other in found.values()) == 1 for key in group["required_target_ids"])]
+
+
+def _adjacent_resolution_groups(candidate: dict, window: dict, witnesses=()) -> list | None:
     """Offer bounded source review, never declare the unresolved text satisfied.
 
     Only complete native paragraph groups crossing a target/adjacent boundary
@@ -111,6 +215,8 @@ def _adjacent_resolution_groups(candidate: dict, window: dict) -> list | None:
         if set(ids) & targets and set(ids) & adjacent:
             eligible.append({"block_ids": ids, "required_target_ids": [key for key in ids if key in targets],
                              "basis": "same_page_native_consecutive_target_and_adjacent_lines"})
+    witnessed_targets = {key for group in witnesses for key in group["required_target_ids"]}
+    eligible = [group for group in eligible if not set(group["required_target_ids"]) & witnessed_targets] + list(witnesses)
     covered = {key for group in eligible for key in group["block_ids"]}
     if not 1 <= len(eligible) <= 4 or not set(unresolved) & targets or not (set(unresolved) & targets) <= covered:
         return None
@@ -187,7 +293,7 @@ def _valid_repair_fields(item: dict, model, excluded: set[str]) -> dict:
     return fields
 
 
-def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnostic_context=None) -> dict | None:
+def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnostic_context=None, source_witnesses=()) -> dict | None:
     """Keep a small source-checked inventory; unknown anchors disable repair."""
     from .extraction import _FormatChapter, _LiveWindowResponse, _Requirement
 
@@ -211,7 +317,7 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
                 context.get("candidate_index") if error_code == "FORMAT_TITLE_NOT_GROUNDED" else None):
             return None
     if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED":
-        groups = _adjacent_resolution_groups(candidate, window)
+        groups = _adjacent_resolution_groups(candidate, window, source_witnesses)
         if groups is None:
             return None
         coverage["resolution_groups"] = groups
@@ -479,7 +585,9 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             # Validator enrichment/mutation can never rewrite the raw candidate.
             return validate(copy.deepcopy(candidate))
         except PlanningError as error:
-            coverage = _repair_coverage(candidate, request, error_code=error.code, diagnostic_context=error.diagnostic_context)
+            witnesses = _prior_source_span_witnesses(ctx, request, candidate) if error.code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else []
+            coverage = _repair_coverage(candidate, request, error_code=error.code, diagnostic_context=error.diagnostic_context,
+                                        source_witnesses=witnesses)
             if (error.code in _REPAIR_CODES and coverage is not None and
                     isinstance(request.get("task_instructions", ""), str) and
                     (not critical_unresolved(candidate) or
@@ -505,7 +613,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise
         if first_context.capture_failed or getattr(ctx, "_capture_failed", False):
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-        relation = {"schema_version": "validation-repair-v3", "unit_id": unit_id, "task_type": task_type,
+        relation = {"schema_version": "validation-repair-v4", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],
