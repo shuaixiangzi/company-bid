@@ -11,7 +11,8 @@ import re
 
 from pydantic import Field
 
-from .models import PreparedBid, SourceRef
+from .models import (PreparedBid, SourceRef, SourceContextProof, RequirementSourceContext,
+                     context_digest, source_context_operator)
 from .slots import has_fill_marker, whole_cell_slot
 from .source_clauses import build_clause_catalog
 from .extraction import (
@@ -24,7 +25,7 @@ from .extraction import (
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-PLANNING_VERSION = "bid-plan-v15"
+PLANNING_VERSION = "bid-plan-v16"
 
 
 class _Fill(_Strict):
@@ -436,6 +437,55 @@ def _format_source_roles(document: dict, body: list[dict]) -> dict:
     return roles
 
 
+def _numbered_child_context(role: dict, requirement: dict, blocks: dict) -> dict | None:
+    """Derive only two supported operators for a proved native circled child."""
+    ids = role["instruction_block_ids"]
+    if (role.get("scope_ambiguous") or not role.get("scope_block_ids") or
+            requirement["category"] != "technical" or requirement["response_mode"] == "procedure" or
+            not re.match(r"^[①②③④⑤⑥⑦⑧⑨⑩]", blocks[ids[0]]["text"].strip()) or
+            len(requirement.get("citations", [])) != 1):
+        return None
+    proof = role["role_proof"]
+    container = [blocks[member["block_id"]] for member in proof["container_members"]]
+    if not _native_source_span(container):
+        return None
+    parents = [blocks[key] for key in role["scope_block_ids"]]
+    operators = [source_context_operator(parent["text"]) for parent in parents]
+    if (None in operators or len(set(operators)) != len(operators) or
+            max(parent["ordinal"] for parent in parents) >= blocks[ids[0]]["ordinal"]):
+        return None
+    prefix = [value for value in container if max(parent["ordinal"] for parent in parents) < value["ordinal"] <= blocks[ids[0]]["ordinal"]]
+    markers = ["①②③④⑤⑥⑦⑧⑨⑩".index(value["text"].strip()[0]) + 1 for value in prefix
+               if re.match(r"^[①②③④⑤⑥⑦⑧⑨⑩]", value["text"].strip())]
+    if markers != list(range(1, len(markers) + 1)):
+        return None
+    for index, value in enumerate(prefix):
+        if not re.match(r"^[①②③④⑤⑥⑦⑧⑨⑩]", value["text"].strip()) and (
+                _SOURCE_ITEM.match(value["text"].strip()) or _heading_level(value["text"].strip()) is not None or
+                index and re.search(r"[。；;]$", prefix[index - 1]["text"].strip())):
+            return None
+    citation = requirement["citations"][0]
+    if citation.get("clause_id") or citation.get("table_row_id"):
+        return None
+    selected = citation.get("block_ids") or [citation["block_id"]]
+    if not set(ids) <= set(selected) or set(selected) - set([*ids, *role["scope_block_ids"]]):
+        return None
+    checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks))
+    if (checked["quote"] != requirement["text"] or checked["start"] != 0 or
+            checked["end"] != len("\n".join(blocks[key]["text"] for key in selected))):
+        return None
+    return {"rule": "native_numbered_child_context_v1", "source_id": proof["source_id"],
+            "source_sha256": proof["source_sha256"], "requirement_id": requirement["requirement_id"],
+            "requirement_quote_sha256": hashlib.sha256(requirement["text"].encode()).hexdigest(),
+            "scope_members": copy.deepcopy(proof["scope_members"]),
+            "container_members": copy.deepcopy(proof["container_members"]),
+            "child_members": copy.deepcopy(proof["members"]),
+            "selected_members": [{key: blocks[block_id].get(key) for key in
+                                  ("block_id", "locator", "ordinal", "page", "unit_id")} |
+                                 {"text_sha256": hashlib.sha256(blocks[block_id]["text"].encode()).hexdigest()}
+                                 for block_id in selected]}
+
+
 def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tuple[list, list]:
     ids = role["instruction_block_ids"]
     text = "\n".join(blocks[key]["text"] for key in ids)
@@ -467,11 +517,17 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
         if "attachment" not in modes or not modes & {"table", "factual_response"}:
             errors.append("preparation_instruction_component_unmapped" if "清单" in text else
                           "preparation_instruction_summary_unproved")
-    if role.get("scope_block_ids") and valid and not all(any(
-            set(role["scope_block_ids"]) <= set(citation.get("block_ids") or [citation["block_id"]])
-            for citation in item["citations"]) for item in valid):
-        errors.append("preparation_instruction_scope_unproved")
-    return [{"requirement_id": item["requirement_id"], "response_mode": item["response_mode"]} for item in valid], errors
+    results = []
+    for item in valid:
+        result = {"requirement_id": item["requirement_id"], "response_mode": item["response_mode"]}
+        if role.get("scope_block_ids"):
+            derivation = _numbered_child_context(role, item, blocks)
+            if derivation:
+                result["source_context_derivation"] = derivation
+            else:
+                errors.append("preparation_instruction_scope_unproved")
+        results.append(result)
+    return results, errors
 
 
 def _instruction_placements(ledger, sections, attachments, actions, issues):
@@ -848,11 +904,36 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 sources.append(item)
             return source_id
 
+        context_derivations, source_context_proofs = {}, {}
+        for row in format_ledger:
+            for handler in row.get("instruction_requirements", []):
+                derivation = handler.get("source_context_derivation")
+                if derivation:
+                    rid = handler["requirement_id"]
+                    _fail(rid in context_derivations and context_derivations[rid] != derivation,
+                          "SOURCE_CONTEXT_DERIVATION_AMBIGUOUS")
+                    context_derivations[rid] = derivation
+
         for raw in extracted["requirements"]:
             citations = raw.get("citations", [])
             _fail(not citations or any(c["quote"] != raw["text"] for c in citations), "REQUIREMENT_CITATION_MISMATCH")
             requirement = {key: raw[key] for key in ("requirement_id", "text", "category", "mandatory", "response_mode")}
             requirement["source_refs"] = list(dict.fromkeys(scoped_source(c) for c in citations))
+            requirement["source_contexts"] = []
+            if raw["requirement_id"] in context_derivations:
+                payload = {**context_derivations[raw["requirement_id"]], "child_source_refs": requirement["source_refs"]}
+                proof_sha = context_digest(payload)
+                proof = {**payload, "proof_id": "CTXP-" + proof_sha[:24], "proof_sha256": proof_sha}
+                source_context_proofs[proof["proof_id"]] = SourceContextProof.model_validate(proof).model_dump(mode="json")
+                for parent in proof["scope_members"]:
+                    block = blocks[parent["block_id"]]
+                    operator = source_context_operator(block["text"])
+                    context = {"kind": "applicability_condition" if operator == "service_applicability" else "assembly_constraint",
+                        "operator": operator, "text": block["text"], "parent_block_id": block["block_id"],
+                        "source_refs": [scoped_source({key: block[key] for key in ("source_id", "block_id", "locator")})],
+                        "proof_ref": proof["proof_id"], "proof_sha256": proof_sha, "review_status": "not_checked"}
+                    context["context_id"] = "CTX-" + context_digest(context)[:24]
+                    requirement["source_contexts"].append(RequirementSourceContext.model_validate(context).model_dump(mode="json"))
             requirements.append(requirement)
             # The original N2 observation is immutable; only N3's derived
             # planning view adopts a separately captured source resolution.
@@ -1111,6 +1192,25 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                                      any(item["section_id"] == section["section_id"] for item in issues))):
                 issue(section, section["requirement_refs"], "指定章节内容待补", "已定位章节标题，但没有可装配的正文、原表或证明内容。", "补充该章节原始格式与资料后重新读取。")
 
+        requirement_map = {item["requirement_id"]: item for item in requirements}
+        for section in sections:
+            for rid in section["requirement_refs"]:
+                for context in requirement_map[rid].get("source_contexts", []):
+                    section["source_refs"] = list(dict.fromkeys([*section["source_refs"], *context["source_refs"]]))
+                    issues.append({"issue_id": f"M-{len(issues) + 1:03d}", "section_id": section["section_id"],
+                        "requirement_refs": [rid], "severity": "warning", "source_requirement": context["text"],
+                        "title": "服务适用条件待核验" if context["operator"] == "service_applicability" else "技术文件报价分离待核对",
+                        "reason": "原文父条件已保留，尚未核验本项目适用性或最终正文的实质符合性。",
+                        "action": "按原文确认适用范围并审查实际响应；该提醒不替代技术正文或代表已满足。"})
+            for task in section["writing_tasks"]:
+                contexts = [context for requirement in requirements if requirement["requirement_id"] in task["requirement_refs"]
+                            for context in requirement.get("source_contexts", [])]
+                task["source_context_refs"] = list(dict.fromkeys(context["context_id"] for context in contexts))
+                task["forbidden_fields"].extend(context["text"] for context in contexts
+                                                if context["operator"] == "exclude_commercial_quotation")
+                if contexts:
+                    task["completion_criteria"].append("父条件适用性尚未核验，不得声称已确认适用或将拟实施内容表述为公司事实。")
+
         instruction_handling, instruction_errors = _instruction_placements(
             format_ledger, sections, attachments, review_actions, issues)
         _capture(ctx, "n3-instruction-handling", {"items": instruction_handling, "errors": instruction_errors,
@@ -1119,6 +1219,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
+                    "source_context_proofs": list(source_context_proofs.values()),
                     "review_actions": review_actions,
                     "prescribed_cover_section_id": prescribed_cover_section_id,
                     "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
@@ -1127,6 +1228,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
                   "instruction_handling": instruction_handling,
+                  "source_context_proofs": list(source_context_proofs.values()),
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
                   "remote_format_resolutions": remote_format_resolutions,
                   "prescribed_cover": {"section_id": prescribed_cover_section_id,

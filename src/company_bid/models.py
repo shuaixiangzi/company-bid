@@ -7,6 +7,7 @@ are candidates; prepared M1 fixtures retain their explicit origin label.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Annotated, Literal
@@ -63,11 +64,102 @@ class Fact(Contract):
     source_refs: list[Text] = Field(min_length=1)
 
 
+def context_digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+class SourceBlockIdentity(Contract):
+    block_id: Text
+    locator: Text
+    ordinal: int = Field(ge=0)
+    page: int = Field(ge=1)
+    unit_id: Text
+    text_sha256: Sha256
+
+
+class SourceContextProof(Contract):
+    proof_id: Text
+    rule: Literal["native_numbered_child_context_v1"]
+    source_id: Text
+    source_sha256: Sha256
+    requirement_id: Text
+    requirement_quote_sha256: Sha256
+    child_source_refs: list[Text] = Field(min_length=1)
+    scope_members: list[SourceBlockIdentity] = Field(min_length=1, max_length=2)
+    container_members: list[SourceBlockIdentity] = Field(min_length=3, max_length=100)
+    child_members: list[SourceBlockIdentity] = Field(min_length=1, max_length=24)
+    selected_members: list[SourceBlockIdentity] = Field(min_length=1, max_length=26)
+    proof_sha256: Sha256
+
+    @model_validator(mode="after")
+    def proof_integrity(self):
+        payload = self.model_dump(mode="json", exclude={"proof_id", "proof_sha256"})
+        if self.proof_sha256 != context_digest(payload) or self.proof_id != "CTXP-" + self.proof_sha256[:24]:
+            raise ValueError("source context proof identity mismatch")
+        members = self.container_members
+        first = members[0]
+        if (len({item.block_id for item in members}) != len(members) or
+                [item.ordinal for item in members] != list(range(first.ordinal, first.ordinal + len(members))) or
+                any(item.unit_id != first.unit_id or item.page != first.page for item in members)):
+            raise ValueError("source context container must be one complete native interval")
+        locators = [re.fullmatch(r"pdf/page\[(\d+)\]/line\[(\d+)\]", item.locator) for item in members]
+        if (not all(locators) or any(int(match[1]) != item.page for match, item in zip(locators, members)) or
+                [int(match[2]) for match in locators] != list(range(int(locators[0][2]), int(locators[0][2]) + len(members)))):
+            raise ValueError("source context proof requires consecutive native line locators")
+        positions = {item.block_id: item for item in members}
+        if any(positions.get(item.block_id) != item for item in [*self.scope_members, *self.child_members, *self.selected_members]):
+            raise ValueError("source context members must retain their container identities")
+        if (len({item.block_id for item in self.scope_members}) != len(self.scope_members) or
+                len({item.block_id for item in self.child_members}) != len(self.child_members) or
+                max(item.ordinal for item in self.scope_members) >= min(item.ordinal for item in self.child_members)):
+            raise ValueError("source context parents must precede their own child")
+        selected = self.selected_members
+        if ([item.ordinal for item in selected] != list(range(selected[0].ordinal, selected[0].ordinal + len(selected))) or
+                {item.block_id for item in self.child_members} - {item.block_id for item in selected} or
+                {item.block_id for item in selected} - {item.block_id for item in [*self.scope_members, *self.child_members]}):
+            raise ValueError("source context selected span must bind its complete child and only its parents")
+        return self
+
+
+def source_context_operator(text: str) -> str | None:
+    if re.fullmatch(r"[（(]\d+[）)](?:合成|测试)?服务(?:类)?适用", text.strip()):
+        return "service_applicability"
+    if re.fullmatch(r"[A-Z][.．、]\s*(?:(?:不带|不含)商务报价的技术部分|"
+                    r"技术(?:部分|材料|文件|册).{0,10}(?:不得|禁止|不带|不含).{0,8}(?:商务|商业)报价)"
+                    r"[^。；;]{0,12}(?:包括|包含)[：:]", text.strip()):
+        return "exclude_commercial_quotation"
+    return None
+
+
+class RequirementSourceContext(Contract):
+    context_id: Text
+    kind: Literal["applicability_condition", "assembly_constraint"]
+    operator: Literal["service_applicability", "exclude_commercial_quotation"]
+    text: SourceText
+    source_refs: list[Text] = Field(min_length=1, max_length=1)
+    parent_block_id: Text
+    proof_ref: Text
+    proof_sha256: Sha256
+    review_status: Literal["not_checked"] = "not_checked"
+
+    @model_validator(mode="after")
+    def context_integrity(self):
+        expected = "applicability_condition" if self.operator == "service_applicability" else "assembly_constraint"
+        if self.kind != expected or self.operator != source_context_operator(self.text):
+            raise ValueError("source context operator and kind differ")
+        payload = self.model_dump(mode="json", exclude={"context_id"})
+        if self.context_id != "CTX-" + context_digest(payload)[:24]:
+            raise ValueError("source context identity mismatch")
+        return self
+
+
 class Requirement(Contract):
     requirement_id: Text
     text: SourceText
     category: Literal["qualification", "technical", "commercial", "fixed_table", "procedure"]
     source_refs: list[Text] = Field(min_length=1)
+    source_contexts: list[RequirementSourceContext] = Field(default_factory=list, max_length=2)
     mandatory: bool = True
     response_mode: Literal["writing", "fixed_text", "table", "attachment", "factual_response", "procedure"] = "writing"
 
@@ -241,6 +333,7 @@ class WritingTask(Contract):
     format_status: Literal["not_prescribed", "prescribed", "unread", "conflict"] = "not_prescribed"
     no_reference_reason: Text | None = None
     table_refs: list[Text] = Field(default_factory=list)
+    source_context_refs: list[Text] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def explicit_reference_decision(self):
@@ -248,7 +341,8 @@ class WritingTask(Contract):
             raise ValueError("reference adaptation requires frozen reference excerpts")
         if self.operation == "bounded_new_draft" and (self.reference_refs or not self.no_reference_reason):
             raise ValueError("bounded drafting requires an explicit no-reference reason and no claimed adaptation")
-        if len(set(self.reference_refs)) != len(self.reference_refs) or len(set(self.table_refs)) != len(self.table_refs):
+        if (len(set(self.reference_refs)) != len(self.reference_refs) or len(set(self.table_refs)) != len(self.table_refs) or
+                len(set(self.source_context_refs)) != len(self.source_context_refs)):
             raise ValueError("writing unit references must not repeat")
         return self
 
@@ -488,6 +582,7 @@ class Snapshot(Contract):
     sources: list[SourceRef] = Field(min_length=1)
     facts: list[Fact] = Field(default_factory=list)
     requirements: list[Requirement] = Field(min_length=1)
+    source_context_proofs: list[SourceContextProof] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list)
     review_actions: list[ReviewAction] = Field(default_factory=list)
@@ -513,6 +608,59 @@ class Snapshot(Contract):
         for item in [*self.attachments, *self.issues]:
             _known(item.requirement_refs, requirement_ids, "requirement")
         requirements = {item.requirement_id: item for item in self.requirements}
+        proof_ids = _unique(self.source_context_proofs, "proof_id", "source context proof")
+        proofs = {item.proof_id: item for item in self.source_context_proofs}
+        sources = {item.source_id: item for item in self.sources}
+        used_proofs = set()
+        context_ids = set()
+        for requirement in self.requirements:
+            local_ids = set()
+            for context in requirement.source_contexts:
+                if (context.context_id in context_ids or context.context_id in local_ids or
+                        context.proof_ref not in proof_ids or requirement.category != "technical" or
+                        requirement.response_mode == "procedure"):
+                    raise ValueError("source context must bind one real technical child")
+                context_ids.add(context.context_id)
+                local_ids.add(context.context_id)
+                proof = proofs[context.proof_ref]
+                _known([proof.source_id, *proof.child_source_refs, *context.source_refs], source_ids, "context source")
+                original = sources[proof.source_id]
+                if (proof.requirement_id != requirement.requirement_id or proof.proof_sha256 != context.proof_sha256 or
+                        proof.requirement_quote_sha256 != hashlib.sha256(requirement.text.encode()).hexdigest() or
+                        set(proof.child_source_refs) != set(requirement.source_refs) or original.kind != "tender" or
+                        original.provenance not in {"original", "synthetic"} or
+                        original.sha256 != proof.source_sha256):
+                    raise ValueError("source context proof does not bind its child quote and original source")
+                parents = {item.block_id: item for item in proof.scope_members}
+                if (context.parent_block_id not in parents or
+                        parents[context.parent_block_id].text_sha256 != hashlib.sha256(context.text.encode()).hexdigest()):
+                    raise ValueError("source context parent text differs from its proof")
+                for ref, text, members in [*((ref, requirement.text, proof.selected_members) for ref in proof.child_source_refs),
+                                          *((ref, context.text, [parents[context.parent_block_id]]) for ref in context.source_refs)]:
+                    source = sources[ref]
+                    quotes = re.findall(r"(?:^|;\s*)quote_sha256=([^;]*)(?=;|$)", source.locator)
+                    ends = re.findall(r"(?:^|;\s*)through=([^;]*)(?=;|$)", source.locator)
+                    selected_ids = re.findall(r"(?:^|;\s*)blocks=([^;]*)(?=;|$)", source.locator)
+                    offsets = re.findall(r"(?:^|;\s*)chars\[(\d+):(\d+)\](?=;|$)", source.locator)
+                    if (source.kind != "tender" or source.provenance not in {"original", "synthetic"} or
+                            source.path != original.path or source.sha256 != original.sha256 or
+                            quotes != [hashlib.sha256(text.encode()).hexdigest()] or
+                            source.locator.split(";", 1)[0] != members[0].locator or offsets != [("0", str(len(text)))] or
+                            (len(members) > 1 and (ends != [members[-1].locator] or selected_ids != [",".join(item.block_id for item in members)])) or
+                            (ends and ends != [members[-1].locator]) or
+                            (selected_ids and selected_ids != [",".join(item.block_id for item in members)])):
+                        raise ValueError("source context needs exact scoped tender quotes")
+                if not any(issue.severity == "warning" and requirement.requirement_id in issue.requirement_refs and
+                           issue.source_requirement == context.text for issue in self.issues):
+                    raise ValueError("unchecked source context needs a visible child warning")
+                used_proofs.add(proof.proof_id)
+            for proof in self.source_context_proofs:
+                if proof.requirement_id == requirement.requirement_id and {
+                        context.parent_block_id for context in requirement.source_contexts if context.proof_ref == proof.proof_id
+                        } != {item.block_id for item in proof.scope_members}:
+                    raise ValueError("source context parents cannot disappear from their child")
+        if used_proofs != proof_ids:
+            raise ValueError("source context proof registry must match actual child contexts")
         reviewed = set()
         for action in self.review_actions:
             _known(action.requirement_refs, requirement_ids, "review action requirement")
@@ -531,6 +679,25 @@ class Snapshot(Contract):
         if self.synthetic and (any(not item.synthetic for item in self.sources) or any(not item.synthetic for item in self.attachments)):
             raise ValueError("synthetic sample must label every source and attachment synthetic")
         return self
+
+
+def validate_context_quote_placement(snapshot, tables) -> None:
+    requirements = {item.requirement_id: item for item in snapshot.requirements}
+    quote_form = re.compile(r"(?:报价|响应价|投标价)(?:一览|明细|汇总|统计|分项|构成)?表|(?:分项|综合|总价)报价(?:表|清单)?")
+    quote_refs = {item.requirement_id for item in snapshot.requirements if item.category in {"commercial", "fixed_table"} and
+                  item.response_mode in {"table", "fixed_text"} and quote_form.search(item.text)}
+    for section in snapshot.sections:
+        constrained = any(context.operator == "exclude_commercial_quotation"
+                          for rid in section.requirement_refs for context in requirements[rid].source_contexts)
+        if not constrained:
+            continue
+        attached = [table for table in tables if table.section_id == section.section_id]
+        if set(section.requirement_refs) & quote_refs or any(set(table.requirement_refs) & quote_refs for table in attached):
+            raise ValueError("source context forbids commercial quotation placement in technical content")
+        if hasattr(section, "writing_tasks"):
+            for task in section.writing_tasks:
+                if any(table.table_id in task.table_refs and set(table.requirement_refs) & quote_refs for table in tables):
+                    raise ValueError("source context forbids quotation tables in a technical writing task")
 
 
 class PreparedBid(Snapshot):
@@ -570,6 +737,15 @@ class PreparedBid(Snapshot):
             covered.update(section.requirement_refs)
             for task in section.writing_tasks:
                 _known(task.reference_refs, reference_ids, "reference excerpt")
+                _known(task.requirement_refs, set(section.requirement_refs), "writing task requirement")
+                expected_contexts = list(dict.fromkeys(context.context_id for item in self.requirements
+                    if item.requirement_id in task.requirement_refs for context in item.source_contexts))
+                if task.source_context_refs != expected_contexts:
+                    raise ValueError("writing task must retain exactly its child source contexts")
+            for item in self.requirements:
+                if (item.requirement_id in section.requirement_refs and item.source_contexts and item.response_mode == "writing"
+                        and not any(item.requirement_id in task.requirement_refs for task in section.writing_tasks)):
+                    raise ValueError("context-bound technical writing requires an actual writing task")
         if requirement_ids - covered:
             raise ValueError("every requirement must have a planned section")
         for item in [*self.tables, *self.attachments, *self.issues]:
@@ -599,6 +775,7 @@ class PreparedBid(Snapshot):
             if not any(set(cover.source_refs) == set(item.source_refs) for item in self.requirements
                        if item.requirement_id in requirement_ids):
                 raise ValueError("prescribed cover section must retain its complete template sources")
+        validate_context_quote_placement(self, self.tables)
         return self
 
 
@@ -631,6 +808,12 @@ class DocumentPackage(Snapshot):
                 issues_seen.update(block.issue_refs)
                 if isinstance(block, (ParagraphBlock, ListBlock)) and block.content_role == "fact" and not block.fact_refs:
                     raise ValueError("fact body requires known fact references")
+                if isinstance(block, (ParagraphBlock, ListBlock)) and block.content_role == "proposal":
+                    needed = {ref for requirement in self.requirements if requirement.requirement_id in block.requirement_refs
+                              and requirement.source_contexts for ref in [*requirement.source_refs,
+                                  *(ref for context in requirement.source_contexts for ref in context.source_refs)]}
+                    if needed - set(block.source_refs):
+                        raise ValueError("proposal must retain child and parent context source provenance")
                 if isinstance(block, AttachmentBlock):
                     _known([block.attachment_id], attachment_ids, "attachment")
                     attachment = next(item for item in self.attachments if item.attachment_id == block.attachment_id)
@@ -652,6 +835,11 @@ class DocumentPackage(Snapshot):
                             issues_seen.update(cell.issue_refs)
         if requirements_seen != requirement_ids:
             raise ValueError("every requirement must have a document section")
+        for requirement in self.requirements:
+            if requirement.source_contexts and requirement.response_mode == "writing" and not any(
+                    isinstance(block, (ParagraphBlock, ListBlock)) and block.content_role == "proposal" and
+                    requirement.requirement_id in block.requirement_refs for section in self.sections for block in section.blocks):
+                raise ValueError("source context warning cannot replace technical proposal content")
         if set(attachments_seen) != attachment_ids or len(attachments_seen) != len(attachment_ids):
             raise ValueError("each attachment must be embedded exactly once")
         if issues_seen != issue_ids:
@@ -681,4 +869,6 @@ class DocumentPackage(Snapshot):
                     raise ValueError("prescribed cover cannot display another section's issue")
                 if isinstance(block, IssueBlock) and block.requirement_refs != issues[block.issue_id].requirement_refs:
                     raise ValueError("prescribed cover issue block must retain its issue requirements")
+        validate_context_quote_placement(self, [block.table for section in self.sections for block in section.blocks
+                                              if isinstance(block, TableBlock)])
         return self

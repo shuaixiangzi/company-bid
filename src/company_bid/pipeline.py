@@ -92,20 +92,29 @@ def build_executor(root: Path, config: dict) -> Executor:
             for task in plan.writing_tasks:
                 task_requirements = [item for item in requirements if item["requirement_id"] in task.requirement_refs]
                 references = [excerpts[ref].model_dump(mode="json") for ref in task.reference_refs]
+                source_contexts = [context for requirement in task_requirements
+                                   for context in requirement.get("source_contexts", [])]
+                context_proof_hashes = list(dict.fromkeys(item["proof_sha256"] for item in source_contexts))
                 context = {"section_id": task.unit_id, "title": task.title,
-                           "writing_task": task.model_dump(mode="json"), "reference_excerpts": references}
+                           "writing_task": task.model_dump(mode="json"), "reference_excerpts": references,
+                           "source_contexts": source_contexts}
                 source_ids = {ref["source_id"] for ref in references}
                 source_ids.update(ref for requirement in task_requirements for ref in requirement["source_refs"])
+                source_ids.update(ref for item in source_contexts for ref in item["source_refs"])
                 source_ids.update(ref for table_id in task.table_refs for ref in tables[table_id].source_refs)
                 task_input = {"context": context, "requirements": task_requirements,
                               "sources": [{"source_id": item.source_id, "sha256": item.sha256} for item in prepared.sources if item.source_id in source_ids],
                               "tables": [tables[ref].model_dump(mode="json") for ref in task.table_refs],
+                              "source_context_proof_hashes": context_proof_hashes,
                               "provider": provider_options, "proposal": value["proposals"].get(task.unit_id)}
 
                 def write_task(task=task, context=context, task_requirements=task_requirements,
-                               plan=plan, references=references):
+                               plan=plan, references=references, source_contexts=source_contexts,
+                               context_proof_hashes=context_proof_hashes):
                     proposal = provider.generate(ctx, context, task_requirements)
-                    source_refs = list(dict.fromkeys(item["source_id"] for item in references))
+                    source_refs = list(dict.fromkeys([*(item["source_id"] for item in references),
+                        *(ref for requirement in task_requirements for ref in requirement["source_refs"]),
+                        *(ref for item in source_contexts for ref in item["source_refs"])]))
                     blocks = [HeadingBlock(text=task.title, level=plan.level + 1,
                                            requirement_refs=task.requirement_refs, source_refs=source_refs)]
                     for paragraph in proposal.paragraphs:
@@ -122,6 +131,9 @@ def build_executor(root: Path, config: dict) -> Executor:
                                        "requirement_refs": task.requirement_refs, "reference_refs": task.reference_refs,
                                        "must_cover": task.must_cover, "completion_criteria": task.completion_criteria,
                                        "coverage": [item.model_dump(mode="json") for item in proposal.coverage],
+                                       "source_context_refs": task.source_context_refs,
+                                       "source_context_proof_hashes": context_proof_hashes,
+                                       "context_review_status": "not_checked" if source_contexts else "not_applicable",
                                        "semantic_status": "requires_source_review"}}
 
                 task_output = ctx.run_unit(task.unit_id, task_input, write_task)
@@ -198,11 +210,25 @@ def build_executor(root: Path, config: dict) -> Executor:
                   "table_count": len(table_ids), "writing_units": value.get("writing_review", []),
                   "review_actions": [item.model_dump(mode="json") for item in package.review_actions],
                   "pending_review_count": len(package.review_actions),
+                  "source_context_review": [], "pending_context_review_count": 0,
                   "requirement_coverage": []}
         actions_by_requirement = {ref: action for action in package.review_actions for ref in action.requirement_refs}
         nonbody_requirements = {item.requirement_id for item in package.requirements if item.response_mode == "procedure"}
         if value.get("input_kind") == "automatic" and set(actions_by_requirement) != nonbody_requirements:
             raise PipelineFailure("NON_BODY_REVIEW_ACTION_MISSING")
+        by_requirement = {item.requirement_id: item for item in package.requirements}
+        reviews = value.get("writing_review", [])
+        for review in reviews:
+            refs = review["requirement_refs"]
+            if set(refs) - set(by_requirement):
+                raise PipelineFailure("SOURCE_CONTEXT_WRITING_REVIEW_MISMATCH")
+            expected_contexts = [context for requirement in package.requirements if requirement.requirement_id in refs
+                                 for context in requirement.source_contexts]
+            if (review.get("source_context_refs", []) != [item.context_id for item in expected_contexts] or
+                    review.get("source_context_proof_hashes", []) != list(dict.fromkeys(
+                        item.proof_sha256 for item in expected_contexts)) or
+                    expected_contexts and review.get("context_review_status") != "not_checked"):
+                raise PipelineFailure("SOURCE_CONTEXT_WRITING_REVIEW_MISMATCH")
         for requirement in package.requirements:
             issues = [i.issue_id for i in package.issues if requirement.requirement_id in i.requirement_refs]
             coverage = {"requirement_id": requirement.requirement_id,
@@ -212,7 +238,22 @@ def build_executor(root: Path, config: dict) -> Executor:
                 action = actions_by_requirement.get(requirement.requirement_id)
                 coverage.update(body_status="not_required", review_status=action.status if action else "not_recorded",
                                 review_action_ids=[action.action_id] if action else [], satisfaction_status="not_determined")
+            if requirement.source_contexts:
+                if requirement.response_mode == "writing" and not any(
+                        requirement.requirement_id in review["requirement_refs"] for review in reviews):
+                    raise PipelineFailure("SOURCE_CONTEXT_WRITING_REVIEW_MISSING")
+                coverage.update(body_status="drafted_for_review" if requirement.response_mode == "writing" else
+                    "pending_manual" if issues else "assembled_for_review", applicability_status="not_checked" if any(
+                    context.operator == "service_applicability" for context in requirement.source_contexts) else "not_applicable",
+                    satisfaction_status="not_determined", source_context_refs=[context.context_id for context in requirement.source_contexts])
+                for context in requirement.source_contexts:
+                    checks["source_context_review"].append({"requirement_id": requirement.requirement_id,
+                        "context_id": context.context_id, "operator": context.operator, "proof_sha256": context.proof_sha256,
+                        "provenance_status": "checked", "review_status": "not_checked",
+                        "assembly_placement_status": "checked_for_known_components" if context.operator == "exclude_commercial_quotation" else "not_applicable",
+                        "semantic_compliance": "requires_source_review", "satisfaction_status": "not_determined"})
             checks["requirement_coverage"].append(coverage)
+        checks["pending_context_review_count"] = len(checks["source_context_review"])
         ctx.capture("validation", checks)
         return {**value, "validation": checks}
 

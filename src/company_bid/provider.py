@@ -20,7 +20,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from pydantic import ValidationError
 
-from .models import ProposalContent, ReferenceExcerpt, WritingTask
+from .models import ProposalContent, ReferenceExcerpt, WritingTask, RequirementSourceContext
 
 
 from .writing_prompt import PROMPT_VERSION, SYSTEM_PROMPT
@@ -40,12 +40,18 @@ class ProviderFailure(RuntimeError):
         super().__init__(error_code)
 
 
-def validate_writing_context(section: dict) -> WritingTask | None:
+def validate_writing_context(section: dict, requirements: list[dict] | None = None) -> WritingTask | None:
     if "writing_task" not in section:
+        if section.get("source_contexts") or any(item.get("source_contexts") for item in requirements or []):
+            raise ProviderFailure("WRITING_SOURCE_CONTEXT_MISMATCH")
         return None
     try:
         task = WritingTask.model_validate(section["writing_task"])
         references = [ReferenceExcerpt.model_validate(item) for item in section.get("reference_excerpts", [])]
+        expected_contexts = [RequirementSourceContext.model_validate(context).model_dump(mode="json")
+                             for requirement in (requirements or []) for context in requirement.get("source_contexts", [])]
+        actual_contexts = [RequirementSourceContext.model_validate(context).model_dump(mode="json")
+                           for context in section.get("source_contexts", [])]
     except ValidationError:
         raise ProviderFailure("WRITING_CONTEXT_INVALID") from None
     if task.unit_id != section.get("section_id"):
@@ -55,11 +61,15 @@ def validate_writing_context(section: dict) -> WritingTask | None:
         raise ProviderFailure("WRITING_FORMAT_NOT_READY")
     if len(references) != len(task.reference_refs) or {item.reference_id for item in references} != set(task.reference_refs):
         raise ProviderFailure("WRITING_REFERENCE_MISMATCH")
+    if (actual_contexts != expected_contexts or task.source_context_refs !=
+            [context["context_id"] for context in expected_contexts] or
+            expected_contexts and {item.get("requirement_id") for item in requirements or []} != set(task.requirement_refs)):
+        raise ProviderFailure("WRITING_SOURCE_CONTEXT_MISMATCH")
     return task
 
 
-def validate_writing_output(section: dict, proposal: ProposalContent) -> None:
-    task = validate_writing_context(section)
+def validate_writing_output(section: dict, proposal: ProposalContent, requirements: list[dict] | None = None) -> None:
+    task = validate_writing_context(section, requirements)
     if task and {item.item_index for item in proposal.coverage} != set(range(len(task.must_cover))):
         raise ProviderFailure("WRITING_COVERAGE_INCOMPLETE")
 
@@ -225,11 +235,11 @@ class ChatProposalProvider:
         self.sleep = sleep
 
     def generate(self, ctx, section: dict, requirements: list[dict]) -> ProposalContent:
-        validate_writing_context(section)
+        validate_writing_context(section, requirements)
 
         def validate(value):
             proposal = ProposalContent.model_validate(value)
-            validate_writing_output(section, proposal)
+            validate_writing_output(section, proposal, requirements)
             return proposal.model_dump(mode="json")
 
         result = self.generate_json(ctx, {"section": section, "requirements": requirements},
@@ -486,11 +496,11 @@ class PreparedProposalProvider:
         self.proposals = proposals
 
     def generate(self, ctx, section: dict, requirements: list[dict]) -> ProposalContent:
-        validate_writing_context(section)
+        validate_writing_context(section, requirements)
         try:
             result = ProposalContent.model_validate(self.proposals[section["section_id"]])
         except (KeyError, ValidationError):
             raise ProviderFailure("PREPARED_PROPOSAL_MISSING_OR_INVALID") from None
-        validate_writing_output(section, result)
+        validate_writing_output(section, result, requirements)
         ctx.capture("prepared-proposal-" + section["section_id"], result.model_dump(mode="json"))
         return result
