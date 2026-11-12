@@ -19,11 +19,12 @@ from .extraction import (
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
     _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid,
     _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result, _close_deferred_context,
+    _chapter_boundary,
 )
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-PLANNING_VERSION = "bid-plan-v12"
+PLANNING_VERSION = "bid-plan-v13"
 
 
 class _Fill(_Strict):
@@ -316,6 +317,191 @@ def _writing_instruction_only(text: str) -> bool:
         text.strip()) is not None
 
 
+_SOURCE_LINE = re.compile(r"^pdf/page\[(\d+)\]/line\[(\d+)\]$")
+_SOURCE_ITEM = re.compile(r"^(?:[（(]\d+[）)]|[①②③④⑤⑥⑦⑧⑨⑩])")
+
+
+def _native_source_line(block: dict) -> bool:
+    match = _SOURCE_LINE.fullmatch(block.get("locator", ""))
+    return bool(match and block.get("kind") == "paragraph" and block.get("origin") == "native" and
+                not block.get("read_disposition") and block.get("page") == int(match[1]) and
+                "\n" not in block.get("text", "") and "\r" not in block.get("text", ""))
+
+
+def _native_source_span(values: list[dict]) -> bool:
+    if not values or not all(_native_source_line(value) for value in values):
+        return False
+    first = values[0]
+    if any(value.get("unit_id") != first.get("unit_id") or value["source_id"] != first["source_id"]
+           for value in values):
+        return False
+    numbers = [int(_SOURCE_LINE.fullmatch(value["locator"])[2]) for value in values]
+    ordinals = [value["ordinal"] for value in values]
+    return (numbers == list(range(numbers[0], numbers[0] + len(values))) and
+            ordinals == list(range(ordinals[0], ordinals[0] + len(values))))
+
+
+def _format_source_roles(document: dict, body: list[dict]) -> dict:
+    """Prove a small set of auxiliary roles from N1, never from model labels.
+
+    Unsupported prelude shapes keep the existing unresolved-format behavior.
+    Roles account for source; they neither create requirements nor prove delivery.
+    """
+    if document.get("format") != "pdf":
+        return {}
+    roles = {}
+    by_id = {value["block_id"]: value for value in body}
+
+    def assign(values, role, *, scope=(), container=(), **extra):
+        def identities(items):
+            return [{key: value.get(key) for key in ("block_id", "locator", "ordinal", "page", "unit_id")} |
+                    {"text_sha256": hashlib.sha256(value["text"].encode()).hexdigest()} for value in items]
+        proof = {"rule": "native_format_source_role_v1", "source_id": document["source_id"],
+                 "source_sha256": document["sha256"], "role": role,
+                 "members": identities(values), "scope_members": identities([by_id[key] for key in scope]),
+                 "container_members": identities(container), "scope_block_ids": list(scope)}
+        for value in values:
+            roles[value["block_id"]] = {"source_role": role, "role_proof": proof,
+                "role_proof_sha256": _hash(proof), "scope_block_ids": list(scope), **extra}
+
+    starts = [i for i, value in enumerate(body) if _chapter_boundary(value) and
+              re.search(r"(?:投标|响应|报价).{0,18}(?:格式|组成)", value["text"])]
+    for start in starts:
+        end = next((i for i in range(start + 1, len(body)) if _chapter_boundary(body[i])), len(body))
+        assign([body[start]], "format_region_boundary")
+        for i in range(start + 1, end):
+            value = body[i]
+            if not _native_source_line(value):
+                continue
+            text = value["text"].strip()
+            page = [item for item in body[i:end] if item["unit_id"] == value["unit_id"]]
+            if re.fullmatch(r"目\s*录", text):
+                entries = [re.fullmatch(r"([1-9]\d*)[.．、]\s*([^。；;！？!?\n]{2,60})", item["text"].strip())
+                           if _native_source_line(item) and not has_fill_marker(item["text"]) else None
+                           for item in page[1:]]
+                if (_native_source_span(page) and len(entries) >= 2 and all(entries) and
+                        [int(item[1]) for item in entries] == list(range(1, len(entries) + 1)) and
+                        not any(re.search(r"(?<!响)应|需|须|必须|不得|禁止|不可|签字|盖章", item[2]) for item in entries)):
+                    assign(page, "source_contents")
+            elif re.fullmatch(r"(?:投标|响应)文件(?:封面)?", text):
+                joined = "\n".join(item["text"] for item in page)
+                if (3 <= len(page) <= 8 and _native_source_span(page) and
+                        re.search(r"(?:项目|采购|招标)(?:名称|编号)[：:]", joined) and
+                        re.search(r"签字|盖章|盖单位章", joined) and re.search(r"年\s*月\s*日|日期[：:]", joined)):
+                    assign(page, "prescribed_cover")
+            match = re.match(r"^([1-9]\d*)[.．、].{0,24}(?:文件|材料)的?组成[，,：:]", text)
+            if not match or not re.search(r"包含|包括", text):
+                continue
+            following = next((j for j in range(i + 1, end) if re.match(
+                rf"^{int(match[1]) + 1}[.．、]", body[j]["text"].strip())), None)
+            if following is None:
+                continue
+            span = body[i:following + 1]
+            if not _native_source_span(span):
+                continue
+            assign([value], "preparation_scope", container=span)
+            scope, outer_scope, leaf = [], [], []
+            condition_number, condition_unknown = 0, False
+
+            def finish():
+                if leaf:
+                    assign(leaf, "preparation_instruction", scope=scope, container=span,
+                           instruction_block_ids=[item["block_id"] for item in leaf],
+                           scope_ambiguous=condition_unknown or bool(scope and not _SOURCE_ITEM.match(leaf[0]["text"].strip())))
+                    leaf.clear()
+
+            for item in body[i + 1:following]:
+                item_text = item["text"].strip()
+                group = re.fullmatch(r"[A-Z][.．、].{1,60}(?:包含|包括)[：:]", item_text)
+                condition = re.fullmatch(r"[（(](\d+)[）)].{1,40}适用", item_text)
+                if group or condition:
+                    finish()
+                    if group:
+                        outer_scope = [item["block_id"]] if re.search(r"不|不得|禁止|仅", item_text) else []
+                        scope, condition_number, condition_unknown = list(outer_scope), 0, False
+                    else:
+                        number = int(condition[1])
+                        condition_unknown = condition_unknown or number != condition_number + 1
+                        condition_number = number
+                        scope = [*outer_scope, item["block_id"]]
+                    assign([item], "preparation_scope", scope=scope, container=span)
+                else:
+                    if _SOURCE_ITEM.match(item_text) or (leaf and re.search(r"[。；;]$", leaf[-1]["text"].strip())):
+                        finish()
+                    leaf.append(item)
+            finish()
+            tail = body[following]
+            if re.fullmatch(r"\d+[.．、].{0,30}格式[（(]未提供格式[^。；;]{1,100}自定义格式[）)]", tail["text"].strip()):
+                assign([tail], "preparation_instruction", container=span, instruction_block_ids=[tail["block_id"]])
+    return roles
+
+
+def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tuple[list, list]:
+    ids = role["instruction_block_ids"]
+    text = "\n".join(blocks[key]["text"] for key in ids)
+    matches = [item for item in extracted.get("requirements", []) if any(
+        set(ids) <= set(citation.get("block_ids") or [citation["block_id"]]) for citation in item["citations"])]
+    errors = []
+    if not matches:
+        errors.append("unmapped_preparation_instruction")
+    if role.get("scope_ambiguous"):
+        errors.append("preparation_instruction_scope_ambiguous")
+    expected = []
+    for pattern, modes in ((r"方案", {"writing"}), (r"授权书|承诺", {"fixed_text"}),
+                           (r"报价表|偏离表", {"table"}), (r"证明|证书|执照", {"attachment"})):
+        if re.search(pattern, text):
+            expected.append(modes)
+    multiple = bool(re.search(r"清单|汇总", text) and re.search(r"证明|证据", text))
+    if multiple and "清单" in text:
+        expected.append({"table", "factual_response"})
+    allowed = set().union(*expected) if expected else None
+    if multiple and allowed is not None:
+        allowed |= {"table", "factual_response"}
+    substantive = re.search(r"方案|授权书|报价表|证明|证书|执照|业绩|承诺|偏离表|资料|材料", text)
+    valid = [item for item in matches if (allowed is None or item["response_mode"] in allowed) and
+             (item["response_mode"] != "procedure" or not substantive)]
+    if matches and (not valid or any(not modes & {item["response_mode"] for item in valid} for modes in expected)):
+        errors.append("preparation_instruction_response_role_invalid")
+    if multiple:
+        modes = {item["response_mode"] for item in valid}
+        if "attachment" not in modes or not modes & {"table", "factual_response"}:
+            errors.append("preparation_instruction_component_unmapped" if "清单" in text else
+                          "preparation_instruction_summary_unproved")
+    if role.get("scope_block_ids") and valid and not all(any(
+            set(role["scope_block_ids"]) <= set(citation.get("block_ids") or [citation["block_id"]])
+            for citation in item["citations"]) for item in valid):
+        errors.append("preparation_instruction_scope_unproved")
+    return [{"requirement_id": item["requirement_id"], "response_mode": item["response_mode"]} for item in valid], errors
+
+
+def _instruction_placements(ledger, sections, attachments, actions, issues):
+    """Validate actual handlers after assembly, not just matching source IDs."""
+    results, errors, seen = [], [], set()
+    for row in ledger:
+        for item in row.get("instruction_requirements", []):
+            rid, mode = item["requirement_id"], item["response_mode"]
+            if (rid, mode) in seen:
+                continue
+            seen.add((rid, mode))
+            pending = [issue["issue_id"] for issue in issues if rid in issue["requirement_refs"]]
+            owners = [section for section in sections if rid in section["requirement_refs"]]
+            if mode == "procedure":
+                handled = any(rid in action["requirement_refs"] for action in actions)
+            elif mode == "writing":
+                handled = any(rid in task["requirement_refs"] for section in owners for task in section["writing_tasks"])
+            elif mode == "attachment":
+                handled = bool(pending) or any(rid in value["requirement_refs"] for value in attachments)
+            else:
+                field = {"table": "table_refs", "fixed_text": "fixed_content", "factual_response": "fact_refs"}[mode]
+                handled = bool(pending) or any(section[field] for section in owners)
+            results.append({"requirement_id": rid, "response_mode": mode,
+                            "status": "mapped_with_issue" if pending else "mapped_pending" if handled else "unresolved",
+                            "issue_refs": pending})
+            if not handled:
+                errors.append({"reason": "preparation_instruction_handler_missing", "requirement_id": rid})
+    return results, errors
+
+
 def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, list, list]:
     """Account for whole structural format regions, including window continuations.
 
@@ -335,6 +521,13 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                 not re.search(r"(?:^|/)(?:header|footer)\d*\.xml", block["locator"])]
         body.sort(key=lambda block: block["ordinal"])
         positions = {block["block_id"]: i for i, block in enumerate(body)}
+        source_roles = _format_source_roles(document, body)
+        auxiliary = {key for key, role in source_roles.items()
+                     if role["source_role"] != "prescribed_cover"}
+        for anchor in set(anchors) & auxiliary:
+            errors.append({"reason": "source_role_conflict", "block_id": anchor,
+                           "format_id": anchors[anchor]["format_id"],
+                           "source_role": source_roles[anchor]["source_role"]})
         letter_items = _fixed_letter_items(body, anchors)
 
         def structural_level(block):
@@ -377,23 +570,37 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             region_end = min((b for _, b in containing), default=len(body))
             source_level = _heading_level(body[anchor_position].get("text", ""))
             boundary = next((j for j in range(anchor_position + 1, region_end)
-                             if body[j]["block_id"] in anchors or (structural_level(body[j]) is not None and
+                             if body[j]["block_id"] in anchors or body[j]["block_id"] in auxiliary or
+                             (structural_level(body[j]) is not None and
                                 structural_level(body[j]) <= (source_level if source_level is not None else 1))), region_end)
             boundaries[anchor] = boundary
             for block_id in chapter["content_block_ids"]:
                 position = positions.get(block_id)
-                if position is None or not anchor_position <= position < boundary or block_id in owners:
+                if block_id in auxiliary:
+                    errors.append({"reason": "source_role_conflict", "format_id": chapter["format_id"],
+                                   "block_id": block_id, "source_role": source_roles[block_id]["source_role"]})
+                elif position is None or not anchor_position <= position < boundary or block_id in owners:
                     errors.append({"reason": "format_content_outside_structural_boundary", "format_id": chapter["format_id"], "block_id": block_id})
                 else:
                     owners[block_id] = chapter
         for i in sorted(relevant):
             block = body[i]
             block_id, text = block["block_id"], block.get("text", "").strip()
-            if (structural_level(block) is not None and block_id not in anchors and
+            source_role = source_roles.get(block_id, {})
+            if (block_id not in auxiliary and structural_level(block) is not None and block_id not in anchors and
                     re.search(r"(?:表|函|书|资料|方案|声明|承诺)$", text) and
                     not (_heading_level(text) == 0 and re.search(r"(?:投标|响应|报价).{0,18}(?:格式|组成)", text))):
                 errors.append({"reason": "unextracted_format_heading", "block_id": block_id, "locator": block["locator"]})
-            if block_id in anchors and text == anchors[block_id]["title"].strip():
+            instruction_requirements = []
+            if block_id in auxiliary:
+                status, owner = source_role["source_role"], None
+                if status == "preparation_instruction":
+                    instruction_requirements, instruction_errors = _instruction_requirements(source_role, extracted, blocks)
+                    errors.extend({"reason": reason, "block_id": block_id, "locator": block["locator"],
+                                   "instruction_block_ids": source_role["instruction_block_ids"],
+                                   "scope_block_ids": source_role.get("scope_block_ids", [])}
+                                  for reason in instruction_errors)
+            elif block_id in anchors and text == anchors[block_id]["title"].strip():
                 status, owner = "chapter_boundary", anchors[block_id]
             elif _heading_level(text) == 0 and re.search(r"(?:投标|响应|报价).{0,18}(?:格式|组成)", text) and block_id not in owners:
                 status, owner = "format_region_boundary", None
@@ -416,6 +623,14 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                 errors.append({"reason": "unread_editable_format_image", "block_id": block_id, "locator": block["locator"]})
             row = {"source_id": block["source_id"], "block_id": block_id, "locator": block["locator"],
                    "kind": block["kind"], "status": status, "format_id": owner["format_id"] if owner else None}
+            if source_role:
+                row.update(copy.deepcopy(source_role))
+                row["instruction_requirements"] = instruction_requirements
+                if (source_role["source_role"] == "prescribed_cover" and
+                        block_id == source_role["role_proof"]["members"][0]["block_id"]):
+                    errors.append({"reason": "unsupported_prescribed_cover", "block_id": block_id,
+                                   "locator": block["locator"],
+                                   "detail": "Source cover fields require a source-backed cover renderer; generic cover is not proof."})
             if block_id in letter_items:
                 row["continuation_basis"] = letter_items[block_id]
             if block_id in boundaries:
@@ -815,6 +1030,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                                      any(item["section_id"] == section["section_id"] for item in issues))):
                 issue(section, section["requirement_refs"], "指定章节内容待补", "已定位章节标题，但没有可装配的正文、原表或证明内容。", "补充该章节原始格式与资料后重新读取。")
 
+        instruction_handling, instruction_errors = _instruction_placements(
+            format_ledger, sections, attachments, review_actions, issues)
+        _capture(ctx, "n3-instruction-handling", {"items": instruction_handling, "errors": instruction_errors,
+                                               "status": "failed" if instruction_errors else "mapped_pending"})
+        _fail(bool(instruction_errors), "PREPARATION_INSTRUCTION_HANDLING_UNRESOLVED")
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
@@ -824,6 +1044,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
+                  "instruction_handling": instruction_handling,
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
                   "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
