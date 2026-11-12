@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
+
+from pydantic import TypeAdapter, ValidationError
 
 from .provider import ChatConfig, ChatProposalProvider, ProviderFailure
 from .storage import digest
@@ -28,14 +31,32 @@ _REPAIR_FIELDS = frozenset({
 })
 _REPAIR_INSTRUCTIONS = (
     "上一候选未通过确定性校验。仅依据本次相同的完整来源窗口和output_contract，重新输出完整JSON对象。"
-    "读取validation_feedback中的错误码、校验位置和required_coverage.counts/anchors，修正定位的问题，"
+    "读取validation_feedback中的错误码、校验位置和required_coverage.counts/anchors/entries，修正定位的问题，"
     "保留这些数量和全部来源选择，仍须完整处理所有原要求、否定、条件、例外及未决内容；"
-    "不得删除要求、隐去未决、改变原文或放宽规则来规避错误。反馈不提供原候选或任何替代事实。"
+    "entries必须按原序逐项一对一保留，不合并同源要求，不用新增无关项补数量。protected_fields与window_fields原样保留；"
+    "editable_label仅允许在prefix/suffix之间替换或删除一个错误标签，其余标签不得删除、改写或转移到其他响应类型。"
+    "不得删除要求、隐去未决、改变原文或放宽规则来规避错误。反馈只提供受限保护字段，不提供原候选全文或任何替代事实。"
 )
 
 
-def _repair_coverage(candidate: dict, request: dict) -> dict | None:
+def _valid_repair_fields(item: dict, model, excluded: set[str]) -> dict:
+    """Freeze valid business fields, including defaults, without guessing bad ones."""
+    fields = {}
+    for key, field in model.model_fields.items():
+        if key in excluded or key not in item and field.is_required():
+            continue
+        value = item[key] if key in item else field.get_default(call_default_factory=True)
+        try:
+            fields[key] = TypeAdapter(field.rebuild_annotation()).validate_python(value, strict=True)
+        except ValidationError:
+            continue  # Only invalid/missing schema fields may be corrected.
+    return fields
+
+
+def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnostic_context=None) -> dict | None:
     """Keep a small source-checked inventory; unknown anchors disable repair."""
+    from .extraction import _FormatChapter, _LiveWindowResponse, _Requirement
+
     window = request.get("window", {})
     if not isinstance(window, dict):
         window = {}
@@ -44,7 +65,9 @@ def _repair_coverage(candidate: dict, request: dict) -> dict | None:
         return None
     available = {block["block_id"]: block for block in [*window.get("blocks", []), *window.get("adjacent_context", [])]
                  if isinstance(block, dict) and isinstance(block.get("block_id"), str)}
-    coverage = {"counts": {}, "anchors": {}}
+    coverage = {"counts": {}, "anchors": {}, "entries": {},
+                "window_fields": _valid_repair_fields(candidate, _LiveWindowResponse, {"requirements", "format_chapters"})}
+    context = _repair_context(diagnostic_context)
     total, source_refs = 0, 0
     for field in ("requirements", "format_chapters"):
         if field not in candidate:
@@ -56,8 +79,8 @@ def _repair_coverage(candidate: dict, request: dict) -> dict | None:
         if total > 64:
             return None
         coverage["counts"][field] = len(items)
-        anchors = []
-        for item in items:
+        anchors, entries = [], []
+        for index, item in enumerate(items):
             citation = item.get("citation") if isinstance(item, dict) else None
             if not isinstance(citation, dict):
                 return None
@@ -65,8 +88,10 @@ def _repair_coverage(candidate: dict, request: dict) -> dict | None:
             if any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", value) for value in anchor.values()):
                 return None
             block = available.get(anchor["block_id"])
-            if block is None or block.get("source_id") != anchor["source_id"]:
+            if (block is None or block.get("source_id") != anchor["source_id"] or
+                    not isinstance(citation.get("locator"), str) or citation["locator"] != block.get("locator")):
                 return None
+            anchor["locator"] = citation["locator"]
             selected = citation.get("block_ids") or [anchor["block_id"]]
             if (not isinstance(selected, list) or not 1 <= len(selected) <= 24 or selected[0] != anchor["block_id"] or
                     any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", key) or
@@ -91,7 +116,22 @@ def _repair_coverage(candidate: dict, request: dict) -> dict | None:
                 anchor[key] = value
             if anchor not in anchors:
                 anchors.append(anchor)
+            protected = _valid_repair_fields(item, _Requirement if field == "requirements" else _FormatChapter, {"citation"})
+            entry = {"candidate_index": index, "anchor": copy.deepcopy(anchor), "protected_fields": protected}
+            label_field, label_index = context.get("field"), context.get("label_index")
+            if (error_code == "EXTRACTION_LABEL_NOT_GROUNDED" and field == "requirements" and
+                    context.get("candidate_type") == "requirement" and context.get("candidate_index") == index and
+                    label_field in {"required_fact_labels", "attachment_keywords", "reference_keywords"} and
+                    label_field in protected and type(label_index) is int and 0 <= label_index < len(protected[label_field])):
+                values = protected.pop(label_field)
+                entry["editable_label"] = {"field": label_field, "label_index": label_index,
+                                           "prefix": values[:label_index], "suffix": values[label_index + 1:]}
+            entries.append(entry)
         coverage["anchors"][field] = anchors
+        coverage["entries"][field] = entries
+    # Diagnostic feedback is bounded independently of the provider input limit.
+    if len(json.dumps(coverage, ensure_ascii=False)) > 20000:
+        return None
     return coverage
 
 
@@ -109,13 +149,19 @@ def _normalized_repair_candidate(candidate, request) -> dict | None:
 
 
 def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
+    from .extraction import _FormatChapter, _LiveWindowResponse, _Requirement
+
     if request is not None:
         candidate = _normalized_repair_candidate(candidate, request)
     if not isinstance(candidate, dict):
         return False
+    if "window_fields" in coverage:
+        fields = _valid_repair_fields(candidate, _LiveWindowResponse, {"requirements", "format_chapters"})
+        if any(key not in fields or fields[key] != value for key, value in coverage["window_fields"].items()):
+            return False
     for field, count in coverage["counts"].items():
         items = candidate.get(field)
-        if not isinstance(items, list) or len(items) < count:
+        if not isinstance(items, list) or (len(items) != count if "entries" in coverage else len(items) < count):
             return False
         citations = [item.get("citation") for item in items if isinstance(item, dict) and isinstance(item.get("citation"), dict)]
         def matches(citation, anchor):
@@ -125,6 +171,22 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
                     all(citation.get(key) == value for key, value in anchor.items() if key != "block_ids"))
         if any(not any(matches(citation, anchor) for citation in citations) for anchor in coverage["anchors"][field]):
             return False
+        for entry in coverage.get("entries", {}).get(field, []):
+            item = items[entry["candidate_index"]]
+            if not isinstance(item, dict) or not isinstance(item.get("citation"), dict) or not matches(item["citation"], entry["anchor"]):
+                return False
+            if (item["citation"].get("block_ids") or [item["citation"].get("block_id")]) != entry["anchor"]["block_ids"]:
+                return False
+            fields = _valid_repair_fields(item, _Requirement if field == "requirements" else _FormatChapter, {"citation"})
+            if any(key not in fields or fields[key] != value for key, value in entry["protected_fields"].items()):
+                return False
+            editable = entry.get("editable_label")
+            if editable:
+                values = fields.get(editable["field"])
+                prefix, suffix = editable["prefix"], editable["suffix"]
+                if (not isinstance(values, list) or len(values) not in {len(prefix) + len(suffix), len(prefix) + len(suffix) + 1} or
+                        values[:len(prefix)] != prefix or (suffix and values[-len(suffix):] != suffix)):
+                    return False
     return True
 
 
@@ -208,11 +270,11 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
 
     def checked(candidate):
         nonlocal rejected
-        coverage = _repair_coverage(candidate, request)
         try:
             # Validator enrichment/mutation can never rewrite the raw candidate.
             return validate(copy.deepcopy(candidate))
         except PlanningError as error:
+            coverage = _repair_coverage(candidate, request, error_code=error.code, diagnostic_context=error.diagnostic_context)
             if (error.code in _REPAIR_CODES and coverage is not None and
                     isinstance(request.get("task_instructions", ""), str) and not critical_unresolved(candidate)):
                 rejected = (error.code, _repair_context(error.diagnostic_context), coverage)
@@ -236,7 +298,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise
         if first_context.capture_failed or getattr(ctx, "_capture_failed", False):
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-        relation = {"schema_version": "validation-repair-v1", "unit_id": unit_id, "task_type": task_type,
+        relation = {"schema_version": "validation-repair-v2", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],

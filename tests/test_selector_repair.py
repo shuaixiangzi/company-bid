@@ -42,10 +42,14 @@ def test_selector_only_label_repair_keeps_raw_selectors_and_derives_the_same_sou
     assert state["status"] == "succeeded" and len(sent) == len(validated) == 2
     assert (first, second) == saved and validated == [first, second]
     feedback = json.loads(sent[1]["messages"][1]["content"])["validation_feedback"]
-    assert feedback["required_coverage"] == {
+    assert {key: feedback["required_coverage"][key] for key in ("counts", "anchors")} == {
         "counts": {"requirements": 1, "format_chapters": 0},
-        "anchors": {"requirements": [{"source_id": "T", "block_id": "B", "block_ids": ["B", "TAIL"]}],
+        "anchors": {"requirements": [{"source_id": "T", "block_id": "B", "locator": window["blocks"][0]["locator"], "block_ids": ["B", "TAIL"]}],
                     "format_chapters": []}}
+    entry, = feedback["required_coverage"]["entries"]["requirements"]
+    assert entry["editable_label"] == {"field": "required_fact_labels", "label_index": 0, "prefix": [], "suffix": []}
+    assert entry["protected_fields"]["response_mode"] == first["requirements"][0]["response_mode"]
+    assert "不在原文的字段CANARY" not in json.dumps(feedback, ensure_ascii=False)
     captured = artifacts(executor, state)
     raw_responses = [json.loads(value["choices"][0]["message"]["content"])
                      for record, value in captured if record["name"].startswith("response-")]
