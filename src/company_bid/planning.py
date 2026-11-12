@@ -23,9 +23,10 @@ from .extraction import (
     _chapter_boundary,
 )
 from .table_continuations import build_table_continuations, build_table_row_catalog
+from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
 
 
-PLANNING_VERSION = "bid-plan-v16"
+PLANNING_VERSION = "bid-plan-v17"
 
 
 class _Fill(_Strict):
@@ -491,17 +492,37 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
     text = "\n".join(blocks[key]["text"] for key in ids)
     matches = [item for item in extracted.get("requirements", []) if any(
         set(ids) <= set(citation.get("block_ids") or [citation["block_id"]]) for citation in item["citations"])]
+    # These closed administrative sentences can have a deterministic N3
+    # handler. They do not repair or rewrite the semantic N2 candidates.
+    rule = preparation_rule(text) if not role.get("scope_ambiguous") else None
+    derived = None
+    if rule and not matches:
+        first = blocks[ids[0]]
+        citation = _citation({**{key: first[key] for key in ("source_id", "block_id", "locator")},
+                              "block_ids": ids}, blocks, _pdf_footer_skips(blocks))
+        derived = {"requirement_id": _id("R-PREP-", [role["role_proof_sha256"], rule]),
+            "text": text, "citations": [citation], "response_mode": "procedure",
+            "category": "commercial" if "商务类" in text else "procedure",
+            "mandatory": rule != "unsupplied_format_permission", "confidence": "high",
+            "format_status": "not_prescribed", "format_title": None,
+            "required_fact_labels": [], "attachment_keywords": [], "reference_keywords": [], "window_ids": []}
+        matches = [derived]
+    pure_manual = bool(matches and manual_signing_submission(text) and all(
+        item["category"] == "procedure" and item["response_mode"] == "procedure" and item["text"] == text and
+        all((citation.get("block_ids") or [citation["block_id"]]) == ids for citation in item["citations"])
+        for item in matches))
     errors = []
     if not matches:
         errors.append("unmapped_preparation_instruction")
-    if role.get("scope_ambiguous"):
+    if role.get("scope_ambiguous") and not pure_manual:
         errors.append("preparation_instruction_scope_ambiguous")
     expected = []
     for pattern, modes in ((r"方案", {"writing"}), (r"授权书|承诺", {"fixed_text"}),
                            (r"报价表|偏离表", {"table"}), (r"证明|证书|执照", {"attachment"})):
         if re.search(pattern, text):
             expected.append(modes)
-    multiple = bool(re.search(r"清单|汇总", text) and re.search(r"证明|证据", text))
+    compilation = proof_compilation(text)
+    multiple = bool(re.search(r"清单|汇总", text) and re.search(r"证明|证据", text)) and not compilation
     if multiple and "清单" in text:
         expected.append({"table", "factual_response"})
     allowed = set().union(*expected) if expected else None
@@ -509,7 +530,9 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
         allowed |= {"table", "factual_response"}
     substantive = re.search(r"方案|授权书|报价表|证明|证书|执照|业绩|承诺|偏离表|资料|材料", text)
     valid = [item for item in matches if (allowed is None or item["response_mode"] in allowed) and
-             (item["response_mode"] != "procedure" or not substantive)]
+             (item["response_mode"] != "procedure" or not substantive or rule)]
+    if rule:
+        valid = [item for item in valid if item["response_mode"] == "procedure" and item["text"] == text]
     if matches and (not valid or any(not modes & {item["response_mode"] for item in valid} for modes in expected)):
         errors.append("preparation_instruction_response_role_invalid")
     if multiple:
@@ -520,12 +543,21 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
     results = []
     for item in valid:
         result = {"requirement_id": item["requirement_id"], "response_mode": item["response_mode"]}
-        if role.get("scope_block_ids"):
+        if rule or pure_manual:
+            result.update(source_rule=rule or "manual_signing_submission", source_scope_status=(
+                "unresolved" if role.get("scope_ambiguous") else "not_checked") if role.get("scope_block_ids") else "not_applicable",
+                source_scope_block_ids=list(role.get("scope_block_ids", [])), source_role_proof=copy.deepcopy(role["role_proof"]),
+                source_role_proof_sha256=role["role_proof_sha256"])
+            if derived:
+                result["derived_requirement"] = derived
+        elif role.get("scope_block_ids"):
             derivation = _numbered_child_context(role, item, blocks)
             if derivation:
                 result["source_context_derivation"] = derivation
             else:
                 errors.append("preparation_instruction_scope_unproved")
+        if compilation:
+            result["proof_compilation"] = True
         results.append(result)
     return results, errors
 
@@ -542,17 +574,29 @@ def _instruction_placements(ledger, sections, attachments, actions, issues):
             pending = [issue["issue_id"] for issue in issues if rid in issue["requirement_refs"]]
             owners = [section for section in sections if rid in section["requirement_refs"]]
             if mode == "procedure":
-                handled = any(rid in action["requirement_refs"] for action in actions)
+                selected_actions = [action for action in actions if rid in action["requirement_refs"]]
+                handled = bool(selected_actions) and all(action.get("source_scope_status", "not_applicable") ==
+                    item.get("source_scope_status", "not_applicable") for action in selected_actions)
             elif mode == "writing":
                 handled = any(rid in task["requirement_refs"] for section in owners for task in section["writing_tasks"])
             elif mode == "attachment":
                 handled = bool(pending) or any(rid in value["requirement_refs"] for value in attachments)
+                if item.get("proof_compilation"):
+                    handled = any(rid in value["requirement_refs"] for value in attachments) or any(
+                        rid in value["requirement_refs"] and value.get("severity", "missing") == "missing" for value in issues)
             else:
                 field = {"table": "table_refs", "fixed_text": "fixed_content", "factual_response": "fact_refs"}[mode]
                 handled = bool(pending) or any(section[field] for section in owners)
-            results.append({"requirement_id": rid, "response_mode": mode,
+            result = {"requirement_id": rid, "response_mode": mode,
                             "status": "mapped_with_issue" if pending else "mapped_pending" if handled else "unresolved",
-                            "issue_refs": pending})
+                            "issue_refs": pending}
+            if item.get("source_rule"):
+                result.update(source_rule=item["source_rule"], source_scope_status=item["source_scope_status"],
+                              satisfaction_status="not_determined")
+            if item.get("proof_compilation"):
+                result.update(proof_compilation_status="pending_review", satisfaction_status="not_determined",
+                              attachment_refs=[value["attachment_id"] for value in attachments if rid in value["requirement_refs"]])
+            results.append(result)
             if not handled:
                 errors.append({"reason": "preparation_instruction_handler_missing", "requirement_id": rid})
     return results, errors
@@ -805,10 +849,25 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
 
     def assemble():
         planned_formats, format_ledger, format_errors = _format_plan(extracted, blocks, documents)
+        source_rules = {}
+        for row in format_ledger:
+            for handler in row.get("instruction_requirements", []):
+                if handler.get("source_rule"):
+                    rid = handler["requirement_id"]
+                    _fail(rid in source_rules and source_rules[rid] != handler, "PREPARATION_SOURCE_RULE_CONFLICT")
+                    source_rules[rid] = copy.deepcopy(handler)
+        derived_requirements = [item["derived_requirement"] for item in source_rules.values() if item.get("derived_requirement")]
+        existing_ids = {item["requirement_id"] for item in extracted["requirements"]}
+        _fail(any(item["requirement_id"] in existing_ids for item in derived_requirements), "PREPARATION_SOURCE_RULE_CONFLICT")
+        planned_requirements = [*extracted["requirements"], *derived_requirements]
+        _capture(ctx, "n3-preparation-source-rules", {"producer_version": PLANNING_VERSION,
+            "derived_requirements": derived_requirements, "rules": list(source_rules.values()),
+            "n2_candidate_mutation": False, "n2_requirements_sha256": _hash(extracted["requirements"]),
+            "status": "pending_review"})
         writing_spaces = {}
         format_links = []
         remote_format_resolutions = []
-        for requirement in extracted["requirements"]:
+        for requirement in planned_requirements:
             title = requirement.get("format_title")
             matches = [chapter for chapter in planned_formats if title and _title_key(title) == _title_key(chapter["title"])]
             if not matches and not title:
@@ -830,7 +889,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             if chapter["status"] != "prescribed":
                 format_errors.append({"reason": "format_chapter_unresolved", "format_id": chapter["format_id"], "citation": chapter["citation"]})
         format_sources_complete = not format_errors
-        for requirement in extracted["requirements"]:
+        for requirement in planned_requirements:
             if any(citation["block_id"] in {row["block_id"] for row in format_ledger if row["status"] == "skipped_page_footer"}
                    for citation in requirement["citations"]):
                 format_errors.append({"reason": "requirement_anchor_is_page_footer", "requirement_id": requirement["requirement_id"]})
@@ -914,7 +973,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                           "SOURCE_CONTEXT_DERIVATION_AMBIGUOUS")
                     context_derivations[rid] = derivation
 
-        for raw in extracted["requirements"]:
+        for raw in planned_requirements:
             citations = raw.get("citations", [])
             _fail(not citations or any(c["quote"] != raw["text"] for c in citations), "REQUIREMENT_CITATION_MISMATCH")
             requirement = {key: raw[key] for key in ("requirement_id", "text", "category", "mandatory", "response_mode")}
@@ -952,6 +1011,20 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 "source_requirement": requirement["text"],
                 "instruction": "按来源规则核对本项目明确输入；尚未判断满足，不以规则值代替报价或履约承诺。" if commercial else
                                "按来源要求线下办理并核对；本记录不代表事项已经完成。"})
+            rule = source_rules.get(requirement["requirement_id"])
+            if rule:
+                action = review_actions[-1]
+                action["source_scope_status"] = rule["source_scope_status"]
+                action["source_scope_contexts"] = []
+                for key in rule["source_scope_block_ids"]:
+                    block = blocks[key]
+                    action["source_scope_contexts"].append({"text": block["text"], "source_ref": scoped_source(
+                        {field: block[field] for field in ("source_id", "block_id", "locator")})})
+                action["instruction"] = {
+                    "additional_materials_review": "核对招标另列的具体资料要求，并线下决定是否补充其他材料；未认定材料齐备，不据此生成新的证明、事实或承诺。",
+                    "unsupplied_format_permission": "只对已独立证成未提供格式的内容使用默认版式；原有指定格式必须保留，未读或冲突不能据此解除。",
+                    "manual_signing_submission": "线下核对封面签署、盖章及递交事项；适用父层范围仍未确定，本项不用于选择正文、报价或判定资格，尚未执行任何事项。",
+                }[rule["source_rule"]]
 
         def issue(section, refs, title, reason, action):
             value = {"issue_id": f"M-{len(issues) + 1:03d}", "title": title, "section_id": section["section_id"],
@@ -998,7 +1071,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         for chapter in sorted(planned_formats, key=lambda value: blocks[value["citation"]["block_id"]]["ordinal"]):
             title_key = _title_key(chapter["title"])
             refs = list(dict.fromkeys([*chapter["requirement_refs"],
-                         *(r["requirement_id"] for r in extracted["requirements"] if _title_key(r.get("format_title") or "") == title_key)]))
+                         *(r["requirement_id"] for r in planned_requirements if _title_key(r.get("format_title") or "") == title_key)]))
             refs = [ref for ref in refs if ref not in assigned]
             # The prescribed chapter itself is a grounded structural obligation,
             # even if no semantic requirement was extracted beside its heading.
@@ -1079,7 +1152,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 else:
                     issue(section, refs, "指定格式图片待处理", "图片格式不能冒充可编辑文字或表格。", "补充可读取原格式或明确允许采用的图片页。")
 
-        for requirement in extracted["requirements"]:
+        for requirement in planned_requirements:
             rid = requirement["requirement_id"]
             if rid in assigned:
                 continue
@@ -1211,6 +1284,14 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 if contexts:
                     task["completion_criteria"].append("父条件适用性尚未核验，不得声称已确认适用或将拟实施内容表述为公司事实。")
 
+        compilations = {item["requirement_id"] for row in format_ledger for item in row.get("instruction_requirements", [])
+                        if item.get("proof_compilation")}
+        for rid in compilations:
+            section = next(section for section in sections if rid in section["requirement_refs"])
+            marker = issue(section, [rid], "证明材料汇编待核对", "证明材料的完整性及其与统计表的对应关系尚未核对。",
+                           "逐项核对实际证明页和招标另行指定的统计表；缺件补原件，空表字段补有来源事实。")
+            next(value for value in issues if value["issue_id"] == marker)["severity"] = "warning"
+
         instruction_handling, instruction_errors = _instruction_placements(
             format_ledger, sections, attachments, review_actions, issues)
         _capture(ctx, "n3-instruction-handling", {"items": instruction_handling, "errors": instruction_errors,
@@ -1228,6 +1309,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
                   "instruction_handling": instruction_handling,
+                  "preparation_source_rules": list(source_rules.values()),
                   "source_context_proofs": list(source_context_proofs.values()),
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
                   "remote_format_resolutions": remote_format_resolutions,

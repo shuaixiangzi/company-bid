@@ -170,6 +170,11 @@ class Requirement(Contract):
         return self
 
 
+class PendingScopeContext(Contract):
+    text: SourceText
+    source_ref: Text
+
+
 class ReviewAction(Contract):
     """A source rule awaiting work or review; never a bidder fact or promise."""
 
@@ -180,6 +185,8 @@ class ReviewAction(Contract):
     source_refs: list[Text] = Field(min_length=1)
     source_requirement: SourceText
     instruction: Text
+    source_scope_status: Literal["not_applicable", "not_checked", "unresolved"] = "not_applicable"
+    source_scope_contexts: list[PendingScopeContext] = Field(default_factory=list, max_length=2)
 
     @model_validator(mode="after")
     def pending_status_matches_kind(self):
@@ -188,6 +195,16 @@ class ReviewAction(Contract):
             raise ValueError("review action must retain its unfulfilled review status")
         if len(set(self.requirement_refs)) != len(self.requirement_refs) or len(set(self.source_refs)) != len(self.source_refs):
             raise ValueError("review action references must be unique")
+        from .preparation_rules import manual_signing_submission, preparation_rule
+        if (self.source_scope_status == "not_applicable") != (not self.source_scope_contexts):
+            raise ValueError("pending scope status and source contexts must agree")
+        if self.source_scope_status == "unresolved" and not (
+                self.kind == "procedure" and manual_signing_submission(self.source_requirement)):
+            raise ValueError("unresolved scope is limited to a manual signing and submission action")
+        if self.source_scope_status == "not_checked" and preparation_rule(self.source_requirement) != "additional_materials_review":
+            raise ValueError("pending scope review cannot replace a substantive response")
+        if len({item.source_ref for item in self.source_scope_contexts}) != len(self.source_scope_contexts):
+            raise ValueError("pending scope sources must be unique")
         return self
 
 
@@ -676,6 +693,16 @@ class Snapshot(Contract):
                 raise ValueError("review action sources must equal its requirement sources")
             if action.source_requirement != "\n".join(item.text for item in selected):
                 raise ValueError("review action rule must equal its cited requirements")
+            for context in action.source_scope_contexts:
+                _known([context.source_ref], source_ids, "pending scope source")
+                source = sources[context.source_ref]
+                child_sources = [sources[ref] for ref in action.source_refs]
+                quotes = re.findall(r"(?:^|;\s*)quote_sha256=([^;]*)(?=;|$)", source.locator)
+                if (source.kind != "tender" or source.provenance not in {"original", "synthetic"} or
+                        not all(child.kind == "tender" and child.path == source.path and child.sha256 == source.sha256
+                                for child in child_sources) or
+                        quotes != [hashlib.sha256(context.text.encode()).hexdigest()]):
+                    raise ValueError("pending scope context must retain an exact same-source quote")
         if self.synthetic and (any(not item.synthetic for item in self.sources) or any(not item.synthetic for item in self.attachments)):
             raise ValueError("synthetic sample must label every source and attachment synthetic")
         return self

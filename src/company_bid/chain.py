@@ -115,5 +115,5 @@ def intake_nodes(root: Path, version, settings: dict):
             NodeSpec("N1", parser_version, read, config_keys=reading_keys),
             NodeSpec("N2", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "provider.py", "structured.py"), extract,
                      config_keys=extraction_keys),
-            NodeSpec("N3", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py", "material_matching.py", "slots.py", "provider.py", "structured.py"), plan,
+            NodeSpec("N3", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py", "preparation_rules.py", "material_matching.py", "slots.py", "provider.py", "structured.py"), plan,
                      config_keys=mapping_keys)]

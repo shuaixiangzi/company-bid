@@ -163,15 +163,17 @@ def test_attachment_does_not_discharge_a_separately_named_list_component(tmp_pat
     assert any(item["reason"] == "preparation_instruction_component_unmapped" and item["block_id"] == "PROOF" for item in errors)
 
 
-def test_evidence_summary_remains_unproved_without_inventing_a_required_table(tmp_path):
+def test_evidence_compilation_keeps_an_actual_handler_without_inventing_a_table(tmp_path):
     manifest, parsed = sources(tmp_path)
     parsed["documents"][0]["units"][0]["blocks"][3]["text"] = "（2）应提交合成检测证明文件汇总。"
     extracted = extract(manifest, parsed)
     blocks, _, documents = _index(parsed, manifest)
-    _, _, errors = _format_plan(extracted, blocks, documents)
-    reasons = {item["reason"] for item in errors if item.get("block_id") == "PROOF"}
-    assert "preparation_instruction_summary_unproved" in reasons
-    assert "preparation_instruction_response_role_invalid" not in reasons
+    _, ledger, errors = _format_plan(extracted, blocks, documents)
+    assert errors == []
+    item = next(row for row in ledger if row["block_id"] == "PROOF")["instruction_requirements"][0]
+    assert item["proof_compilation"] is True
+    _, failures = _instruction_placements(ledger, [], [], [], [])
+    assert any(error["requirement_id"] == item["requirement_id"] for error in failures)
     assert [item["response_mode"] for item in extracted["requirements"]] == ["writing", "attachment", "procedure"]
 
 

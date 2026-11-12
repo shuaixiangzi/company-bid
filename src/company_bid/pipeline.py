@@ -238,6 +238,9 @@ def build_executor(root: Path, config: dict) -> Executor:
                 action = actions_by_requirement.get(requirement.requirement_id)
                 coverage.update(body_status="not_required", review_status=action.status if action else "not_recorded",
                                 review_action_ids=[action.action_id] if action else [], satisfaction_status="not_determined")
+                if action:
+                    coverage.update(source_scope_status=action.source_scope_status,
+                                    source_scope_refs=[item.source_ref for item in action.source_scope_contexts])
             if requirement.source_contexts:
                 if requirement.response_mode == "writing" and not any(
                         requirement.requirement_id in review["requirement_refs"] for review in reviews):
@@ -278,7 +281,7 @@ def build_executor(root: Path, config: dict) -> Executor:
 
     # Actual source hashes prevent continuing a partially completed run after code
     # changes. A repair/fork is explicit and keeps the original record untouched.
-    shared = ("pipeline.py", "models.py", "runtime.py", "storage.py", "observability.py")
+    shared = ("pipeline.py", "models.py", "preparation_rules.py", "runtime.py", "storage.py", "observability.py")
     nodes = [NodeSpec("N0", _version(*shared), freeze, config_keys=()),
              NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py"), draft, config_keys=("provider",)),
              NodeSpec("N5", _version(*shared), check, config_keys=()),

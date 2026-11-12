@@ -540,6 +540,12 @@ def _render_issues(package):
             _plain(document, f"对应要求：{'、'.join(action.requirement_refs)}", style)
             _plain(document, f"来源要求：{action.source_requirement}", style)
             _plain(document, f"办理或核对动作：{action.instruction}", style)
+            if action.source_scope_status != "not_applicable":
+                _plain(document, "适用范围尚未确定；该事项仅待线下核对，未据此判定正文、报价或资格。", style)
+                for context in action.source_scope_contexts:
+                    _plain(document, f"候选上层原文：{context.text}", style)
+                    source = sources[context.source_ref]
+                    _plain(document, f"上层来源定位：{context.source_ref}；{source.title}；{source.locator}", style)
             for ref in action.source_refs:
                 source = sources[ref]
                 _plain(document, f"来源定位：{ref}；{source.title}；{source.locator}", style)
