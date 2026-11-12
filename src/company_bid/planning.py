@@ -24,7 +24,7 @@ from .extraction import (
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
 
-PLANNING_VERSION = "bid-plan-v13"
+PLANNING_VERSION = "bid-plan-v14"
 
 
 class _Fill(_Strict):
@@ -644,6 +644,51 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
     return formats, ledger, errors
 
 
+def _remote_format_resolution(requirement, chapter, ledger, blocks, windows, documents, coverage):
+    """Derive a remote format observation only after full N1/N2 revalidation.
+
+    The caller has already checked global format source errors. This cannot
+    resolve an unread window, an unread template or an overlapping local quote.
+    """
+    title = requirement.get("format_title")
+    if (requirement["format_status"] != "unread" or not title or chapter["status"] != "prescribed" or
+            _title_key(title) != _title_key(chapter["title"])):
+        return None
+    anchor = chapter["citation"]["block_id"]
+    source_id = chapter["citation"]["source_id"]
+    if any(citation["source_id"] != source_id for citation in requirement["citations"]):
+        return None
+    content_ids = chapter["content_block_ids"]
+    template_ids = {anchor, *content_ids}
+    selected_ids = {key for citation in requirement["citations"]
+                    for key in citation.get("block_ids") or [citation["block_id"]]}
+    origin_windows = [window for window in windows if window["window_id"] in requirement["window_ids"]]
+    if (not origin_windows or selected_ids & template_ids or any(
+            anchor in {block["block_id"] for block in window["blocks"]} for window in origin_windows)):
+        return None
+    rows = [row for row in ledger if row.get("format_id") == chapter["format_id"]]
+    by_id = {row["block_id"]: row for row in rows}
+    if (not template_ids <= set(by_id) or any(by_id[key]["status"] not in {
+            "chapter_boundary", "declared_content", "structural_continuation"} for key in template_ids) or
+            any(blocks[key]["kind"] == "image" or blocks[key]["source_id"] != source_id or
+                blocks[key].get("read_disposition") for key in template_ids)):
+        return None
+    body = [blocks[key] for key in content_ids if key != anchor and
+            (blocks[key]["kind"] == "table" or blocks[key].get("text", "").strip())]
+    if not body:
+        return None
+    source = next(document for document in documents if document["source_id"] == source_id)
+    return {"requirement_id": requirement["requirement_id"], "format_id": chapter["format_id"],
+            "original_format_status": "unread", "resolved_format_status": "prescribed",
+            "basis": "complete_source_verified_remote_format_v1", "source_id": source_id,
+            "source_sha256": source["sha256"], "requirement_citations": copy.deepcopy(requirement["citations"]),
+            "format_citation": copy.deepcopy(chapter["citation"]), "content_block_ids": list(content_ids),
+            "origin_window_ids": list(requirement["window_ids"]),
+            "format_owner_window_id": next(window["window_id"] for window in windows
+                if anchor in {block["block_id"] for block in window["blocks"]}),
+            "format_source_coverage": copy.deepcopy(rows), "full_N2_coverage_sha256": _hash(coverage)}
+
+
 def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, config: dict) -> dict:
     """N3: freeze an automatic PreparedBid; never let a model fill values."""
     manifest = _json(manifest)
@@ -696,6 +741,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         planned_formats, format_ledger, format_errors = _format_plan(extracted, blocks, documents)
         writing_spaces = {}
         format_links = []
+        remote_format_resolutions = []
         for requirement in extracted["requirements"]:
             title = requirement.get("format_title")
             matches = [chapter for chapter in planned_formats if title and _title_key(title) == _title_key(chapter["title"])]
@@ -717,6 +763,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         for chapter in planned_formats:
             if chapter["status"] != "prescribed":
                 format_errors.append({"reason": "format_chapter_unresolved", "format_id": chapter["format_id"], "citation": chapter["citation"]})
+        format_sources_complete = not format_errors
         for requirement in extracted["requirements"]:
             if any(citation["block_id"] in {row["block_id"] for row in format_ledger if row["status"] == "skipped_page_footer"}
                    for citation in requirement["citations"]):
@@ -738,6 +785,13 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                bool(blocks[key].get("text", "").strip()) and
                                _title_key(blocks[key]["text"]) != _title_key(chapter["title"]))
                               for chapter in matching_formats for key in chapter["content_block_ids"])
+            if (format_sources_complete and located and len(matching_formats) == 1 and
+                    requirement["format_status"] == "unread"):
+                resolution = _remote_format_resolution(requirement, matching_formats[0], format_ledger,
+                    blocks, windows, documents, extracted["coverage"])
+                if resolution is not None:
+                    remote_format_resolutions.append(resolution)
+                    unresolved = False
             if unresolved or (needs_format and not located):
                 format_errors.append({"reason": "required_response_format_unresolved", "requirement_id": requirement["requirement_id"],
                                       "citations": requirement["citations"]})
@@ -750,6 +804,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     else:
                         writing_spaces[(chapter["format_id"], requirement["requirement_id"])] = evidence
         _capture(ctx, "n3-format-coverage", {"producer_version": PLANNING_VERSION, "blocks": format_ledger,
+                                             "remote_format_resolutions": remote_format_resolutions,
                                              "errors": format_errors, "status": "failed" if format_errors else "complete"})
         _fail(bool(format_errors), "REQUIRED_FORMAT_UNRESOLVED")
         sources = copy.deepcopy(manifest["sources"])
@@ -788,7 +843,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             requirement = {key: raw[key] for key in ("requirement_id", "text", "category", "mandatory", "response_mode")}
             requirement["source_refs"] = list(dict.fromkeys(scoped_source(c) for c in citations))
             requirements.append(requirement)
-            details[raw["requirement_id"]] = raw
+            # The original N2 observation is immutable; only N3's derived
+            # planning view adopts a separately captured source resolution.
+            details[raw["requirement_id"]] = ({**raw, "format_status": "prescribed"} if any(
+                item["requirement_id"] == raw["requirement_id"] for item in remote_format_resolutions) else raw)
 
         review_actions = []
         for requirement in requirements:
@@ -1046,6 +1104,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "format_block_coverage": format_ledger,
                   "instruction_handling": instruction_handling,
                   "format_links": format_links, "writing_space_decisions": writing_space_reports,
+                  "remote_format_resolutions": remote_format_resolutions,
                   "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
                   "review_actions": review_actions,
