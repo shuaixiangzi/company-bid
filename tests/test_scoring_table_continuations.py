@@ -195,6 +195,7 @@ def test_n2_n3_source_rebuild_supports_zero_index_right_row_and_split_windows(tm
     manifest, parsed = integration_fixture(tmp_path)
     blocks, _, documents = _index(parsed, manifest)
     windows, _ = _windows(documents, blocks, {"window_max_blocks": block_limit})
+    full_by_id = {window["window_id"]: window for window in windows}
     selected_windows = []
     def caller(ctx, task_type, unit_id, payload, validate):
         window = payload["window"]
@@ -207,7 +208,9 @@ def test_n2_n3_source_rebuild_supports_zero_index_right_row_and_split_windows(tm
             selected_windows.append(window)
         raw = {"window_id": window["window_id"], "processing_declaration": "processed_not_semantically_accepted",
                "unresolved_block_ids": [], "requirements": requirements, "format_chapters": [], "format_status": "none_verified"}
-        assert validate_live_window(raw, window) == validate(raw)
+        # Independently rebuild from full frozen source, not the model's
+        # compact reading view. Both validators must agree.
+        assert validate_live_window(raw, full_by_id[window["window_id"]]) == validate(raw)
         return validate(raw)
     ctx = Context()
     extracted = extract_requirements(ctx, parsed, manifest, caller, {"window_max_blocks": block_limit})
