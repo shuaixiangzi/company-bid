@@ -348,6 +348,8 @@ v6 合并全量回归 **1794 passed、1 skipped（165.47 秒）**，skip 仍为 
 
 混合诊断合并全量检查为 **1870 passed、1 failed、1 skipped（205.72 秒）**：唯一失败是旧渲染中断测试的替身函数未接受新增的 `diagnostic` 关键字，导致它没有到达原本要测试的渲染中断。替身补齐参数并断言普通流程为 false、首次确实进入渲染后，恢复/发布相关 **26 passed（11.98 秒）**；未修改生产校验或删除负例。skip 仍为 Windows 符号链接权限负例。
 
+提交差异复核还发现新增链路测试与旧 `test_diagnostic_chain.py` 重名覆盖了原 8 项测试；已从上一版本完整恢复原文件，新测试另存 `test_mixed_diagnostic_chain.py`，两组 **15 passed（3.38 秒）**。此遗漏在发起新的真实调用前修复，保留修复提交，不以减少旧测试数量宣称门禁通过。
+
 ## 运行方式
 
 PowerShell 在项目根设置 `$env:PYTHONPATH='src'`，用项目 Python 执行 `-m company_bid.cli`。自动流程配置 `pipeline: automatic`，输入符合 `IntakeManifest`；敏感原文/配置放受控目录。密钥仅用已有环境变量或 `--credential-file`，不要写入 JSON 配置。
