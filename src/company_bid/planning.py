@@ -26,7 +26,7 @@ from .table_continuations import build_table_continuations, build_table_row_cata
 from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
 
 
-PLANNING_VERSION = "bid-plan-v18"
+PLANNING_VERSION = "bid-plan-v20"
 
 
 class _Fill(_Strict):
@@ -763,6 +763,128 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
     return formats, ledger, errors
 
 
+def _joint_deviation_formats(requirement, formats, ledger, blocks, units, documents, coverage):
+    """Prove one joint obligation's two distinct native response tables.
+
+    This recognizes a complete positive source sentence and a unique role pair,
+    not a general equivalence between different deviation-table titles. The
+    original N2 requirement and its citation remain unchanged.
+    """
+    if (requirement["category"] != "commercial" or requirement["response_mode"] != "table" or
+            requirement["format_status"] != "prescribed" or requirement.get("format_title")):
+        return None, None
+    positive = re.compile(r"^(?:\d+(?:\.\d+)*[、．.]?)?响应文件对采购文件的全部偏差[，,]?"
+                          r"均应在响应文件的商务和技术偏差表中列明[。.]")
+    source_text = re.sub(r"\s+", "", requirement["text"])
+    # Only this complete follow-up structure is known to preserve the joint
+    # obligation: omitted entries are presumed responsive, with review after
+    # clarification of inconsistency or missing supporting documents. Unknown
+    # suffixes stay unresolved; a growing denial blacklist cannot prove them.
+    follow_up = re.compile(
+        r"响应文件偏差表中未列明的(?:内容|事项)[，,]将视为响应人响应采购文件的要求[；;]"
+        r"但如在(?:询比采购|采购)活动中发现响应文件的其他部分与商务和技术偏差表的(?:描述|记载)不一致"
+        r"或响应人的响应缺乏支持性(?:文件|材料)[，,]则(?:采购评审小组|评审小组)有权要求响应人"
+        r"对相关(?:问题|事项)进行澄清[，,]并根据澄清结果对响应人的响应文件进行评审[。.]"
+    )
+
+    def supported_statement(text):
+        first = positive.match(text)
+        return first is not None and (first.end() == len(text) or follow_up.fullmatch(text[first.end():]) is not None)
+
+    if not supported_statement(source_text):
+        return None, None
+    error = {"reason": "joint_deviation_format_pair_unresolved", "requirement_id": requirement["requirement_id"]}
+    citations = requirement["citations"]
+    source_ids = {citation["source_id"] for citation in citations}
+    if len(source_ids) != 1:
+        return None, error
+    source_id = next(iter(source_ids))
+    document = next((item for item in documents if item["source_id"] == source_id), None)
+    if document is None or document.get("format") != "pdf":
+        return None, error
+
+    def native(block, kind):
+        label = "table" if kind == "table" else "line"
+        return (block["source_id"] == source_id and block["kind"] == kind and block.get("origin") == "native" and
+                re.fullmatch(rf"pdf/page\[\d+\]/{label}\[\d+\]", block["locator"]) is not None and
+                not block.get("read_disposition") and units[block["unit_id"]].get("coverage", {}).get("status") == "read")
+
+    # Every cited native block must be present in full. Selecting only a
+    # positive substring cannot hide a source waiver or activation condition;
+    # line wrapping of a complete supported follow-up remains harmless.
+    for citation in citations:
+        source_blocks = [blocks[key] for key in (citation.get("block_ids") or [citation["block_id"]])]
+        if (any(not native(block, "paragraph") for block in source_blocks) or
+                re.sub(r"\s+", "", "".join(block["text"] for block in source_blocks)) != source_text or
+                re.sub(r"\s+", "", citation["quote"]) != source_text):
+            return None, error
+    role_titles = {"business": "商务条款偏离表", "technical": "技术规格偏离表"}
+    required_headers = {"business": {"询比文件的商务条款", "响应文件的商务条款", "偏离", "说明"},
+                        "technical": {"询比规格", "响应文件规格", "偏离", "说明"}}
+    targets = []
+    for role, title in role_titles.items():
+        candidates = [chapter for chapter in formats if _title_key(chapter["title"]) == title and
+                      chapter["citation"]["source_id"] == source_id]
+        if len(candidates) != 1:
+            return None, {**error, "role": role, "candidate_format_ids": [item["format_id"] for item in candidates]}
+        chapter = candidates[0]
+        anchor = chapter["citation"]["block_id"]
+        content_ids = list(dict.fromkeys([anchor, *chapter["content_block_ids"]]))
+        by_id = {row["block_id"]: row for row in ledger if row.get("format_id") == chapter["format_id"]}
+        if (chapter["status"] != "prescribed" or not native(blocks[anchor], "paragraph") or
+                blocks[anchor]["text"].strip() != chapter["title"].strip() or not set(content_ids) <= set(by_id) or
+                any(by_id[key]["status"] not in {"chapter_boundary", "declared_content", "structural_continuation"} or
+                    not native(blocks[key], blocks[key]["kind"]) for key in content_ids)):
+            return None, {**error, "role": role, "format_id": chapter["format_id"]}
+        table_blocks = [blocks[key] for key in content_ids if blocks[key]["kind"] == "table"]
+        if len(table_blocks) != 1:
+            return None, {**error, "role": role, "format_id": chapter["format_id"], "table_count": len(table_blocks)}
+        table = table_blocks[0]
+        rows, merges, _ = _raw_grid(table)
+        headers = {_normal(cell) for cell in rows[0]}
+        if len(rows) < 2 or not required_headers[role] <= headers:
+            return None, {**error, "role": role, "format_id": chapter["format_id"], "detail": "native_role_columns_unproven"}
+        grid = {"rows": rows, "merges": merges, "column_widths": table.get("column_widths", [])}
+        targets.append({"role": role, "format_id": chapter["format_id"], "source_title": chapter["title"],
+            "format_citation": copy.deepcopy(chapter["citation"]), "content_block_ids": list(chapter["content_block_ids"]),
+            "source_blocks": [{"block_id": key, "locator": blocks[key]["locator"],
+                               "text_sha256": hashlib.sha256(blocks[key]["text"].encode()).hexdigest()} for key in content_ids],
+            "tables": [{"block_id": table["block_id"], "locator": table["locator"], **grid,
+                        "grid_sha256": _hash(grid), "table_id": _id("TABLE-", [source_id, table["block_id"]])}],
+            "format_source_coverage": copy.deepcopy(list(by_id.values()))})
+    if len({target["tables"][0]["block_id"] for target in targets}) != 2:
+        return None, error
+    footer_skips = _pdf_footer_skips(blocks)
+    body = sorted((block for block in blocks.values() if block["source_id"] == source_id and
+                   block["block_id"] not in footer_skips), key=lambda block: block["ordinal"])
+    positions = {block["block_id"]: i for i, block in enumerate(body)}
+    anchor_positions = [positions[target["format_citation"]["block_id"]] for target in targets]
+    regions = []
+    for i, block in enumerate(body):
+        text = block.get("text", "").strip()
+        if (native(block, "paragraph") and _heading_level(text) == 0 and
+                re.search(r"(?:投标|响应|报价).{0,18}(?:格式|组成)", text) and not re.search(r"\.{2,}|…{2,}", text)):
+            end = next((j for j in range(i + 1, len(body)) if _heading_level(body[j].get("text", "")) == 0), len(body))
+            if all(i < position < end for position in anchor_positions):
+                regions.append((i, end))
+    if len(regions) != 1:
+        return None, {**error, "detail": "shared_native_format_region_unproven"}
+    start, end = regions[0]
+    region_members = [{"block_id": block["block_id"], "locator": block["locator"],
+                       "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()} for block in body[start:end]]
+    proof = {"rule": "joint_business_technical_deviation_pair_v1", "requirement_id": requirement["requirement_id"],
+        "source_id": source_id, "source_sha256": document["sha256"], "requirement_citations": copy.deepcopy(citations),
+        "format_region": {"anchor_block_id": body[start]["block_id"], "members": region_members,
+            "end_block_id": body[end]["block_id"] if end < len(body) else None,
+            "end_locator": body[end]["locator"] if end < len(body) else None,
+            "end_text_sha256": hashlib.sha256(body[end]["text"].encode()).hexdigest() if end < len(body) else None,
+            "members_sha256": _hash(region_members), "boundary_basis": "next_source_major_heading_or_source_end"},
+        "targets": targets, "full_N2_coverage_sha256": _hash(coverage), "status": "source_proven",
+        "satisfaction_status": "not_determined", "n2_candidate_mutation": False}
+    proof["proof_sha256"] = _hash(proof)
+    return proof, None
+
+
 def _remote_format_resolution(requirement, chapter, ledger, blocks, windows, documents, coverage):
     """Derive a remote format observation only after full N1/N2 revalidation.
 
@@ -878,27 +1000,41 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         pending_body_reports = []
         format_links = []
         remote_format_resolutions = []
-        for requirement in planned_requirements:
-            title = requirement.get("format_title")
-            matches = [chapter for chapter in planned_formats if title and _title_key(title) == _title_key(chapter["title"])]
-            if not matches and not title:
-                matches = [chapter for chapter in planned_formats if len(_title_key(chapter["title"])) >= 4 and
-                           _title_key(chapter["title"]) in _normal(requirement["text"])]
-            if len(matches) > 1:
-                format_errors.append({"reason": "ambiguous_grounded_format_title", "requirement_id": requirement["requirement_id"],
-                                      "format_ids": [chapter["format_id"] for chapter in matches]})
-            elif len(matches) == 1:
-                chapter = matches[0]
-                if requirement["requirement_id"] not in chapter["requirement_refs"]:
-                    chapter["requirement_refs"].append(requirement["requirement_id"])
-                format_links.append({"requirement_id": requirement["requirement_id"], "format_id": chapter["format_id"],
-                                     "basis": "exact_source_title_after_number_prefix_normalization", "title": chapter["title"]})
+        format_associations = []
+        joint_formats = {}
         for result in extracted["window_results"]:
             if result["validated"]["format_status"] in {"unread", "conflict"}:
                 format_errors.append({"reason": "window_format_unresolved", "window_id": result["window_id"]})
         for chapter in planned_formats:
             if chapter["status"] != "prescribed":
                 format_errors.append({"reason": "format_chapter_unresolved", "format_id": chapter["format_id"], "citation": chapter["citation"]})
+        if not format_errors:
+            for requirement in planned_requirements:
+                proof, error = _joint_deviation_formats(requirement, planned_formats, format_ledger, blocks, units,
+                                                       documents, extracted["coverage"])
+                if error:
+                    format_errors.append(error)
+                if proof:
+                    format_associations.append(proof)
+                    joint_formats[requirement["requirement_id"]] = {target["format_id"] for target in proof["targets"]}
+        for requirement in planned_requirements:
+            title = requirement.get("format_title")
+            joint_ids = joint_formats.get(requirement["requirement_id"], set())
+            matches = [chapter for chapter in planned_formats if chapter["format_id"] in joint_ids] if joint_ids else [
+                chapter for chapter in planned_formats if title and _title_key(title) == _title_key(chapter["title"])]
+            if not matches and not title:
+                matches = [chapter for chapter in planned_formats if len(_title_key(chapter["title"])) >= 4 and
+                           _title_key(chapter["title"]) in _normal(requirement["text"])]
+            if len(matches) > 1 and not joint_ids:
+                format_errors.append({"reason": "ambiguous_grounded_format_title", "requirement_id": requirement["requirement_id"],
+                                      "format_ids": [chapter["format_id"] for chapter in matches]})
+            else:
+                for chapter in matches:
+                    if requirement["requirement_id"] not in chapter["requirement_refs"]:
+                        chapter["requirement_refs"].append(requirement["requirement_id"])
+                    format_links.append({"requirement_id": requirement["requirement_id"], "format_id": chapter["format_id"],
+                        "basis": "joint_business_technical_deviation_pair_v1" if joint_ids else
+                                 "exact_source_title_after_number_prefix_normalization", "title": chapter["title"]})
         format_sources_complete = not format_errors
         for requirement in planned_requirements:
             if any(citation["block_id"] in {row["block_id"] for row in format_ledger if row["status"] == "skipped_page_footer"}
@@ -911,7 +1047,13 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                 _title_key(requirement.get("format_title") or "") == _title_key(chapter["title"])]
             located = bool(matching_formats)
             if requirement["response_mode"] == "table":
-                located = any(blocks[key]["kind"] == "table" for chapter in matching_formats for key in chapter["content_block_ids"])
+                located = bool(matching_formats) and all(any(blocks[key]["kind"] == "table" for key in chapter["content_block_ids"])
+                                                        for chapter in matching_formats)
+                if len(matching_formats) > 1 and requirement["requirement_id"] not in joint_formats:
+                    format_errors.append({"reason": "ambiguous_grounded_format_title", "requirement_id": requirement["requirement_id"],
+                                          "format_ids": [chapter["format_id"] for chapter in matching_formats]})
+                if requirement["requirement_id"] in joint_formats:
+                    located = located and {chapter["format_id"] for chapter in matching_formats} == joint_formats[requirement["requirement_id"]]
             elif requirement["response_mode"] == "fixed_text":
                 located = any(blocks[key]["kind"] == "paragraph" and blocks[key].get("text", "").strip() != chapter["title"].strip()
                               for chapter in matching_formats for key in chapter["content_block_ids"])
@@ -947,7 +1089,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                               "format_id": chapter["format_id"], "citation": chapter["citation"]})
                     else:
                         writing_spaces[(chapter["format_id"], requirement["requirement_id"])] = evidence
+        _capture(ctx, "n3-format-associations", {"producer_version": PLANNING_VERSION, "items": format_associations,
+            "errors": format_errors, "n2_candidate_mutation": False, "n2_requirements_sha256": _hash(extracted["requirements"]),
+            "status": "failed" if format_errors else "source_proven" if format_associations else "not_needed"})
         _capture(ctx, "n3-format-coverage", {"producer_version": PLANNING_VERSION, "blocks": format_ledger,
+                                             "format_associations": format_associations,
                                              "remote_format_resolutions": remote_format_resolutions,
                                              "errors": format_errors, "status": "failed" if format_errors else "complete"})
         _fail(bool(format_errors), "REQUIRED_FORMAT_UNRESOLVED")
@@ -1091,7 +1237,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             title_key = _title_key(chapter["title"])
             refs = list(dict.fromkeys([*chapter["requirement_refs"],
                          *(r["requirement_id"] for r in planned_requirements if _title_key(r.get("format_title") or "") == title_key)]))
-            refs = [ref for ref in refs if ref not in assigned]
+            refs = [ref for ref in refs if ref not in assigned or chapter["format_id"] in joint_formats.get(ref, set())]
             # The prescribed chapter itself is a grounded structural obligation,
             # even if no semantic requirement was extracted beside its heading.
             structural_citation = chapter["citation"]
@@ -1348,6 +1494,27 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _fail(bool(instruction_errors), "PREPARATION_INSTRUCTION_HANDLING_UNRESOLVED")
         _capture(ctx, "n3-pending-response-bodies", {"producer_version": PLANNING_VERSION,
             "items": pending_body_reports, "n2_candidate_mutation": False, "status": "pending_manual" if pending_body_reports else "not_needed"})
+        association_placements = []
+        association_errors = []
+        for proof in format_associations:
+            rid = proof["requirement_id"]
+            for target in proof["targets"]:
+                section_id = _id("SEC-", target["format_id"])
+                section = next((item for item in sections if item["section_id"] == section_id), None)
+                for native_table in target["tables"]:
+                    matches = [item for item in tables if item["table_id"] == native_table["table_id"]]
+                    handled = (len(matches) == 1 and section is not None and rid in section["requirement_refs"] and
+                               rid in matches[0]["requirement_refs"] and matches[0]["section_id"] == section_id and
+                               native_table["table_id"] in section["table_refs"])
+                    association_placements.append({"requirement_id": rid, "format_id": target["format_id"],
+                        "section_id": section_id, "table_id": native_table["table_id"], "proof_sha256": proof["proof_sha256"],
+                        "status": "mapped" if handled else "unresolved", "satisfaction_status": "not_determined"})
+                    if not handled:
+                        association_errors.append({"requirement_id": rid, "format_id": target["format_id"],
+                                                   "table_id": native_table["table_id"]})
+        _capture(ctx, "n3-format-association-placement", {"items": association_placements, "errors": association_errors,
+            "status": "failed" if association_errors else "mapped" if association_placements else "not_needed"})
+        _fail(bool(association_errors), "JOINT_FORMAT_ASSOCIATION_INCOMPLETE")
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
@@ -1362,7 +1529,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "instruction_handling": instruction_handling,
                   "preparation_source_rules": list(source_rules.values()),
                   "source_context_proofs": list(source_context_proofs.values()),
-                  "format_links": format_links, "writing_space_decisions": writing_space_reports,
+                  "format_links": format_links, "format_associations": format_associations,
+                  "format_association_placements": association_placements, "writing_space_decisions": writing_space_reports,
                   "remote_format_resolutions": remote_format_resolutions,
                   "prescribed_cover": {"section_id": prescribed_cover_section_id,
                       "source_proofs": [chapter["cover_source_proof"] for chapter in planned_formats

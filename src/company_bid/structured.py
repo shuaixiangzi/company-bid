@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 
@@ -56,6 +57,94 @@ _ADJACENT_REPAIR_INSTRUCTIONS = (
     "格式条目和其它根字段不变，不得把实质义务降成程序事项、捏造格式或借用远章阅读上下文的ID。"
     "若仍有语义冲突、不能确定要求或完整范围，保留未决并停止；返回完整JSON重新接受全部校验。"
 )
+_LITERAL_NOTE_REPAIR_INSTRUCTIONS = (
+    "上一候选把完整读取的独立字面‘/’列为未决。resolution_groups中的read_literal_source_note只证明"
+    "同源同页原生连续的原标题、‘/’及下一同级编号标题完整可用，不解释‘/’含义，不证明无要求、不适用或免除义务。"
+    "保留原候选全部条目、来源原序、默认值与protected_fields及其它根字段；仅可在requirements尾部追加一个待核对来源备注。"
+    "新增项citation.block_ids必须精确等于该组block_ids（原标题和‘/’）；下一标题仅为边界证据，不能拼进备注。"
+    "新增项逐字段使用required_note_fields：procedure/procedure、mandatory=false、confidence=low、not_prescribed、"
+    "format_title=null、三类labels/keywords=[]；不能生成步骤、事实、模板或占位含义。"
+    "只有追加该完整原字备注后才可移除对应未决ID，不能仅清空标记、改旧候选或引用远处内容。"
+    "若仍有实质冲突、缺读或不能按该窄合同保留原字，则保留未决并停止。返回完整JSON接受原校验。"
+)
+
+
+def _literal_placeholder_resolution_groups(candidate: dict, window: dict) -> list | None:
+    """Admit one literal source note, never infer that an obligation is absent.
+
+    The slash must be the entire body between immediately consecutive numbered
+    sibling headings on one fully available native PDF page. The next heading
+    bounds the source span; its content is never borrowed into the note.
+    """
+    from .extraction import _LiveWindowResponse
+
+    try:
+        _LiveWindowResponse.model_validate(candidate, strict=True)
+    except ValidationError:
+        return None
+    if (window.get("source_format") != "pdf" or
+            not re.fullmatch(r"[a-f0-9]{64}", str(window.get("source_sha256", ""))) or
+            window.get("source_sha256") == "0" * 64 or
+            candidate.get("format_status") in {"unread", "conflict"} or
+            any(item.get("format_status") in {"unread", "conflict"} for item in candidate["requirements"]) or
+            any(item.get("status", "prescribed") in {"unread", "conflict"} for item in candidate["format_chapters"])):
+        return None
+    unresolved = candidate["unresolved_block_ids"]
+    blocks = [*window.get("blocks", []), *window.get("adjacent_context", [])]
+    available = {block["block_id"]: block for block in blocks}
+    targets = {block["block_id"] for block in window.get("blocks", [])}
+    if (len(unresolved) != 1 or unresolved[0] not in targets or len(available) != len(blocks) or
+            available[unresolved[0]].get("text") != "/"):
+        return None
+    literal = available[unresolved[0]]
+    if type(literal.get("ordinal")) is not int:
+        return None
+    neighbors = [
+        [block for block in blocks if block.get("ordinal") == literal["ordinal"] + offset]
+        for offset in (-1, 0, 1)
+    ]
+    if any(len(values) != 1 for values in neighbors):
+        return None
+    span = [values[0] for values in neighbors]
+    skips = {row.get("block_id") for row in window.get("safe_skip_blocks", [])}
+    positions = []
+    for block in span:
+        match = re.fullmatch(r"pdf/page\[(\d+)\]/line\[(\d+)\]", str(block.get("locator", "")))
+        if (not match or block.get("source_id") != window.get("source_id") or
+                block.get("origin") != "native" or block.get("kind") != "paragraph" or
+                block.get("read_disposition") or block["block_id"] in skips or
+                type(block.get("page")) is not int or block["page"] != int(match[1]) or
+                not isinstance(block.get("unit_id"), str) or not block["unit_id"] or
+                type(block.get("ordinal")) is not int or type(block.get("unit_ordinal")) is not int or
+                not isinstance(block.get("text"), str) or not block["text"].strip() or
+                "\n" in block["text"] or "\r" in block["text"]):
+            return None
+        positions.append(int(match[2]))
+    if any(right["page"] != left["page"] or right["unit_id"] != left["unit_id"] or
+           right["unit_ordinal"] != left["unit_ordinal"] + 1 or right_line != left_line + 1
+           for left, right, left_line, right_line in zip(span, span[1:], positions, positions[1:])):
+        return None
+    heading = re.compile(r"([1-9]\d*(?:\.(?:0|[1-9]\d*)){1,3})[ \t]*([^\d\s][^\r\n。；;：:！？!?]{1,69})")
+    titles = [heading.fullmatch(block["text"].strip()) for block in (span[0], span[2])]
+    if (not all(titles) or any(re.search(
+            r"应当|必须|不得|不应|须|需|应提供|应提交|应按|应在|应由|应予|不超过|不少于|不低于|不高于|"
+            r"\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)", title[2]) for title in titles)):
+        return None
+    numbers = [tuple(int(part) for part in title[1].split(".")) for title in titles]
+    if numbers[0][:-1] != numbers[1][:-1] or numbers[1][-1] != numbers[0][-1] + 1:
+        return None
+    note_fields = {"category": "procedure", "response_mode": "procedure", "mandatory": False,
+                   "confidence": "low", "format_status": "not_prescribed", "format_title": None,
+                   "required_fact_labels": [], "attachment_keywords": [], "reference_keywords": []}
+    proof = {"window_id": window["window_id"], "source_id": window["source_id"],
+             "source_sha256": window["source_sha256"], "context_identity": window.get("context_identity"),
+             "blocks": [{**{key: block[key] for key in ("block_id", "source_id", "locator", "page", "ordinal", "unit_id", "unit_ordinal")},
+                         "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()}
+                        for block in span], "interpretation": "literal_only_meaning_not_inferred",
+             "semantic_review": "requires_source_review"}
+    return [{"resolution_kind": "read_literal_source_note", "block_ids": [block["block_id"] for block in span[:2]],
+             "required_target_ids": list(unresolved), "basis": "native_literal_slash_between_consecutive_sibling_headings",
+             "required_note_fields": note_fields, "source_proof": proof, "source_proof_sha256": digest(proof)}]
 
 
 def _prior_source_span_witnesses(ctx, request: dict, candidate: dict) -> list:
@@ -319,6 +408,8 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
     if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED":
         groups = _adjacent_resolution_groups(candidate, window, source_witnesses)
         if groups is None:
+            groups = _literal_placeholder_resolution_groups(candidate, window)
+        if groups is None:
             return None
         coverage["resolution_groups"] = groups
         coverage["original_unresolved_block_ids"] = coverage["window_fields"].pop("unresolved_block_ids")
@@ -470,6 +561,11 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
             if not matches or any(not set(group["required_target_ids"]) & set(selected) for group in matches):
                 return False
             for group in matches:
+                if group.get("resolution_kind") == "read_literal_source_note":
+                    if (selected != group["block_ids"] or item["citation"].get("clause_id") or
+                            item["citation"].get("table_row_id") or
+                            _valid_repair_fields(item, _Requirement, {"citation"}) != group["required_note_fields"]):
+                        return False
                 resolved.update(group["block_ids"])
         if unresolved != [key for key in original if key not in resolved]:
             return False
@@ -538,6 +634,9 @@ def _repair_capture(ctx, name, value):
 def _validation_repair_request(request, code, context, coverage, call_id, attempt=1):
     """Shared wire builder for live correction and a provenance-labelled probe."""
     instructions = (_TITLE_REPAIR_INSTRUCTIONS if code == "FORMAT_TITLE_NOT_GROUNDED" else
+                    _LITERAL_NOTE_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+                    any(group.get("resolution_kind") == "read_literal_source_note"
+                        for group in coverage.get("resolution_groups", [])) else
                     _ADJACENT_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else
                     _REPAIR_INSTRUCTIONS)
     result = copy.deepcopy(request)
@@ -565,6 +664,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
         raise ProviderFailure("VALIDATION_REPAIR_ALREADY_ATTEMPTED")
     first_context = _RepairContext(ctx)
     rejected = None
+    rejected_candidate_hash = None
 
     def critical_unresolved(candidate):
         window = request.get("window")
@@ -580,7 +680,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
         return any(isinstance(key, str) and key in targets for key in unresolved)
 
     def checked(candidate):
-        nonlocal rejected
+        nonlocal rejected, rejected_candidate_hash
         try:
             # Validator enrichment/mutation can never rewrite the raw candidate.
             return validate(copy.deepcopy(candidate))
@@ -593,6 +693,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
                     (not critical_unresolved(candidate) or
                      error.code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and bool(coverage.get("resolution_groups")))):
                 rejected = (error.code, _repair_context(error.diagnostic_context), coverage)
+                rejected_candidate_hash = digest(candidate)
             raise
 
     def generate(context, value, validator):
@@ -613,11 +714,12 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise
         if first_context.capture_failed or getattr(ctx, "_capture_failed", False):
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-        relation = {"schema_version": "validation-repair-v4", "unit_id": unit_id, "task_type": task_type,
+        relation = {"schema_version": "validation-repair-v5", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],
-                    "first_request_hash": digest(request), "first_provider_input_hash": terminal.get("input_hash")}
+                    "first_request_hash": digest(request), "first_provider_input_hash": terminal.get("input_hash"),
+                    "first_candidate_hash": rejected_candidate_hash}
         if first_context.capture_disabled:
             skipped = ctx.capture(f"validation-repair-skipped-{call_id}", {**relation, "status": "not_scheduled",
                 "reason": "capture_disabled_by_policy", "capture_status": "disabled_by_policy"})
@@ -642,8 +744,11 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
         _repair_capture(ctx, f"validation-repair-scheduled-{call_id}", relation)
         ctx.call_event("call.retry_scheduled", {**terminal, "retry_reason": rejected[0], "phase": "validation_repair"})
         second_context = _RepairContext(ctx)
+        repaired_candidate_hash = None
 
         def repaired(candidate):
+            nonlocal repaired_candidate_hash
+            repaired_candidate_hash = digest(candidate)
             if not _covers_rejected_candidate(candidate, rejected[2], second_request):
                 raise PlanningError("VALIDATION_REPAIR_COVERAGE_LOST")
             return validate(copy.deepcopy(candidate))
@@ -658,6 +763,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
                 "second_call_id": second_terminal.get("call_id") if second_terminal else None,
                 "second_call_attempt": second_terminal.get("call_attempt") if second_terminal else None,
                 "second_provider_input_hash": second_terminal.get("input_hash") if second_terminal else None,
+                "second_candidate_hash": repaired_candidate_hash,
                 "second_call_started": any(event == "call.started" for event, _ in second_context.events)})
             raise
         second_terminal = second_context.terminal()
@@ -666,7 +772,8 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
         observer.check()
         _repair_capture(ctx, f"validation-repair-result-{call_id}", {**relation, "status": "completed",
             "second_call_id": second_terminal["call_id"], "second_call_attempt": second_terminal["call_attempt"],
-            "second_provider_input_hash": second_terminal.get("input_hash"), "second_call_started": True})
+            "second_provider_input_hash": second_terminal.get("input_hash"), "second_call_started": True,
+            "second_candidate_hash": repaired_candidate_hash})
         return result
 
 

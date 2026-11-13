@@ -190,6 +190,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                 "input_kind": prepared.input_kind,
                 "chain_diagnostics": value.get("chain_diagnostics", {}),
                 "writing_review": writing_review, "expected_table_ids": list(tables),
+                "expected_table_links": {table_id: {"section_id": table.section_id,
+                    "requirement_refs": list(table.requirement_refs)} for table_id, table in tables.items()},
                 "generation_mode": provider_options["mode"], "external_model_verified": provider_options["mode"] == "chat_completions"}
 
     def check(ctx, value):
@@ -202,12 +204,35 @@ def build_executor(root: Path, config: dict) -> Executor:
         table_ids = [block.table.table_id for section in package.sections for block in section.blocks if isinstance(block, TableBlock)]
         if len(set(table_ids)) != len(table_ids) or set(table_ids) != set(value.get("expected_table_ids", table_ids)):
             raise PipelineFailure("TABLE_ASSEMBLY_INCOMPLETE")
+        # Preserve every N3 table-to-requirement edge, including one requirement
+        # answered by two distinct forms. Aggregate table/RID counts miss losing
+        # just one edge. This checks assembly, not substantive compliance.
+        expected_links = value.get("expected_table_links")
+        if expected_links is None and value.get("input_kind") == "automatic":
+            raise PipelineFailure("TABLE_REQUIREMENT_LINKS_MISSING")
+        table_links = []
+        if expected_links is not None:
+            if not isinstance(expected_links, dict) or set(expected_links) != set(table_ids):
+                raise PipelineFailure("TABLE_REQUIREMENT_LINK_MISMATCH")
+            for section in package.sections:
+                for block in section.blocks:
+                    if not isinstance(block, TableBlock):
+                        continue
+                    table = block.table
+                    actual = {"section_id": table.section_id, "requirement_refs": list(table.requirement_refs)}
+                    if (expected_links[table.table_id] != actual or table.section_id != section.section_id or
+                            set(table.requirement_refs) - set(section.requirement_refs)):
+                        raise PipelineFailure("TABLE_REQUIREMENT_LINK_MISMATCH")
+                    table_links.append({"table_id": table.table_id, **actual,
+                                        "assembly_status": "checked", "satisfaction_status": "not_determined"})
         checks = {"schema": "passed", "source_hashes": "passed",
                   "semantic_fact_support": "requires_source_review",
                   "model_fact_invention": "requires_source_review",
                   "requirement_count": len(package.requirements), "section_count": len(package.sections),
                   "attachment_count": len(package.attachments), "issue_count": len(package.issues),
                   "table_count": len(table_ids), "writing_units": value.get("writing_review", []),
+                  "table_requirement_links": table_links,
+                  "table_requirement_links_status": "checked" if expected_links is not None else "not_recorded",
                   "review_actions": [item.model_dump(mode="json") for item in package.review_actions],
                   "pending_review_count": len(package.review_actions),
                   "source_context_review": [], "pending_context_review_count": 0,

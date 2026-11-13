@@ -114,7 +114,8 @@ def task_proposal(task):
                          for i in range(len(task["must_cover"]))]}
 
 
-def runner(tmp_path, monkeypatch, *, provider_mode="prepared", provider_change=None, output_change=None, cost_table=False):
+def runner(tmp_path, monkeypatch, *, provider_mode="prepared", provider_change=None, output_change=None, cost_table=False,
+           prepared_change=None):
     manifest, parsed, extracted = source_data(tmp_path, cost_table=cost_table)
     calls = []
     config = {"provider": {"mode": "prepared"}, "debug_capture": True}
@@ -148,6 +149,9 @@ def runner(tmp_path, monkeypatch, *, provider_mode="prepared", provider_change=N
 
     def n3(ctx, value):
         prepared = plan_bid(ctx, extracted, parsed, manifest, no_call, {"map_table_fields": False})
+        if prepared_change:
+            prepared_change(prepared)
+            prepared = PreparedBid.model_validate(prepared).model_dump(mode="json")
         proposals = {task["unit_id"]: task_proposal(task) for section in prepared["sections"]
                      for task in section["writing_tasks"]}
         return {"prepared": prepared, "proposals": proposals, "source_artifacts": [], "input_kind": "automatic"}
@@ -348,17 +352,22 @@ def test_n5_rejects_known_quotation_table_placed_in_a_technical_context(tmp_path
 
 
 def test_n5_does_not_confuse_technical_cost_control_or_schedule_numbers_with_a_quote(tmp_path, monkeypatch):
-    def move_cost_table(output):
-        package = output["package"]
-        technical_id = next(item["requirement_id"] for item in package["requirements"] if item["response_mode"] == "writing")
-        technical = next(section for section in package["sections"] if technical_id in section["requirement_refs"])
-        origin = next(section for section in package["sections"] if any(value["kind"] == "table" for value in section["blocks"]))
-        table = next(value for value in origin["blocks"] if value["kind"] == "table")
-        assert table["table"]["title"] == "一、技术成本控制表"
-        origin["blocks"].remove(table)
-        table["table"]["section_id"] = technical["section_id"]
-        technical["blocks"].append(table)
-    executor, run, _ = runner(tmp_path, monkeypatch, output_change=move_cost_table, cost_table=True)
+    def plan_cost_table(prepared):
+        # Test permitted technical content with its location frozen before N4.
+        # Moving a table only after assembly now correctly violates that plan.
+        technical_id = next(item["requirement_id"] for item in prepared["requirements"] if item["response_mode"] == "writing")
+        technical = next(section for section in prepared["sections"] if technical_id in section["requirement_refs"])
+        table, = prepared["tables"]
+        assert table["title"] == "一、技术成本控制表"
+        origin = next(section for section in prepared["sections"] if section["section_id"] == table["section_id"])
+        origin["table_refs"].remove(table["table_id"])
+        origin["fixed_content"] = [item for item in origin["fixed_content"] if item.get("table_ref") != table["table_id"]]
+        table["section_id"] = technical["section_id"]
+        technical["table_refs"].append(table["table_id"])
+        technical["requirement_refs"] = list(dict.fromkeys([*technical["requirement_refs"], *table["requirement_refs"]]))
+        technical["nonwriting_requirement_refs"] = list(dict.fromkeys([
+            *technical["nonwriting_requirement_refs"], *table["requirement_refs"]]))
+    executor, run, _ = runner(tmp_path, monkeypatch, prepared_change=plan_cost_table, cost_table=True)
     state = executor.execute(run)
     assert state["status"] == "succeeded", state.get("error_code")
     result = executor.output(run, "N5")
