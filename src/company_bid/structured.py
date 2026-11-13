@@ -95,6 +95,34 @@ _MATERIAL_RESPONSE_FIELDS = {
     "required_fact_labels": [], "attachment_keywords": [], "reference_keywords": [],
 }
 
+_SOURCE_MATERIAL_REPAIR_INSTRUCTIONS = (
+    "上一候选把已经完整读出的空材料类别标题列为未决。resolution_groups中的source_proof来自本次冻结N1原文，"
+    "保留格式章、资格材料父标题、共同说明和相邻同级标题边界；这些证据只证明来源和空正文范围，"
+    "不证明公司符合资格，也不证明父说明中的引用题名或具体门槛已经核验。"
+    "保留原候选全部requirements、format_chapters、原序、来源和protected_fields及默认值。"
+    "只在requirements尾部按resolution_groups原序逐项追加材料待补要求，citation.block_ids精确等于该组block_ids，"
+    "clause_id和table_row_id为null，完整填写required_response_fields：qualification/factual_response、"
+    "mandatory=true、confidence=low、not_prescribed、format_title=null、三类labels/keywords=[]。"
+    "不能猜证书、人员、金额、事实、证明形式、适用豁免或改成procedure；父层引用原字保留且仍待核对。"
+    "source_proof是只读边界依据，不能把其中远处块ID当成本窗可引用或已处理ID。"
+    "仅在每个目标标题都有对应的完整原字新增项后移除其未决ID，其余未决原序保留；"
+    "不能吞掉条件、否定、正文、相邻窗口或改旧候选。存在来源缺读或实质冲突时仍须保留未决。"
+    "返回完整JSON接受全部原校验。"
+)
+
+
+def _frozen_material_source(ctx):
+    """Read the independent successful N1 checkpoint, never a model's context."""
+    executor = getattr(ctx, "executor", None)
+    if executor is None or getattr(ctx, "node_key", None) != "N2":
+        return None
+    state = executor.store.read_state(ctx.run_id)
+    n1 = next((node for node in state["nodes"] if node["key"] == "N1"), None)
+    if n1 is None or n1["status"] != "succeeded":
+        return None
+    # output verifies the checkpoint prefix and all immutable artifact hashes.
+    return executor.output(ctx.run_id, "N1")
+
 
 def _material_heading_resolution_groups(candidate: dict, window: dict) -> list | None:
     """Recognize one complete qualification-material *format* source family.
@@ -657,7 +685,8 @@ def _valid_repair_fields(item: dict, model, excluded: set[str]) -> dict:
     return fields
 
 
-def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnostic_context=None, source_witnesses=()) -> dict | None:
+def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnostic_context=None,
+                     source_witnesses=(), source_data=None) -> dict | None:
     """Keep a small source-checked inventory; unknown anchors disable repair."""
     from .extraction import _FormatChapter, _LiveWindowResponse, _Requirement
 
@@ -698,6 +727,9 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
             groups = _literal_placeholder_resolution_groups(candidate, window)
         if groups is None and not source_witnesses:
             groups = _material_heading_resolution_groups(candidate, window)
+        if groups is None and not source_witnesses and source_data is not None:
+            from .material_heading_sources import material_heading_source_groups
+            groups = material_heading_source_groups(candidate, request, source_data["parsed"], source_data["manifest"])
         if groups is None:
             return None
         coverage["resolution_groups"] = groups
@@ -850,9 +882,13 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
         original = coverage["original_unresolved_block_ids"]
         groups = coverage["resolution_groups"]
         added = candidate["requirements"][coverage["counts"]["requirements"]:]
-        material_groups = [group for group in groups if group.get("resolution_kind") == "qualification_material_category_heading"]
+        material_groups = [group for group in groups if group.get("resolution_kind") in {
+            "qualification_material_category_heading", "source_bound_material_heading"}]
         if material_groups:
-            if len(material_groups) != len(groups) or len(groups) != 2 or len(added) != 2:
+            kinds = {group.get("resolution_kind") for group in groups}
+            if (len(material_groups) != len(groups) or len(kinds) != 1 or len(added) != len(groups) or
+                    (kinds == {"qualification_material_category_heading"} and len(groups) != 2) or
+                    not 1 <= len(groups) <= 8):
                 return False
             for item, group in zip(added, groups):
                 if (group.get("required_response_fields") != _MATERIAL_RESPONSE_FIELDS or
@@ -943,7 +979,10 @@ def _repair_capture(ctx, name, value):
 
 def _validation_repair_request(request, code, context, coverage, call_id, attempt=1):
     """Shared wire builder for live correction and a provenance-labelled probe."""
-    instructions = (_MATERIAL_HEADING_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+    instructions = (_SOURCE_MATERIAL_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+                    any(group.get("resolution_kind") == "source_bound_material_heading"
+                        for group in coverage.get("resolution_groups", [])) else
+                    _MATERIAL_HEADING_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
                     any(group.get("resolution_kind") == "qualification_material_category_heading"
                         for group in coverage.get("resolution_groups", [])) else
                     _TITLE_REPAIR_INSTRUCTIONS if code == "FORMAT_TITLE_NOT_GROUNDED" else
@@ -1003,6 +1042,11 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             witnesses = _prior_source_span_witnesses(ctx, request, candidate) if error.code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else []
             coverage = _repair_coverage(candidate, request, error_code=error.code, diagnostic_context=error.diagnostic_context,
                                         source_witnesses=witnesses)
+            if coverage is None and error.code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and not witnesses:
+                source_data = _frozen_material_source(ctx)
+                if source_data is not None:
+                    coverage = _repair_coverage(candidate, request, error_code=error.code,
+                                               diagnostic_context=error.diagnostic_context, source_data=source_data)
             if (error.code in _REPAIR_CODES and coverage is not None and
                     isinstance(request.get("task_instructions", ""), str) and
                     (not critical_unresolved(candidate) or
@@ -1029,7 +1073,9 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise
         if first_context.capture_failed or getattr(ctx, "_capture_failed", False):
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-        relation = {"schema_version": "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
+        source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
+                           for group in rejected[2].get("resolution_groups", []))
+        relation = {"schema_version": "validation-repair-v8" if source_bound else "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],

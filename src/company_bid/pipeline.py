@@ -27,7 +27,8 @@ def _version(*names: str) -> str:
     dependencies = {"planning.py": ("plan_component_controls.py", "project_constraint_runtime.py"),
                     "pipeline.py": ("project_constraint_runtime.py",),
                     "project_constraint_runtime.py": ("project_constraints.py",),
-                    "project_constraints.py": ("table_continuations.py",)}
+                    "project_constraints.py": ("table_continuations.py",),
+                    "structured.py": ("material_heading_sources.py",)}
     expanded = list(dict.fromkeys(names))
     for name in expanded:
         for dependency in dependencies.get(name, ()):

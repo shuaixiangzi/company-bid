@@ -344,9 +344,29 @@ class DiagnosticReplay:
         _require(_repair_context(first["validation"].get("diagnostic_context")) == context and
                  first["terminal"].get("error_code") == code, "LINEAGE_INVALID")
         witnesses = self._witnesses(coverage, first_run, window)
+        source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
+                           for group in coverage.get("resolution_groups", []))
+        source_data = self._n1(first_run)[0] if source_bound else None
         rebuilt = _repair_coverage(first["candidate"], first["task"], error_code=code,
-                                   diagnostic_context=context, source_witnesses=witnesses)
+                                   diagnostic_context=context, source_witnesses=witnesses, source_data=source_data)
         _require(rebuilt is not None and rebuilt == coverage, "LINEAGE_UNSUPPORTED")
+        if source_bound:
+            current = _repair_coverage(first["candidate"], first["task"], error_code=code,
+                                       diagnostic_context=context, source_data=self.current)
+            def source_identity(value):
+                value = copy.deepcopy(value)
+                for group in value.get("resolution_groups", []):
+                    if group.get("resolution_kind") == "source_bound_material_heading":
+                        proof = group["source_proof"]
+                        # Both full N1 views were independently validated. Only
+                        # their container digests can include fresh read artifacts;
+                        # all source text, coordinates and boundary hashes remain.
+                        proof.pop("parsed_sha256", None)
+                        proof.pop("source_reading_sha256", None)
+                        group["source_proof_sha256"] = digest(proof)
+                return value
+            _require(current is not None and source_identity(current) == source_identity(coverage),
+                     "SOURCE_CONTEXT_MISMATCH")
         expected = _validation_repair_request(first["task"], code, context, coverage, first["call_id"], first["call_attempt"])
         # The actual feedback message keeps its historical object ordering and
         # call identity. Stored coverage JSON has sorted keys; reserializing it
@@ -392,9 +412,12 @@ class DiagnosticReplay:
             else:
                 relation_ref = _one(relations)
                 relation = run.capture(captures, relation_ref["name"])
-                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7"} and
+                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7", "validation-repair-v8"} and
                          relation.get("status") == "completed" and relation.get("unit_id") == unit["unit_id"] and
                          relation.get("repair_attempt") == 1 and relation.get("second_call_started") is True, "LINEAGE_INVALID")
+                source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
+                                   for group in relation.get("required_coverage", {}).get("resolution_groups", []))
+                _require((relation["schema_version"] == "validation-repair-v8") == source_bound, "LINEAGE_INVALID")
                 first = run.call(node, unit["unit_id"], attempt, relation["first_call_id"], relation["first_call_attempt"], passed=False)
                 self._wire(run, first, task)
                 _require(relation.get("first_request_hash") == digest(task) and
