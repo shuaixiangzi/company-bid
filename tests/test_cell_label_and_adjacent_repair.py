@@ -62,7 +62,7 @@ def test_combined_repair_has_one_exact_original_label_and_one_complete_appended_
     frozen = copy.deepcopy((first, second, request))
     state, validated, relation, feedback = run_repair(tmp_path, monkeypatch, window, first, second)
     assert state['status'] == 'succeeded' and validated == [first, second]
-    assert relation['schema_version'] == 'validation-repair-v6' and relation['status'] == 'completed'
+    assert relation['schema_version'] == 'validation-repair-v7' and relation['status'] == 'completed'
     assert relation['first_candidate_hash'] == digest(first) and relation['second_candidate_hash'] == digest(second)
     assert_two_distinct_settled_calls(state, relation)
     coverage = feedback['required_coverage']

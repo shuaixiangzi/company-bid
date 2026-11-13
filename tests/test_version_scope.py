@@ -8,12 +8,15 @@ from company_bid.pipeline import build_executor
 @pytest.mark.parametrize("changed_file, affected", [
     ("writing_prompt.py", {"N4"}),
     ("planning.py", {"N3"}),
+    ("plan_component_controls.py", {"N3"}),
+    ("project_constraints.py", {"N3", "N4", "N5", "N6"}),
+    ("project_constraint_runtime.py", {"N3", "N4", "N5", "N6"}),
     ("diagnostic_replay.py", {"N2"}),
     ("pipeline.py", {"N4", "N5", "N6"}),
     ("slots.py", {"N3"}),
     ("extraction.py", {"N2", "N3"}),
     ("source_clauses.py", {"N2", "N3"}),
-    ("table_continuations.py", {"N2", "N3"}),
+    ("table_continuations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("material_matching.py", {"N3"}),
     ("preparation_rules.py", {"N3", "N4", "N5", "N6"}),
 ])

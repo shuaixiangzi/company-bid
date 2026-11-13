@@ -21,7 +21,8 @@ def assembled(tmp_path):
     value = runner.output(run, "N4")
     handler = next(node.handler for node in runner.nodes if node.key == "N5")
     captures = []
-    ctx = SimpleNamespace(capture=lambda name, payload: captures.append((name, payload)))
+    ctx = SimpleNamespace(execution_config=runner.execution_config,
+                          capture=lambda name, payload: captures.append((name, payload)))
     return runner, run, value, handler, ctx, captures
 
 

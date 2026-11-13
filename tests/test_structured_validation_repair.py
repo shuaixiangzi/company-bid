@@ -245,7 +245,7 @@ def test_capture_write_failure_blocks_repair_or_success_checkpoint(tmp_path, mon
             point == "response" and "choices" in value or
             point == "validation" and value.get("status") == "failed" and "diagnostic_context" in value and "schema_version" not in value or
             point == "failure" and value.get("error_code") == "EXTRACTION_LABEL_NOT_GROUNDED" and "diagnostic_context" not in value or
-            point in {"scheduled", "result"} and value.get("schema_version") == "validation-repair-v6" and
+            point in {"scheduled", "result"} and value.get("schema_version") == "validation-repair-v7" and
             value.get("status") == ("scheduled" if point == "scheduled" else "completed"))
         if target and not failed:
             failed.append(True)

@@ -216,7 +216,7 @@ def replay_config(source):
 
 def target_run(source, *, spec=None, options_change=None, value_change=None,
                purpose="diagnostic_replay", preflight=True, after_preflight=None, validator=None,
-               transport=None):
+               transport=None, include_prefix=False, root=None, fail_after_extraction=False):
     spec = copy.deepcopy(spec if spec is not None else replay_config(source))
     options = {**source["options"], "mode": "diagnostic_mixed"}
     if options_change:
@@ -254,11 +254,19 @@ def target_run(source, *, spec=None, options_change=None, value_change=None,
                 lambda: gateway(ctx, "extract_requirements", unit, original_payload, validator))
         else:
             result = extract_requirements(ctx, data["parsed"], data["manifest"], gateway, source.get("extraction", {}))
+        if fail_after_extraction:
+            from company_bid.provider import ProviderFailure
+            raise ProviderFailure("SYNTHETIC_LATER_FAILURE")
         return {"extracted": result, "diagnostic_replay": gateway.summary()}
 
     # One production extraction body with the same durable Executor contracts.
-    root = source["tmp_path"] / ("target-runtime-" + str(len(list(source["tmp_path"].glob("target-runtime-*")))))
-    executor = Executor(root, [NodeSpec("N2", "synthetic-current-validator-v2", execute,
+    root = Path(root) if root is not None else source["tmp_path"] / (
+        "target-runtime-" + str(len(list(source["tmp_path"].glob("target-runtime-*")))))
+    # Source bytes stay in the explicitly declared original root. References in
+    # another store are not relabelled as if copied into this synthetic prefix.
+    prefix = [NodeSpec("N0", "synthetic-frozen-prefix", lambda ctx, value: {**value, "source_artifacts": []}, ()),
+              NodeSpec("N1", "synthetic-read-prefix", lambda ctx, value: value, ())] if include_prefix else []
+    executor = Executor(root, [*prefix, NodeSpec("N2", "synthetic-current-validator-v2", execute,
                                       ("structured_provider", "extraction", "run_purpose", "diagnostic_replay"))], config)
     run = executor.create_run(value)
     state = executor.execute(run)
@@ -655,4 +663,202 @@ def test_failed_later_live_window_resumes_without_losing_revalidation_statistics
     spans = rows(executor.store.run_dir(run) / "spans.jsonl")
     assert len([span for span in spans if span["name"] == "candidate.revalidation"]) == 1
     assert snapshot(source["executor"].store.root) == before
+
+
+def make_mixed_source(tmp_path, monkeypatch, *, later_failure=False):
+    """One historical revalidation followed by one real offline Provider call."""
+    original = make_source_run(tmp_path, monkeypatch, two_windows=True)
+    executor, run, state, calls, _ = target_run(original, include_prefix=True,
+        fail_after_extraction=later_failure,
+        transport=lambda wire: response(candidate(json.loads(wire["messages"][-1]["content"]))))
+    assert state["status"] == ("failed" if later_failure else "succeeded"), state.get("error_code")
+    assert len(calls) == 1 and state["artifact_scope"] == "diagnostic"
+    assert inspect_diagnostics(executor.store.root, run)["actual_call_attempts"] == 1
+    return {**original, "executor": executor, "run": run, "value": executor.output(run, "N1"),
+            "unit_id": original["unit_ids"][1], "calls": calls, "original_source": original}
+
+
+def mixed_replay_config(source):
+    # A revalidated unit remains bound to its actual original source.
+    original = source["original_source"]
+    spec = replay_config(original)
+    spec["sources"]["mixed"] = str(source["executor"].store.root)
+    live = source["unit_id"]
+    spec["bindings"]["extract_requirements:" + live] = {
+        "alias": "mixed", "run_id": source["run"], "node_key": "N2", "unit_id": live}
+    return spec
+
+
+@pytest.fixture
+def mixed_source(tmp_path, monkeypatch):
+    return make_mixed_source(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("later_failure", [False, True])
+@pytest.mark.parametrize("same_root", [False, True])
+def test_sealed_mixed_actual_live_unit_is_revalidated_without_relabelling_history(
+        tmp_path, monkeypatch, later_failure, same_root):
+    source = make_mixed_source(tmp_path, monkeypatch, later_failure=later_failure)
+    old_run_dir = source["executor"].store.run_dir(source["run"])
+    before = snapshot(old_run_dir)
+    original_before = snapshot(source["original_source"]["executor"].store.root)
+    monkeypatch.delenv(source["options"]["auth_env"])
+    executor, run, state, calls, _ = target_run(source, spec=mixed_replay_config(source),
+        root=source["executor"].store.root if same_root else None)
+    assert state["status"] == "succeeded", state.get("error_code")
+    assert calls == [] and "call_budget" not in state
+    summary = executor.output(run)["diagnostic_replay"]
+    assert summary["verified_binding_count"] == summary["revalidated_count"] == 2
+    assert summary["historical_calls_charged_again"] == summary["live_miss_count"] == 0
+    live_origin, = [item for item in summary["origins"] if item["source_alias"] == "mixed"]
+    assert live_origin["unit_id"] == source["unit_id"]
+    assert {call["run_id"] for call in live_origin["calls"]} == {source["run"]}
+    original_origin, = [item for item in summary["origins"] if item["source_alias"] == "history"]
+    assert original_origin["run_id"] == source["original_source"]["run"]
+    assert inspect_diagnostics(executor.store.root, run)["actual_call_attempts"] == 0
+    assert snapshot(old_run_dir) == before
+    assert snapshot(source["original_source"]["executor"].store.root) == original_before
+
+
+def test_replayed_mixed_unit_is_not_an_actual_source_even_with_identical_raw_candidate(mixed_source):
+    source = mixed_source
+    first = source["unit_ids"][0]
+    spec = mixed_replay_config(source)
+    spec["bindings"]["extract_requirements:" + first].update(alias="mixed", run_id=source["run"])
+    source_node = next(node for node in source["executor"].inspect(source["run"])["nodes"] if node["key"] == "N2")
+    old = source["original_source"]
+    old_node = next(node for node in old["executor"].inspect(old["run"])["nodes"] if node["key"] == "N2")
+    assert source["executor"].store.read_json(source_node["units"][first]["output_ref"])["data"]["raw_model_candidate"] == (
+        old["executor"].store.read_json(old_node["units"][first]["output_ref"])["data"]["raw_model_candidate"])
+    result = target_run(source, spec=spec)
+    failed_without_http(result)
+    assert result[2]["error_code"] == "DIAGNOSTIC_REPLAY_SOURCE_ACTUAL_CALL_REQUIRED"
+
+
+@pytest.mark.parametrize("damage", ["purpose", "scope", "capture_policy", "capture_disabled", "running", "paused",
+    "missing_spec", "bad_spec_schema", "config_hash", "unfinished_execution", "missing_preflight", "missing_miss", "failed_unit"])
+def test_mixed_source_requires_frozen_diagnostic_scope_and_terminal_complete_capture(mixed_source, damage):
+    source = mixed_source
+    executor = source["executor"]
+    state = executor.inspect(source["run"])
+    if damage == "purpose":
+        state["execution_config"]["run_purpose"] = "formal"
+    elif damage == "scope":
+        state["artifact_scope"] = "standard"
+    elif damage == "capture_policy":
+        state["capture_policy"] = False
+    elif damage == "capture_disabled":
+        state["execution_config"]["debug_capture"] = False
+    elif damage == "running":
+        state["status"] = "running"
+    elif damage == "paused":
+        state["status"] = "paused_debug"
+    elif damage == "missing_spec":
+        del state["execution_config"]["diagnostic_replay"]
+    elif damage == "bad_spec_schema":
+        state["execution_config"]["diagnostic_replay"]["schema_version"] = "invented-replay"
+    elif damage == "unfinished_execution":
+        del state["execution_attempts"][-1]["ended_at"]
+    elif damage == "failed_unit":
+        node = next(node for node in state["nodes"] if node["key"] == "N2")
+        node["units"][source["unit_id"]]["status"] = "failed"
+    elif damage in {"missing_preflight", "missing_miss"}:
+        node = next(node for node in state["nodes"] if node["key"] == "N2")
+        node["attempts"][-1]["captures"] = [cap for cap in node["attempts"][-1]["captures"]
+            if cap["name"] != ("diagnostic-replay-preflight" if damage == "missing_preflight" else "diagnostic-replay-live-miss")]
+    state["config_hash"] = "f" * 64 if damage == "config_hash" else digest(state["execution_config"])
+    atomic_json(executor.store.run_dir(source["run"]) / "state.json", state)
+    failed_without_http(target_run(source, spec=mixed_replay_config(source)))
+
+
+@pytest.mark.parametrize("damage", ["preflight_scope", "preflight_count", "preflight_origin", "imported_fees", "miss_reason", "miss_hash",
+                                     "response", "ledger", "call_trace", "metadata_trace"])
+def test_mixed_source_metadata_and_actual_wire_trace_budget_cannot_be_forged(mixed_source, damage):
+    source = mixed_source
+    if damage == "preflight_scope":
+        replace_capture(source, "diagnostic-replay-preflight", lambda value: value.update(diagnostic_only=False))
+    elif damage == "preflight_count":
+        replace_capture(source, "diagnostic-replay-preflight", lambda value: value.update(verified_binding_count=0))
+    elif damage == "preflight_origin":
+        replace_capture(source, "diagnostic-replay-preflight", lambda value: value["origins"][0].update(run_id="f" * 32))
+    elif damage == "imported_fees":
+        replace_capture(source, "diagnostic-replay-preflight", lambda value: value.update(historical_calls_charged_again=1))
+    elif damage == "miss_reason":
+        replace_capture(source, "diagnostic-replay-live-miss", lambda value: value.update(reason="declared_but_live"))
+    elif damage == "miss_hash":
+        replace_capture(source, "diagnostic-replay-live-miss", lambda value: value.update(request_sha256="0" * 64))
+    elif damage == "response":
+        def corrupt(value):
+            raw = json.loads(value["choices"][0]["message"]["content"])
+            raw["requirements"][0]["mandatory"] = False
+            value["choices"][0]["message"]["content"] = json.dumps(raw)
+        replace_capture(source, "response-", corrupt)
+    elif damage == "call_trace":
+        path = source["executor"].store.run_dir(source["run"]) / "spans.jsonl"
+        values = rows(path)
+        next(item for item in values if item["name"] == "provider.call")["attributes"]["call_id"] = "0" * 32
+        path.write_text("".join(json.dumps(item) + "\n" for item in values), encoding="utf-8")
+    else:
+        state = source["executor"].inspect(source["run"])
+        if damage == "ledger":
+            state["call_budget"]["reservations"] = []
+        else:
+            node = next(node for node in state["nodes"] if node["key"] == "N2")
+            next(cap for cap in node["attempts"][-1]["captures"] if
+                 cap["name"] == "diagnostic-replay-preflight")["trace_id"] = "0" * 32
+        atomic_json(source["executor"].store.run_dir(source["run"]) / "state.json", state)
+    failed_without_http(target_run(source, spec=mixed_replay_config(source)))
+
+
+def test_ordinary_actual_call_cannot_be_disguised_as_mixed_by_editing_only_frozen_labels(source_run):
+    source = source_run
+    state = source["executor"].inspect(source["run"])
+    state["artifact_scope"] = "diagnostic"
+    state["execution_config"].update(run_purpose="diagnostic_replay", diagnostic_replay={
+        "schema_version": "diagnostic-replay-v1", "sources": {"history": str(source["executor"].store.root)},
+        "bindings": {}})
+    state["execution_config"]["structured_provider"]["mode"] = "diagnostic_mixed"
+    state["config_hash"] = digest(state["execution_config"])
+    atomic_json(source["executor"].store.run_dir(source["run"]) / "state.json", state)
+    failed_without_http(target_run(source))
+
+
+def test_current_run_identity_is_never_loaded_as_its_own_source(mixed_source):
+    from company_bid.diagnostic_replay import DiagnosticReplay
+    from company_bid.provider import ProviderFailure
+    source = mixed_source
+    adapter = DiagnosticReplay({}, None)
+    root = source["executor"].store.root.resolve()
+    adapter.roots = {"current": root}
+    adapter._target = (root, source["run"])
+    before = snapshot(source["executor"].store.run_dir(source["run"]))
+    with pytest.raises(ProviderFailure, match="DIAGNOSTIC_REPLAY_SOURCE_CURRENT_RUN"):
+        adapter._run("current", source["run"])
+    assert snapshot(source["executor"].store.run_dir(source["run"])) == before
+
+
+def test_bad_mixed_metadata_blocks_an_earlier_undeclared_live_window(mixed_source):
+    source = mixed_source
+    replace_capture(source, "diagnostic-replay-preflight", lambda value: value.update(publication_status="published"))
+    spec = mixed_replay_config(source)
+    del spec["bindings"]["extract_requirements:" + source["unit_ids"][0]]
+    failed_without_http(target_run(source, spec=spec,
+        transport=lambda wire: response(candidate(json.loads(wire["messages"][-1]["content"])))))
+
+
+@pytest.mark.parametrize("schema", ["validation-repair-v5", "validation-repair-v6", "validation-repair-v7"])
+def test_correction_relation_versions_keep_the_same_full_lineage_contract(source_repaired, schema):
+    replace_capture(source_repaired, "validation-repair-result-", lambda value: value.update(schema_version=schema))
+    replace_capture(source_repaired, "validation-repair-scheduled-", lambda value: value.update(schema_version=schema))
+    executor, run, state, calls, _ = target_run(source_repaired)
+    assert state["status"] == "succeeded", state.get("error_code")
+    assert calls == [] and "call_budget" not in state
+    assert len(executor.output(run)["diagnostic_replay"]["origins"][0]["calls"]) == 2
+
+
+@pytest.mark.parametrize("schema", ["validation-repair-v4", "validation-repair-v8"])
+def test_unknown_correction_relation_schema_never_falls_back_to_http(source_repaired, schema):
+    replace_capture(source_repaired, "validation-repair-result-", lambda value: value.update(schema_version=schema))
+    replace_capture(source_repaired, "validation-repair-scheduled-", lambda value: value.update(schema_version=schema))
+    failed_without_http(target_run(source_repaired))
 

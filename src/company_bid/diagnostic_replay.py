@@ -50,9 +50,28 @@ def _without_paths(value):
     return value
 
 
-def _options(config):
+def _options(config, state=None):
     options = config.get("structured_provider") or config.get("provider", {})
-    _require(options.get("mode") == "chat_completions", "SOURCE_PROVIDER_INVALID")
+    mode = options.get("mode")
+    _require(mode in {"chat_completions", "diagnostic_mixed"}, "SOURCE_PROVIDER_INVALID")
+    if mode == "diagnostic_mixed":
+        # Only options are normalized. Diagnostic provenance must remain
+        # explicit in the frozen source run and be proved again per live unit.
+        _require(isinstance(state, dict) and state.get("status") in {"succeeded", "failed"},
+                 "SOURCE_NOT_SEALED")
+        _require(config.get("run_purpose") == "diagnostic_replay" and
+                 config.get("debug_capture", True) is True and state.get("capture_policy") is True and
+                 state.get("artifact_scope") == "diagnostic", "SOURCE_DIAGNOSTIC_PURPOSE_INVALID")
+        _require(state.get("execution_config") == config and state.get("config_hash") == digest(config),
+                 "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+        spec = config.get("diagnostic_replay")
+        _require(isinstance(spec, dict) and set(spec) == {"schema_version", "sources", "bindings"} and
+                 spec.get("schema_version") == SCHEMA_VERSION and isinstance(spec.get("sources"), dict) and
+                 bool(spec["sources"]) and isinstance(spec.get("bindings"), dict), "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+        attempts = state.get("execution_attempts", [])
+        _require(attempts and all(attempt.get("status") in {"succeeded", "failed", "paused_debug"} and
+                                 attempt.get("ended_at") and attempt.get("trace_status") == "captured"
+                                 for attempt in attempts), "SOURCE_NOT_SEALED")
     return ChatConfig(**{key: value for key, value in options.items()
                          if key not in {"mode", "validation_repair_attempts"}})
 
@@ -73,7 +92,9 @@ class _OriginRun:
         from .diagnostics import inspect_diagnostics
         report = inspect_diagnostics(root, run_id)
         _require(not report["gaps"] and report["capture_policy"], "SOURCE_DIAGNOSTICS_INCOMPLETE")
-        self.config = _options(self.state["execution_config"])
+        self.config = _options(self.state["execution_config"], self.state)
+        options = self.state["execution_config"].get("structured_provider") or self.state["execution_config"].get("provider", {})
+        self.mixed_source = options.get("mode") == "diagnostic_mixed"
 
     def _file(self, name):
         path = self.store.run_dir(self.run_id) / name
@@ -150,6 +171,41 @@ class _OriginRun:
         _require(item.get("hash") == item["ref"]["sha256"])
         return self.artifact(item["ref"])
 
+    def actual_mixed_unit(self, node, unit_id, attempt, task, captures):
+        """A replay-only checkpoint cannot become a new actual-call source."""
+        _require(node["key"] == "N2", "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+        spec = self.state["execution_config"]["diagnostic_replay"]
+        _require("extract_requirements:" + unit_id not in spec["bindings"], "SOURCE_ACTUAL_CALL_REQUIRED")
+        _require(not any(item["name"] in {"diagnostic-replay-candidate", "diagnostic-replay-validation"}
+                         for item in captures), "SOURCE_ACTUAL_CALL_REQUIRED")
+        node_attempt = _one(item for item in node["attempts"] if item["attempt_id"] == attempt["node_attempt_id"])
+        preflight_ref = _one(item for item in node_attempt.get("captures", [])
+                             if item["name"] == "diagnostic-replay-preflight")
+        _require(preflight_ref.get("status") == "captured" and preflight_ref.get("unit_id") is None and
+                 preflight_ref.get("unit_attempt_id") is None and
+                 preflight_ref.get("node_attempt_id") == attempt["node_attempt_id"] and
+                 preflight_ref.get("trace_id") == node_attempt.get("trace_id") == attempt["trace_id"],
+                 "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+        preflight = self.capture([preflight_ref], "diagnostic-replay-preflight")
+        _require(preflight.get("schema_version") == SUMMARY_VERSION and preflight.get("diagnostic_only") is True and
+                 preflight.get("publication_status") == "diagnostic_only" and
+                 preflight.get("binding_count") == preflight.get("verified_binding_count") == len(spec["bindings"]) and
+                 isinstance(preflight.get("origins"), list) and len(preflight["origins"]) == len(spec["bindings"]) and
+                 preflight.get("historical_calls_charged_again") == 0, "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+        for key, binding in spec["bindings"].items():
+            _require(isinstance(binding, dict) and set(binding) == {"alias", "run_id", "node_key", "unit_id"} and
+                     binding["alias"] in spec["sources"] and _id(binding["run_id"]) and
+                     binding["node_key"] in {"N2", "N2_WINDOW_DIAGNOSTIC"} and
+                     key == "extract_requirements:" + binding["unit_id"], "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+            origin = _one(item for item in preflight["origins"] if isinstance(item, dict) and
+                          (item.get("source_alias"), item.get("run_id"), item.get("node_key"), item.get("unit_id")) ==
+                          (binding["alias"], binding["run_id"], binding["node_key"], binding["unit_id"]))
+            _require(origin.get("external_call") is False and isinstance(origin.get("calls"), list) and
+                     origin["calls"], "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+        miss = self.capture(captures, "diagnostic-replay-live-miss")
+        _require(miss == {"unit_id": unit_id, "request_sha256": digest(task), "diagnostic_only": True,
+                          "reason": "key_not_declared"}, "SOURCE_DIAGNOSTIC_METADATA_INVALID")
+
     def call(self, node, unit_id, attempt, call_id, call_attempt, *, passed):
         _require(_id(call_id) and type(call_attempt) is int and call_attempt == 1, "LINEAGE_UNSUPPORTED")
         captures = self.captures(node, unit_id, attempt)
@@ -219,6 +275,7 @@ class DiagnosticReplay:
 
     def _run(self, alias, run_id):
         _require(alias in self.roots, "CONFIG_INVALID")
+        _require((self.roots[alias], run_id) != self._target, "SOURCE_CURRENT_RUN")
         key = alias, run_id
         if key not in self._runs:
             self._runs[key] = _OriginRun(alias, self.roots[alias], run_id)
@@ -314,6 +371,8 @@ class DiagnosticReplay:
         node, unit, payload, data, attempt = run.unit(binding["node_key"], binding["unit_id"])
         _require(payload == {key: value for key, value in task.items() if key != "task_type"}, "REQUEST_MISMATCH")
         captures = run.captures(node, unit["unit_id"], attempt)
+        if run.mixed_source:
+            run.actual_mixed_unit(node, unit["unit_id"], attempt, task, captures)
         completed = [event for event in run.events if event.get("event") == "call.completed" and
                      event.get("unit_attempt_id") == attempt["attempt_id"] and
                      event.get("node_attempt_id") == attempt["node_attempt_id"]]
@@ -333,7 +392,7 @@ class DiagnosticReplay:
             else:
                 relation_ref = _one(relations)
                 relation = run.capture(captures, relation_ref["name"])
-                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6"} and
+                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7"} and
                          relation.get("status") == "completed" and relation.get("unit_id") == unit["unit_id"] and
                          relation.get("repair_attempt") == 1 and relation.get("second_call_started") is True, "LINEAGE_INVALID")
                 first = run.call(node, unit["unit_id"], attempt, relation["first_call_id"], relation["first_call_attempt"], passed=False)
@@ -419,6 +478,7 @@ class DiagnosticReplay:
                      ctx.execution_config.get("debug_capture", True) and
                      getattr(ctx, "artifact_scope", "diagnostic") == "diagnostic", "PURPOSE_REQUIRED")
             _require(ctx.node_key == "N2", "TASK_NOT_ALLOWED")
+            self._target = (ctx.executor.store.root.resolve(), ctx.run_id)
             config = self.config
             _require(isinstance(config, dict) and set(config) == {"schema_version", "sources", "bindings"} and
                      config["schema_version"] == SCHEMA_VERSION and isinstance(config["sources"], dict) and

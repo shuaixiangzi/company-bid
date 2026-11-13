@@ -76,6 +76,192 @@ _CELL_LABEL_REPAIR_INSTRUCTIONS = (
     "同时仍须按resolution_groups完整追加处理相邻来源组；仅修标签不能清除任何未决。"
     "不确定的实质内容仍须保持未决，第二个错误不在此纠正授权内；返回完整JSON接受原校验。"
 )
+_MATERIAL_HEADING_REPAIR_INSTRUCTIONS = (
+    "上一候选将完整原格式中的两个材料类别小标题列为未决。程序只证明这些原字标题属于同一资格审查材料"
+    "容器及其完整编号子结构，不证明资格已满足，也不证明引用题名、资格门槛或公司资料已经核验。"
+    "保留原候选全部requirements、format_chapters的原顺序、来源选择、字段及默认值；仅在requirements尾部"
+    "按resolution_groups原序逐项追加两个材料类别待补要求，每项citation.block_ids只含该组的一个完整原字标题，"
+    "clause_id和table_row_id均为null。各项完整填写required_response_fields：qualification/factual_response、"
+    "mandatory=true、confidence=low、not_prescribed、format_title=null、三类labels/keywords=[]。"
+    "这些是需要补充有来源事实和材料的响应要求，不能改为procedure或符合结论，不能猜证书名称、等级、金额、"
+    "日期、事实值、证明形式或适用豁免。原父说明中的引用题名逐字保留并保持未核对，不自行把第三部分解释为第一章。"
+    "只有这两个完整标题各有一项新增要求后，才可从原unresolved_block_ids移除各自ID；所有相邻窗未决ID"
+    "原序保留，不能借此吞掉其后实质条款、条件、否定或声称相邻窗口已处理。"
+    "仍按原output_contract及完整来源校验；存在来源不完整或其它冲突时保留未决并停止。返回完整JSON。"
+)
+_MATERIAL_RESPONSE_FIELDS = {
+    "category": "qualification", "response_mode": "factual_response", "mandatory": True,
+    "confidence": "low", "format_status": "not_prescribed", "format_title": None,
+    "required_fact_labels": [], "attachment_keywords": [], "reference_keywords": [],
+}
+
+
+def _material_heading_resolution_groups(candidate: dict, window: dict) -> list | None:
+    """Recognize one complete qualification-material *format* source family.
+
+    This is deliberately narrower than recognizing the word 'materials'. The
+    format chapter, catalogued parent, original common instruction, six ordered
+    material siblings, and preserved native performance form must all agree.
+    The two empty sibling bodies yield pending factual responses, never proof
+    of qualification or an inferred obligation from an arbitrary bare heading.
+    """
+    from .extraction import _LiveWindowResponse
+
+    try:
+        _LiveWindowResponse.model_validate(candidate, strict=True)
+        if (window.get("source_format") != "pdf" or candidate.get("format_status") != "specified" or
+                not re.fullmatch(r"[a-f0-9]{64}", str(window.get("source_sha256", ""))) or
+                window["source_sha256"] == "0" * 64 or
+                any(item.get("format_status") in {"unread", "conflict"} for item in candidate["requirements"]) or
+                any(item.get("status", "prescribed") in {"unread", "conflict"} for item in candidate["format_chapters"])):
+            return None
+        blocks = [*window["blocks"], *window.get("adjacent_context", [])]
+        available = {block["block_id"]: block for block in blocks}
+        targets = {block["block_id"] for block in window["blocks"]}
+        adjacent = {block["block_id"] for block in window.get("adjacent_context", [])}
+        skips = {row.get("block_id") for row in window.get("safe_skip_blocks", [])}
+        unresolved = candidate["unresolved_block_ids"]
+        if (len(available) != len(blocks) or len(set(unresolved)) != len(unresolved) or
+                not set(unresolved) <= targets | adjacent):
+            return None
+        parents = [(block, re.fullmatch(r"([1-9]\d*)[.、．]?[ \t]*资格审查(?:材料|资料)", block.get("text", "")))
+                   for block in blocks if block.get("kind") == "paragraph"]
+        parents = [(block, match) for block, match in parents if match]
+        if len(parents) != 1:
+            return None
+        parent, parent_match = parents[0]
+        number = parent_match[1]
+        names = ("资质材料", "业绩材料", "财务要求材料", "信誉要求材料", "人员要求材料", "其他材料")
+        children = []
+        for index, name in enumerate(names, 1):
+            matches = [block for block in blocks if block.get("kind") == "paragraph" and re.fullmatch(
+                re.escape(number) + r"\." + str(index) + r"[、．.]?[ \t]*" + name + r"[：:]", block.get("text", ""))]
+            if len(matches) != 1:
+                return None
+            children.append(matches[0])
+        by_ordinal = {}
+        for block in blocks:
+            ordinal = block.get("ordinal")
+            if type(ordinal) is int:
+                by_ordinal.setdefault(ordinal, []).append(block)
+        def following(block):
+            values = by_ordinal.get(block["ordinal"] + 1, [])
+            return values[0] if len(values) == 1 else None
+        note, caption = following(parent), following(children[1])
+        if note is None or caption is None:
+            return None
+        reference = re.fullmatch(r"注[：:][ \t]*所有材料按照[“\"]([^”\"\r\n]{1,60})[”\"]中要求提供", note.get("text", ""))
+        if not reference or not re.fullmatch(r"(?:响应人|投标人)业绩统计表[（(]后附业绩材料[）)]", caption.get("text", "")):
+            return None
+        table = following(caption)
+        if table is None:
+            return None
+        span = [parent, note, children[0], children[1], caption, table, *children[2:]]
+        if any(right.get("ordinal") != left.get("ordinal") + 1 for left, right in zip(span, span[1:])):
+            return None
+        if (any(len(by_ordinal.get(block["ordinal"], [])) != 1 for block in span) or
+                {block["block_id"] for block in blocks if type(block.get("ordinal")) is int and
+                 parent["ordinal"] <= block["ordinal"] <= children[-1]["ordinal"]} != {block["block_id"] for block in span}):
+            return None
+        page, unit_id = parent.get("page"), parent.get("unit_id")
+        lines = []
+        for index, block in enumerate(span):
+            if (block.get("source_id") != window.get("source_id") or block.get("origin") != "native" or
+                    block.get("read_disposition") or block["block_id"] in skips or type(page) is not int or
+                    block.get("page") != page or not isinstance(unit_id, str) or not unit_id or
+                    block.get("unit_id") != unit_id or type(block.get("ordinal")) is not int or
+                    type(block.get("unit_ordinal")) is not int or
+                    block["unit_ordinal"] != parent["unit_ordinal"] + index):
+                return None
+            if block is table:
+                if (block.get("kind") != "table" or not re.fullmatch(r"pdf/page\[" + str(page) + r"\]/table\[\d+\]", block.get("locator", "")) or
+                        block.get("text_basis") != "table_rows_tsv_v1"):
+                    return None
+            else:
+                match = re.fullmatch(r"pdf/page\[" + str(page) + r"\]/line\[(\d+)\]", block.get("locator", ""))
+                if (not match or block.get("kind") != "paragraph" or not block.get("text", "").strip() or
+                        "\n" in block["text"] or "\r" in block["text"]):
+                    return None
+                lines.append(int(match[1]))
+        if any(right != left + 1 for left, right in zip(lines, lines[1:])):
+            return None
+        rows = table.get("rows")
+        if (not isinstance(rows, list) or len(rows) < 2 or not all(isinstance(row, list) for row in rows) or
+                not 3 <= len(rows[0]) <= 12 or any(len(row) != len(rows[0]) for row in rows) or
+                not all(isinstance(cell, str) for row in rows for cell in row) or
+                not {"序号", "项目名称"} <= set(rows[0]) or any(cell for row in rows[1:] for cell in row) or
+                table.get("text") != "\n".join("\t".join(row) for row in rows)):
+            return None
+        # Check the catalogued source hierarchy, rather than guessing parentage
+        # from a label. An intervening unknown chapter defeats the format role.
+        catalog = window.get("source_heading_catalog", [])
+        parent_catalog = [item for item in catalog if item.get("block_id") == parent["block_id"]]
+        if len(parent_catalog) != 1:
+            return None
+        parent_entry = parent_catalog[0]
+        if any(parent_entry.get(key) != parent.get(key) for key in ("source_id", "locator", "page")) or parent_entry.get("title") != parent["text"]:
+            return None
+        def catalog_position(item):
+            match = re.fullmatch(r"pdf/page\[(\d+)\]/line\[(\d+)\]", str(item.get("locator", "")))
+            return (int(match[1]), int(match[2])) if match and item.get("page") == int(match[1]) else None
+        parent_position = catalog_position(parent_entry)
+        chapters = [(catalog_position(item), item) for item in catalog
+                    if re.match(r"第[一二三四五六七八九十百\d]+章", str(item.get("title", ""))) and
+                    catalog_position(item) is not None and parent_position is not None and catalog_position(item) < parent_position]
+        if not chapters:
+            return None
+        latest = max(position for position, _ in chapters)
+        ancestors = [item for position, item in chapters if position == latest]
+        if len(ancestors) != 1:
+            return None
+        ancestor = ancestors[0]
+        if not re.fullmatch(r"第[一二三四五六七八九十百\d]+章[ \t]*(?:响应|投标)文件(?:要求及)?格式", ancestor.get("title", "")):
+            return None
+        for entry in (ancestor, parent_entry):
+            if (entry.get("source_id") != window["source_id"] or not isinstance(entry.get("block_id"), str) or
+                    entry.get("quote_sha256") != hashlib.sha256(entry["title"].encode()).hexdigest()):
+                return None
+        # These are already source-checked inventory items. Their identity is
+        # part of the repair proof, and the generic guard protects them verbatim.
+        parent_items = [index for index, item in enumerate(candidate["requirements"])
+                        if item.get("category") == "qualification" and item.get("response_mode") in {"attachment", "factual_response"} and
+                        item.get("citation", {}).get("block_ids") == [parent["block_id"], note["block_id"]]]
+        table_items = [index for index, item in enumerate(candidate["requirements"])
+                       if item.get("category") == "qualification" and item.get("response_mode") == "table" and
+                       item.get("format_status") == "prescribed" and item.get("format_title") == caption["text"] and
+                       item.get("citation", {}).get("block_ids") == [children[1]["block_id"], caption["block_id"], table["block_id"]]]
+        if len(parent_items) != 1 or len(table_items) != 1:
+            return None
+        formats = [index for index, item in enumerate(candidate["format_chapters"])
+                   if item.get("title") == caption["text"] and
+                   item.get("citation", {}).get("block_ids") == [caption["block_id"], table["block_id"]] and
+                   item.get("content_block_ids") == [caption["block_id"], table["block_id"]] and
+                   item.get("requirement_indices") == table_items]
+        critical = [child["block_id"] for child in (children[0], children[2])]
+        if (len(formats) != 1 or set(unresolved) & targets != set(critical) or
+                not set(critical) <= targets or any(key not in adjacent for key in set(unresolved) - set(critical))):
+            return None
+        # Never erase unread/foreign adjacent content by treating it as a handoff.
+        if any(available[key].get("origin") != "native" or available[key].get("kind") != "paragraph" or
+               available[key].get("source_id") != window["source_id"] or available[key].get("read_disposition") or key in skips
+               for key in set(unresolved) - set(critical)):
+            return None
+        proof = {"rule": "native_qualification_material_format_siblings_v1", "window_id": window["window_id"],
+                 "source_id": window["source_id"], "source_sha256": window["source_sha256"],
+                 "context_identity": window.get("context_identity"), "format_ancestor": copy.deepcopy(ancestor),
+                 "parent_heading": copy.deepcopy(parent_entry), "reference_title": reference[1],
+                 "reference_resolution_status": "not_resolved", "semantic_review": "requires_source_review",
+                 "parent_requirement_index": parent_items[0], "performance_requirement_index": table_items[0],
+                 "performance_format_index": formats[0],
+                 "blocks": [{**{key: block[key] for key in ("block_id", "source_id", "locator", "page", "ordinal", "unit_id", "unit_ordinal")},
+                             "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()} for block in span],
+                 "performance_grid_sha256": digest({key: table.get(key, []) for key in ("rows", "merges", "column_widths", "header_rows")})}
+        return [{"resolution_kind": "qualification_material_category_heading", "block_ids": [key],
+                 "required_target_ids": [key], "basis": "native_complete_numbered_qualification_material_format",
+                 "required_response_fields": copy.deepcopy(_MATERIAL_RESPONSE_FIELDS),
+                 "source_proof": copy.deepcopy(proof), "source_proof_sha256": digest(proof)} for key in critical]
+    except (ValidationError, KeyError, TypeError, ValueError, AttributeError):
+        return None
 
 
 def _literal_placeholder_resolution_groups(candidate: dict, window: dict) -> list | None:
@@ -510,6 +696,8 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
         groups = _adjacent_resolution_groups(candidate, window, source_witnesses)
         if groups is None:
             groups = _literal_placeholder_resolution_groups(candidate, window)
+        if groups is None and not source_witnesses:
+            groups = _material_heading_resolution_groups(candidate, window)
         if groups is None:
             return None
         coverage["resolution_groups"] = groups
@@ -662,6 +850,18 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
         original = coverage["original_unresolved_block_ids"]
         groups = coverage["resolution_groups"]
         added = candidate["requirements"][coverage["counts"]["requirements"]:]
+        material_groups = [group for group in groups if group.get("resolution_kind") == "qualification_material_category_heading"]
+        if material_groups:
+            if len(material_groups) != len(groups) or len(groups) != 2 or len(added) != 2:
+                return False
+            for item, group in zip(added, groups):
+                if (group.get("required_response_fields") != _MATERIAL_RESPONSE_FIELDS or
+                        group.get("source_proof_sha256") != digest(group.get("source_proof")) or
+                        item.get("citation", {}).get("block_ids") != group["block_ids"] or
+                        item["citation"].get("clause_id") or item["citation"].get("table_row_id") or
+                        any(field not in item or item[field] != value for field, value in _MATERIAL_RESPONSE_FIELDS.items()) or
+                        _valid_repair_fields(item, _Requirement, {"citation"}) != _MATERIAL_RESPONSE_FIELDS):
+                    return False
         resolved = set()
         for item in added:
             selected = item.get("citation", {}).get("block_ids", []) if isinstance(item, dict) else []
@@ -743,7 +943,10 @@ def _repair_capture(ctx, name, value):
 
 def _validation_repair_request(request, code, context, coverage, call_id, attempt=1):
     """Shared wire builder for live correction and a provenance-labelled probe."""
-    instructions = (_TITLE_REPAIR_INSTRUCTIONS if code == "FORMAT_TITLE_NOT_GROUNDED" else
+    instructions = (_MATERIAL_HEADING_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+                    any(group.get("resolution_kind") == "qualification_material_category_heading"
+                        for group in coverage.get("resolution_groups", [])) else
+                    _TITLE_REPAIR_INSTRUCTIONS if code == "FORMAT_TITLE_NOT_GROUNDED" else
                     _LITERAL_NOTE_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
                     any(group.get("resolution_kind") == "read_literal_source_note"
                         for group in coverage.get("resolution_groups", [])) else
@@ -826,7 +1029,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise
         if first_context.capture_failed or getattr(ctx, "_capture_failed", False):
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-        relation = {"schema_version": "validation-repair-v6", "unit_id": unit_id, "task_type": task_type,
+        relation = {"schema_version": "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],

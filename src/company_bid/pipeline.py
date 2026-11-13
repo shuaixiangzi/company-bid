@@ -22,8 +22,19 @@ class PipelineFailure(RuntimeError):
 
 
 def _version(*names: str) -> str:
+    # Node-owned helpers are explicit transitive inputs. Extending an N3 helper
+    # must invalidate N3 without relabeling unchanged N0/N1/N2 implementations.
+    dependencies = {"planning.py": ("plan_component_controls.py", "project_constraint_runtime.py"),
+                    "pipeline.py": ("project_constraint_runtime.py",),
+                    "project_constraint_runtime.py": ("project_constraints.py",),
+                    "project_constraints.py": ("table_continuations.py",)}
+    expanded = list(dict.fromkeys(names))
+    for name in expanded:
+        for dependency in dependencies.get(name, ()):
+            if dependency not in expanded:
+                expanded.append(dependency)
     digest = hashlib.sha256()
-    for name in names:
+    for name in expanded:
         digest.update(name.encode() + b"\0")
         digest.update((Path(__file__).parent / name).read_text(encoding="utf-8").encode("utf-8"))
     digest.update(platform.python_version().encode())
@@ -70,6 +81,9 @@ def build_executor(root: Path, config: dict) -> Executor:
 
     def draft(ctx, value):
         prepared = PreparedBid.model_validate(value["prepared"])
+        from .project_constraint_runtime import (load_project_constraints, validate_project_constraint_context,
+                                                project_constraint_trace_bindings)
+        project_constraints = load_project_constraints(ctx, prepared.model_dump(mode="json"))
         provider_options = ctx.execution_config.get("provider", {"mode": "prepared"})
         if provider_options["mode"] == "prepared":
             provider = PreparedProposalProvider(value["proposals"])
@@ -98,7 +112,13 @@ def build_executor(root: Path, config: dict) -> Executor:
                 context = {"section_id": task.unit_id, "title": task.title,
                            "writing_task": task.model_dump(mode="json"), "reference_excerpts": references,
                            "source_contexts": source_contexts}
+                if project_constraints is not None:
+                    import copy
+                    context["project_constraints"] = copy.deepcopy(project_constraints["plan"]["tasks"][task.unit_id])
+                    validate_project_constraint_context(task.model_dump(mode="json"), context, project_constraints)
+                project_source_refs = list(dict.fromkeys(item["source_id"] for item in context.get("project_constraints", [])))
                 source_ids = {ref["source_id"] for ref in references}
+                source_ids.update(project_source_refs)
                 source_ids.update(ref for requirement in task_requirements for ref in requirement["source_refs"])
                 source_ids.update(ref for item in source_contexts for ref in item["source_refs"])
                 source_ids.update(ref for table_id in task.table_refs for ref in tables[table_id].source_refs)
@@ -107,14 +127,19 @@ def build_executor(root: Path, config: dict) -> Executor:
                               "tables": [tables[ref].model_dump(mode="json") for ref in task.table_refs],
                               "source_context_proof_hashes": context_proof_hashes,
                               "provider": provider_options, "proposal": value["proposals"].get(task.unit_id)}
+                if project_constraints is not None:
+                    task_input["project_constraint_artifact_refs"] = project_constraints["artifact_refs"]
+                    task_input["project_constraint_plan_sha256"] = project_constraints["plan_sha256"]
 
                 def write_task(task=task, context=context, task_requirements=task_requirements,
                                plan=plan, references=references, source_contexts=source_contexts,
-                               context_proof_hashes=context_proof_hashes):
+                               context_proof_hashes=context_proof_hashes, project_source_refs=project_source_refs):
+                    project_constraint_checks = validate_project_constraint_context(task.model_dump(mode="json"), context,
+                                                                                   project_constraints)
                     proposal = provider.generate(ctx, context, task_requirements)
                     source_refs = list(dict.fromkeys([*(item["source_id"] for item in references),
                         *(ref for requirement in task_requirements for ref in requirement["source_refs"]),
-                        *(ref for item in source_contexts for ref in item["source_refs"])]))
+                        *(ref for item in source_contexts for ref in item["source_refs"]), *project_source_refs]))
                     blocks = [HeadingBlock(text=task.title, level=plan.level + 1,
                                            requirement_refs=task.requirement_refs, source_refs=source_refs)]
                     for paragraph in proposal.paragraphs:
@@ -133,6 +158,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                                        "coverage": [item.model_dump(mode="json") for item in proposal.coverage],
                                        "source_context_refs": task.source_context_refs,
                                        "source_context_proof_hashes": context_proof_hashes,
+                                       "project_constraint_bindings": project_constraint_checks,
+                                       "project_constraint_source_refs": project_source_refs,
                                        "context_review_status": "not_checked" if source_contexts else "not_applicable",
                                        "semantic_status": "requires_source_review"}}
 
@@ -190,12 +217,23 @@ def build_executor(root: Path, config: dict) -> Executor:
                 "input_kind": prepared.input_kind,
                 "chain_diagnostics": value.get("chain_diagnostics", {}),
                 "writing_review": writing_review, "expected_table_ids": list(tables),
+                "expected_project_constraint_bindings": project_constraint_trace_bindings(project_constraints),
                 "expected_table_links": {table_id: {"section_id": table.section_id,
                     "requirement_refs": list(table.requirement_refs)} for table_id, table in tables.items()},
                 "generation_mode": provider_options["mode"], "external_model_verified": provider_options["mode"] == "chat_completions"}
 
     def check(ctx, value):
         package = DocumentPackage.model_validate(value["package"])
+        from .project_constraint_runtime import load_project_constraints, project_constraint_trace_bindings
+        project_constraints = load_project_constraints(ctx)
+        expected_project_constraints = project_constraint_trace_bindings(project_constraints)
+        if expected_project_constraints is not None:
+            reviews = value.get("writing_review", [])
+            actual_project_constraints = {item["unit_id"]: item.get("project_constraint_bindings") for item in reviews}
+            if (len(actual_project_constraints) != len(reviews) or
+                    value.get("expected_project_constraint_bindings") != expected_project_constraints or
+                    actual_project_constraints != expected_project_constraints):
+                raise PipelineFailure("PROJECT_CONSTRAINT_REVIEW_BINDING_MISSING_OR_CHANGED")
         # Revalidate source bytes immediately before rendering. Source refs are not
         # semantic proof: the scoped human source review is recorded separately.
         for source in [*package.sources, *package.attachments]:
@@ -236,6 +274,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                   "review_actions": [item.model_dump(mode="json") for item in package.review_actions],
                   "pending_review_count": len(package.review_actions),
                   "source_context_review": [], "pending_context_review_count": 0,
+                  "project_constraint_bindings": expected_project_constraints,
+                  "project_constraint_compliance": "requires_source_review" if project_constraints is not None else "not_recorded",
                   "requirement_coverage": []}
         actions_by_requirement = {ref: action for action in package.review_actions for ref in action.requirement_refs}
         nonbody_requirements = {item.requirement_id for item in package.requirements if item.response_mode == "procedure"}

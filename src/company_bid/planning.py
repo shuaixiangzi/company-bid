@@ -24,9 +24,11 @@ from .extraction import (
 )
 from .table_continuations import build_table_continuations, build_table_row_catalog
 from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
+from .plan_component_controls import collect_plan_controls, component_targets
+from .project_constraint_runtime import plan_project_constraints
 
 
-PLANNING_VERSION = "bid-plan-v20"
+PLANNING_VERSION = "bid-plan-v21"
 
 
 class _Fill(_Strict):
@@ -991,6 +993,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         existing_ids = {item["requirement_id"] for item in extracted["requirements"]}
         _fail(any(item["requirement_id"] in existing_ids for item in derived_requirements), "PREPARATION_SOURCE_RULE_CONFLICT")
         planned_requirements = [*extracted["requirements"], *derived_requirements]
+        source_controls = collect_plan_controls(planned_requirements, blocks, units, documents, _native_source_span)
+        global_control_ids = {item["requirement_id"] for item in source_controls["global_controls"]}
+        global_control_handling = []
+        _capture(ctx, "n3-source-component-controls", {"producer_version": PLANNING_VERSION,
+            **source_controls, "n2_candidate_mutation": False,
+            "n2_requirements_sha256": _hash(extracted["requirements"]), "status": "source_proven_pending_review"})
         _capture(ctx, "n3-preparation-source-rules", {"producer_version": PLANNING_VERSION,
             "derived_requirements": derived_requirements, "rules": list(source_rules.values()),
             "n2_candidate_mutation": False, "n2_requirements_sha256": _hash(extracted["requirements"]),
@@ -1352,6 +1360,25 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 detail = details[rid]
                 placements.append({"requirement_id": rid, "section_id": section["section_id"],
                                    "response_mode": detail["response_mode"], "render_body": section["render_body"]})
+                if rid in global_control_ids:
+                    requirement = next(item for item in requirements if item["requirement_id"] == rid)
+                    _fail(bool(requirement.get("source_contexts")), "GLOBAL_CONTROL_CONTEXT_UNRESOLVED")
+                    # Preserve the complete original rule as neutral source and
+                    # an explicit pending control. In particular this remains a
+                    # facts section, avoiding N4's task-less technical fallback.
+                    section["render_body"] = True
+                    section["fixed_content"].append({"kind": "paragraph",
+                        "text": "关键条款全局规则（招标原文）：\n" + detail["text"],
+                        "source_refs": requirement["source_refs"]})
+                    marker = issue(section, [rid], "关键条款逐项响应及证据待核对",
+                        "本条仅规定全局响应规则，不是可独立起草的实施方法；尚未核验具体关键条款及相应证据。",
+                        "按完整招标原文逐项定位实际关键条款、响应和所需证明；未定位或缺响应的项目保留待补，不以通用承诺代替。")
+                    next(item for item in issues if item["issue_id"] == marker)["severity"] = "warning"
+                    global_control_handling.append({"requirement_id": rid, "section_id": section["section_id"],
+                        "issue_id": marker, "decision": "original_rule_preserved_as_pending_control",
+                        "writing_unit_ids": [], "n2_candidate_mutation": False,
+                        "satisfaction_status": "not_determined"})
+                    continue
                 if rid.startswith("R-FORM-") or detail["response_mode"] == "procedure":
                     continue
                 if section_formats.get(section["section_id"]) in {"unread", "conflict"}:
@@ -1460,6 +1487,66 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                                      any(item["section_id"] == section["section_id"] for item in issues))):
                 issue(section, section["requirement_refs"], "指定章节内容待补", "已定位章节标题，但没有可装配的正文、原表或证明内容。", "补充该章节原始格式与资料后重新读取。")
 
+        component_matrix = []
+        linked_formats = [{**chapter, "planned_section_id": _id("SEC-", chapter["format_id"])}
+                          for chapter in planned_formats]
+        for group in source_controls["component_groups"]:
+            for component in group["components"]:
+                targets = component_targets(component, group, linked_formats, sections, tables, issues, _title_key, blocks)
+                source_ref = scoped_source(component["citation"])
+                section = new_section([group["group_id"], component["number"]],
+                    component["source_name"] + "：响应组成待核对", group["requirement_refs"], source_refs=[source_ref])
+                section["fixed_content"].append({"kind": "paragraph",
+                    "text": "响应组成要求（招标原文）：\n" + component["source_text"], "source_refs": [source_ref]})
+                conditional = component["component"] in {"authorization", "joint_bid"}
+                additional = component["component"] == "other_materials"
+                reason = ("原文为条件性组成项；尚未根据本项目明确输入核验签署或联合体适用性，不能据资料缺少推定不适用。"
+                          if conditional else "本项需与前附表及独立的具体资料要求逐项核对；兜底清单不能证明存在额外证明要求，也不能证明资料齐备。"
+                          if additional else "已列出候选原格式落点，仍须核对实际响应、空白字段及证明；标题或空表不代表该组成项已完成。"
+                          if targets else "尚无已证成的独立组件正文或资料落点；组成清单和程序待办本身不能代替响应。")
+                marker = issue(section, group["requirement_refs"], component["source_name"] +
+                    ("适用性待核对" if conditional else "范围及完整性待核对" if additional else
+                     "完整响应待核对" if targets else "响应内容待补"), reason,
+                    "逐项核对本项实际正文、原格式和资料；缺项补有来源内容，未知条件保留待核，不编造公司事实或履约承诺。")
+                next(item for item in issues if item["issue_id"] == marker).update(
+                    source_requirement=component["source_text"], severity="warning" if conditional or additional or targets else "missing")
+                row = {"group_id": group["group_id"], **component, "requirement_refs": group["requirement_refs"],
+                    "source_ref": source_ref, "section_id": section["section_id"], "format_candidates": targets,
+                    "issue_id": marker, "decision": "source_component_requires_explicit_review_or_missing_response",
+                    "reason": reason, "status": "pending_manual", "satisfaction_status": "not_determined"}
+                row["proof_sha256"] = _hash(row)
+                component_matrix.append(row)
+                placements.extend({"requirement_id": rid, "section_id": section["section_id"],
+                    "response_mode": details[rid]["response_mode"], "render_body": True} for rid in group["requirement_refs"])
+        conflict_handling = []
+        for conflict in source_controls["number_name_conflicts"]:
+            refs = conflict["requirement_refs"]
+            source_refs = list(dict.fromkeys(ref for item in requirements if item["requirement_id"] in refs
+                                            for ref in item["source_refs"]))
+            section = new_section(["source-number-conflict", conflict["proof_sha256"]],
+                "响应组成原文编号冲突待核对", refs, source_refs=source_refs)
+            marker = issue(section, refs, "第3.1.1（4）项名称与例外回指冲突",
+                "组成清单第（4）项为商务和技术偏差表，后文却将同一编号称为响应保证金；不得按错误编号删除偏差表。",
+                "保留商务及技术偏离表与两处原文，线下核对编号冲突；不静默改写招标要求，不据此判断保证金或公司响应已满足。")
+            next(item for item in issues if item["issue_id"] == marker)["severity"] = "warning"
+            conflict_handling.append({**conflict, "section_id": section["section_id"], "issue_id": marker,
+                                      "satisfaction_status": "not_determined"})
+            placements.extend({"requirement_id": rid, "section_id": section["section_id"],
+                "response_mode": details[rid]["response_mode"], "render_body": True} for rid in refs)
+        _capture(ctx, "n3-component-dispositions", {"producer_version": PLANNING_VERSION,
+            "items": component_matrix, "number_name_conflicts": conflict_handling,
+            "n2_candidate_mutation": False, "status": "pending_manual" if component_matrix else "not_needed"})
+        _capture(ctx, "n3-global-critical-controls", {"producer_version": PLANNING_VERSION,
+            "source_controls": source_controls["global_controls"], "handling": global_control_handling,
+            "marker_observations": [{"source_id": block["source_id"], "block_id": block["block_id"],
+                "locator": block["locator"], "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest(),
+                "requirement_refs": [raw["requirement_id"] for raw in planned_requirements if any(
+                    block["block_id"] in (citation.get("block_ids") or [citation["block_id"]]) for citation in raw["citations"])]}
+                for block in blocks.values() if block["source_id"] in {doc["source_id"] for doc in documents}
+                and re.search(r"[＊*★]", block["text"])],
+            "target_interpretation": "pending_source_review_markers_are_not_automatically_concrete_clauses",
+            "n2_candidate_mutation": False, "satisfaction_status": "not_determined"})
+
         requirement_map = {item["requirement_id"]: item for item in requirements}
         for section in sections:
             for rid in section["requirement_refs"]:
@@ -1515,6 +1602,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _capture(ctx, "n3-format-association-placement", {"items": association_placements, "errors": association_errors,
             "status": "failed" if association_errors else "mapped" if association_placements else "not_needed"})
         _fail(bool(association_errors), "JOINT_FORMAT_ASSOCIATION_INCOMPLETE")
+        project_constraints = plan_project_constraints(parsed, planned_requirements, manifest, sections)
+        _capture(ctx, "n3-project-constraints", project_constraints)
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
@@ -1539,6 +1628,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
                   "review_actions": review_actions,
+                  "component_dispositions": component_matrix, "component_number_conflicts": conflict_handling,
+                  "global_critical_controls": global_control_handling,
+                  "project_constraints": project_constraints,
                   "counts": {"requirements": len(requirements), "sections": len(sections), "writing_tasks": sum(len(s["writing_tasks"]) for s in sections),
                              "tables": len(tables), "attachments": len(attachments), "issues": len(issues),
                              "review_actions": len(review_actions), "pending_review": len(review_actions),
