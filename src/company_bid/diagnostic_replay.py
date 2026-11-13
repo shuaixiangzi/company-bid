@@ -264,6 +264,9 @@ class DiagnosticReplay:
         self._runs = {}
         self._loading = set()
         self._loaded_entries = {}
+        self._source_windows = {}
+        self._source_file_hashes = {}
+        self._source_file_paths = {}
         self._summary = {"schema_version": SUMMARY_VERSION, "diagnostic_only": True,
                          "publication_status": "diagnostic_only", "binding_count": 0,
                          "verified_binding_count": 0, "revalidated_count": 0, "live_miss_count": 0,
@@ -289,18 +292,52 @@ class DiagnosticReplay:
         for source in [*value["manifest"]["sources"], *value["manifest"].get("attachments", [])]:
             path = Path(source["path"]).resolve()
             _require(any(path.is_relative_to(root) for root in self.roots.values()), "SOURCE_REFERENCE_INVALID")
-            _require(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"])
+            self._verify_source_file(path, source["sha256"], source["path"])
         return value, node
+
+    def _verify_source_file(self, path, expected, source_path):
+        # A historical N1 may be used by many windows. Its original binaries
+        # are not consumed again by those window/proof builders; they operate
+        # on the authenticated checkpoint. Hash each distinct resolved path
+        # once, then hash ALL of them again before preflight releases any call.
+        # No mtime/size shortcut, cross-preflight cache or persistent assertion.
+        source_path = Path(source_path)
+        _require(source_path.resolve() == path and self._source_file_paths.get(source_path, path) == path,
+                 "SOURCE_CHANGED")
+        self._source_file_paths[source_path] = path
+        _require(path.is_file())
+        if path not in self._source_file_hashes:
+            _require(hashlib.sha256(path.read_bytes()).hexdigest() == expected)
+            self._source_file_hashes[path] = expected
+        _require(self._source_file_hashes[path] == expected)
+
+    def _seal_source_files(self):
+        for path, expected in self._source_file_hashes.items():
+            _require(path.resolve() == path and path.is_file() and
+                     hashlib.sha256(path.read_bytes()).hexdigest() == expected, "SOURCE_CHANGED")
+        # Preserve original manifest spellings too: a junction/symlink can be
+        # retargeted while its formerly resolved file remains intact.
+        for source_path, resolved in self._source_file_paths.items():
+            _require(source_path.resolve() == resolved, "SOURCE_CHANGED")
 
     def _source_window(self, run, payload, unit_id):
         from .extraction import _index, _windows, extraction_window_payload
         value, n1 = self._n1(run)
-        blocks, _, documents = _index(value["parsed"], value["manifest"])
-        windows, _ = _windows(documents, blocks, payload["window_config"])
+        # _n1 still authenticates the checkpoint bytes, complete data hash and
+        # project scope on EVERY lookup; originals are sealed before and after
+        # the complete preflight. Only deterministic
+        # indexing/window construction is shared within this preflight; this
+        # is neither a stored candidate nor a cross-execution validity cache.
+        key = n1["output_hash"], digest(payload["window_config"])
+        if key not in self._source_windows:
+            blocks, _, documents = _index(value["parsed"], value["manifest"])
+            self._source_windows[key] = _windows(documents, blocks, payload["window_config"])[0]
+        windows = self._source_windows[key]
         window = _one(window for window in windows if window["window_id"] == unit_id)
         _require(window == self.windows[unit_id] and extraction_window_payload(window, payload["window_config"]) == payload,
                  "SOURCE_WINDOW_MISMATCH")
-        return window, n1
+        # Correction proof builders must not be able to mutate another lookup.
+        return copy.deepcopy(window), n1
 
     def _wire(self, run, call, task):
         from .structured import SYSTEM_PROMPT, PROMPT_VERSION
@@ -579,6 +616,12 @@ class DiagnosticReplay:
     def preflight(self, ctx, value):
         self._ready = None
         self._entries = {}
+        self._runs = {}
+        self._loading = set()
+        self._loaded_entries = {}
+        self._source_windows = {}
+        self._source_file_hashes = {}
+        self._source_file_paths = {}
         try:
             _require(ctx.execution_config.get("run_purpose") == "diagnostic_replay" and
                      ctx.execution_config.get("diagnostic_replay") == self.config and
@@ -602,7 +645,7 @@ class DiagnosticReplay:
                 path = Path(source["path"]).resolve()
                 _require(path.is_relative_to(ctx.executor.store.root) or
                          any(path.is_relative_to(root) for root in self.roots.values()), "SOURCE_REFERENCE_INVALID")
-                _require(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"], "SOURCE_INVALID")
+                self._verify_source_file(path, source["sha256"], source["path"])
             from .extraction import _index, _windows, extraction_window_payload
             blocks, _, documents = _index(value["parsed"], value["manifest"])
             extraction = ctx.execution_config.get("extraction", {})
@@ -643,8 +686,11 @@ class DiagnosticReplay:
                                       "source_relative_path": path, "origin_sha256": hashlib.sha256(raw).hexdigest(),
                                       "snapshot": reference})
             self.snapshots = snapshots
+            self._seal_source_files()
             self._summary.update(verified_binding_count=len(self._entries),
-                                 origins=[entry["origin"] for entry in self._entries.values()], historical_evidence=snapshots)
+                                 origins=[entry["origin"] for entry in self._entries.values()], historical_evidence=snapshots,
+                                 source_file_verification={"policy": "full_hash_before_and_after_preflight",
+                                                           "distinct_paths": len(self._source_file_hashes)})
             self._capture(ctx, "diagnostic-replay-preflight", self._summary)
             ctx._observer.check()
             self._ready = (ctx.run_id, ctx.attempt_id, digest(ctx.execution_config))

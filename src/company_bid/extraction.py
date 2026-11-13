@@ -734,15 +734,22 @@ def _native_pdf_line_edge(left, right, column_right, source_sha256, source_forma
 def _native_pdf_line_edges(document, blocks):
     if document.get("format") != "pdf":
         return []
+    # Column geometry is local to a validated reading unit. Index its native
+    # paragraph boxes once instead of scanning the entire document per line.
+    # Keep their source order and the original height-dependent filter/max so
+    # every resulting edge and evidence hash remains byte-for-byte equivalent.
+    boxes_by_unit = {}
+    for block in blocks:
+        if block.get("kind") == "paragraph" and block.get("origin") == "native" and _valid_box(block.get("bbox")):
+            boxes_by_unit.setdefault(block.get("unit_id"), []).append(block["bbox"])
     edges = []
     for left, right in zip(blocks, blocks[1:]):
         box = left.get("bbox")
         if not _valid_box(box):
             continue
         height = box[3] - box[1]
-        peers = [block["bbox"][2] for block in blocks if block.get("unit_id") == left.get("unit_id") and
-                 block.get("kind") == "paragraph" and block.get("origin") == "native" and _valid_box(block.get("bbox")) and
-                 abs(block["bbox"][0] - box[0]) <= height * 2]
+        peers = [peer[2] for peer in boxes_by_unit.get(left.get("unit_id"), [])
+                 if abs(peer[0] - box[0]) <= height * 2]
         column_right = max(peers, default=box[2])
         edge = _native_pdf_line_edge(left, right, column_right, document["sha256"], document.get("format"))
         if edge:
