@@ -66,7 +66,7 @@ def test_historical_wire_still_rejects_every_value_or_call_parameter_change(chan
         replay._wire(run, call, task)
 
 
-def repair_case(tmp_path):
+def repair_case(tmp_path, *, with_source=False):
     candidate, request, parsed, manifest, witness = source_case(tmp_path)
     unit = parsed["documents"][0]["units"][0]
     rows = unit["blocks"]
@@ -102,7 +102,10 @@ def repair_case(tmp_path):
     resolved = {key for group in coverage["resolution_groups"] for key in group["block_ids"]}
     corrected["unresolved_block_ids"] = [key for key in corrected["unresolved_block_ids"] if key not in resolved]
     repair = _validation_repair_request(request, "LIVE_REQUIRED_BLOCK_UNRESOLVED", {}, coverage, "a" * 32)
-    return candidate, corrected, coverage, repair, current
+    result = candidate, corrected, coverage, repair, current
+    if with_source:
+        return (*result, {"parsed": parsed, "manifest": manifest}, witness, request)
+    return result
 
 
 def test_v11_removes_only_owner_duplicate_and_appends_pending_with_full_original_inventory(tmp_path):
@@ -252,3 +255,83 @@ def test_correction_wire_compares_algorithm_expected_not_just_itself(tmp_path, m
         assert actual == expected and digest(actual) != digest(expected)
         with pytest.raises(ProviderFailure, match="DIAGNOSTIC_REPLAY_REQUEST_MISMATCH"):
             replay._correction(object(), first, run, final, coverage, {}, {}, "LIVE_REQUIRED_BLOCK_UNRESOLVED")
+
+
+def standalone_context_case(tmp_path, monkeypatch, *, actual=None, sent=None):
+    original, corrected, coverage, _, window, source, witness, base = repair_case(tmp_path, with_source=True)
+    actual = {"field": "unresolved_block_ids"} if actual is None else actual
+    sent = {} if sent is None else sent
+    repair = _validation_repair_request(base, "LIVE_REQUIRED_BLOCK_UNRESOLVED", sent, coverage, "a" * 32)
+    replay, run, _, _ = wire_case()
+    replay.provider_config = run.config = ChatConfig(endpoint="https://example.invalid/chat", model="synthetic",
+        auth_env="UNUSED_SYNTHETIC_KEY", max_input_chars=100000)
+    run.run_id = "2" * 32
+    replay.current = source
+    monkeypatch.setattr(replay, "_n1", lambda run: (source, None))
+    monkeypatch.setattr(replay, "_witnesses", lambda *args: [])
+    monkeypatch.setattr(replay, "_completed_owner_witness", lambda *args: witness)
+    first = {"candidate": original, "task": base, "validation": {"diagnostic_context": actual},
+             "terminal": {"error_code": "LIVE_REQUIRED_BLOCK_UNRESOLVED"}, "call_id": "a" * 32, "call_attempt": 1}
+    final = {"task": repair, "request": build_json_request(replay.provider_config, repair, SYSTEM_PROMPT),
+             "terminal": {"prompt_version": PROMPT_VERSION, "model": replay.provider_config.model}, "candidate": corrected}
+    return replay, SimpleNamespace(run_id="1" * 32), first, run, final, coverage, window, sent
+
+
+def test_standalone_v11_omitted_redundant_field_is_explicit_and_preserves_actual_wire(tmp_path, monkeypatch):
+    args = standalone_context_case(tmp_path, monkeypatch)
+    replay, source, first, final_run, final, coverage, window, sent = args
+    before = copy.deepcopy((first, final, coverage, window))
+    notes = replay._correction(source, first, final_run, final, coverage, window, sent,
+        "LIVE_REQUIRED_BLOCK_UNRESOLVED", standalone_node_key="N2_WINDOW_DIAGNOSTIC")
+    note, = notes
+    assert note["kind"] == "historical_standalone_v11_redundant_error_field_omission"
+    assert note["source_error_context"] == {"field": "unresolved_block_ids"}
+    assert note["sent_feedback_context"] == final["task"]["validation_feedback"]["context"] == {}
+    assert note["source_error_context_sha256"] == digest({"field": "unresolved_block_ids"})
+    assert note["sent_feedback_context_sha256"] == digest({})
+    assert note["actual_context_coverage_sha256"] == note["sent_context_coverage_sha256"] == digest(coverage)
+    assert note["actual_wire_sha256"] == digest(final["request"])
+    assert note["omitted_field_was_sent"] is note["historical_request_modified"] is note["historical_candidate_modified"] is False
+    assert (first, final, coverage, window) == before
+    validate_live_window(copy.deepcopy(final["candidate"]), window)
+
+
+@pytest.mark.parametrize("change", ["automatic", "node", "same_run", "different_error", "different_field", "more_actual_fields",
+    "more_sent_fields", "sent_list", "sent_wrong_type", "coverage_actual_diff", "coverage_actual_type", "coverage_current_diff",
+    "ordinary_v10", "actual_wire_changed", "missing_requirement"])
+def test_standalone_context_compatibility_has_no_general_error_or_coverage_waiver(tmp_path, monkeypatch, change):
+    import company_bid.structured as structured
+    args = standalone_context_case(tmp_path, monkeypatch)
+    replay, source, first, final_run, final, coverage, window, context = args
+    node_key, code = "N2_WINDOW_DIAGNOSTIC", "LIVE_REQUIRED_BLOCK_UNRESOLVED"
+    if change == "automatic": node_key = None
+    elif change == "node": node_key = "N2"
+    elif change == "same_run": final_run.run_id = source.run_id
+    elif change == "different_error": first["terminal"]["error_code"] = code = "FORMAT_TITLE_NOT_GROUNDED"
+    elif change == "different_field": first["validation"]["diagnostic_context"] = {"field": "format_title"}
+    elif change == "more_actual_fields": first["validation"]["diagnostic_context"]["candidate_index"] = 1
+    elif change == "more_sent_fields": context = {"other": "value"}
+    elif change == "sent_list": context = []
+    elif change == "sent_wrong_type": context = {"field": True}
+    elif change == "ordinary_v10": coverage.pop("owned_adjacent_requirement")
+    elif change == "actual_wire_changed": final["request"]["temperature"] += .1
+    elif change == "missing_requirement": final["candidate"]["requirements"].pop(0)
+    elif change.startswith("coverage_"):
+        original = structured._repair_coverage
+        if change == "coverage_current_diff": replay.current = copy.deepcopy(replay.current)
+        def unequal(*args, **kwargs):
+            value = original(*args, **kwargs)
+            if kwargs.get("diagnostic_context") == {"field": "unresolved_block_ids"}:
+                if change != "coverage_current_diff" or kwargs["source_data"] is replay.current:
+                    value["counts"]["requirements"] = 2.0 if change == "coverage_actual_type" else 3
+            return value
+        monkeypatch.setattr(structured, "_repair_coverage", unequal)
+    with pytest.raises(ProviderFailure, match="DIAGNOSTIC_REPLAY_"):
+        replay._correction(source, first, final_run, final, coverage, window, context, code, standalone_node_key=node_key)
+
+
+def test_correct_future_standalone_context_needs_no_compatibility_note(tmp_path, monkeypatch):
+    args = standalone_context_case(tmp_path, monkeypatch, sent={"field": "unresolved_block_ids"})
+    replay, source, first, final_run, final, coverage, window, context = args
+    assert replay._correction(source, first, final_run, final, coverage, window, context,
+        "LIVE_REQUIRED_BLOCK_UNRESOLVED", standalone_node_key="N2_WINDOW_DIAGNOSTIC") == []

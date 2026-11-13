@@ -357,10 +357,24 @@ class DiagnosticReplay:
         _require(entry["origin"] == proof["origin"], "OWNER_WITNESS_MISMATCH")
         return {"binding": copy.deepcopy(binding), "entry": entry, "full_window": copy.deepcopy(window)}
 
-    def _correction(self, first_run, first, final_run, final, coverage, window, context, code):
-        from .structured import _repair_context, _repair_coverage, _covers_rejected_candidate, _validation_repair_request
-        _require(_repair_context(first["validation"].get("diagnostic_context")) == context and
-                 first["terminal"].get("error_code") == code, "LINEAGE_INVALID")
+    def _correction(self, first_run, first, final_run, final, coverage, window, context, code, *, standalone_node_key=None):
+        from .structured import (
+            _repair_context, _repair_coverage, _covers_rejected_candidate,
+            _validation_repair_request, _extended_contract_repair,
+        )
+        actual_context = _repair_context(first["validation"].get("diagnostic_context"))
+        _require(first["terminal"].get("error_code") == code, "LINEAGE_INVALID")
+        omitted_error_field = actual_context != context
+        if omitted_error_field:
+            # A historical standalone probe omitted one redundant error-path
+            # label from its actual feedback. Authenticate that wire unchanged;
+            # never pretend the missing field was sent, or apply this to the
+            # ordinary automatic-repair lineage.
+            _require(standalone_node_key == "N2_WINDOW_DIAGNOSTIC" and
+                     first_run.run_id != final_run.run_id and
+                     code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and _extended_contract_repair(coverage) and
+                     type(actual_context) is dict and actual_context == {"field": "unresolved_block_ids"} and
+                     type(context) is dict and not context, "LINEAGE_INVALID")
         witnesses = self._witnesses(coverage, first_run, window)
         source_bound = bool(coverage.get("format_continuation") or coverage.get("owned_adjacent_requirement") or
                             coverage.get("citation_gap_restore")) or any(
@@ -372,9 +386,20 @@ class DiagnosticReplay:
                                    diagnostic_context=context, source_witnesses=witnesses, source_data=source_data,
                                    owner_witness=owner_witness)
         _require(rebuilt is not None and rebuilt == coverage, "LINEAGE_UNSUPPORTED")
+        if omitted_error_field:
+            actual_rebuilt = _repair_coverage(first["candidate"], first["task"], error_code=code,
+                diagnostic_context=actual_context, source_witnesses=witnesses, source_data=source_data,
+                owner_witness=owner_witness)
+            _require(actual_rebuilt is not None and actual_rebuilt == rebuilt and
+                     digest(actual_rebuilt) == digest(rebuilt) == digest(coverage), "LINEAGE_UNSUPPORTED")
         if source_bound:
             current = _repair_coverage(first["candidate"], first["task"], error_code=code,
                                        diagnostic_context=context, source_data=self.current, owner_witness=owner_witness)
+            if omitted_error_field:
+                actual_current = _repair_coverage(first["candidate"], first["task"], error_code=code,
+                    diagnostic_context=actual_context, source_data=self.current, owner_witness=owner_witness)
+                _require(current is not None and actual_current is not None and actual_current == current and
+                         digest(actual_current) == digest(current), "SOURCE_CONTEXT_MISMATCH")
             def source_identity(value):
                 value = copy.deepcopy(value)
                 for group in value.get("resolution_groups", []):
@@ -410,6 +435,18 @@ class DiagnosticReplay:
         self._wire(final_run, final, expected)
         _require(final["task"] == expected and
                  _covers_rejected_candidate(copy.deepcopy(final["candidate"]), coverage, expected), "LINEAGE_INVALID")
+        if omitted_error_field:
+            return [{"kind": "historical_standalone_v11_redundant_error_field_omission",
+                "source_run_id": first_run.run_id, "correction_run_id": final_run.run_id,
+                "correction_node_key": standalone_node_key, "error_code": code,
+                "source_error_context": copy.deepcopy(actual_context), "sent_feedback_context": copy.deepcopy(context),
+                "source_error_context_sha256": digest(actual_context), "sent_feedback_context_sha256": digest(context),
+                "source_validation_diagnostic_context_sha256": digest(first["validation"].get("diagnostic_context")),
+                "actual_context_coverage_sha256": digest(actual_rebuilt), "sent_context_coverage_sha256": digest(rebuilt),
+                "actual_wire_sha256": digest(final["request"]), "actual_task_sha256": digest(final["task"]),
+                "omitted_field_was_sent": False, "historical_request_modified": False,
+                "historical_candidate_modified": False}]
+        return []
 
     def _load_entry(self, binding, task, full_window):
         identity = binding["alias"], binding["run_id"], binding["node_key"], binding["unit_id"]
@@ -439,6 +476,7 @@ class DiagnosticReplay:
                  data.get("raw_model_candidate") == final["candidate"] and
                  data.get("validated") == final["validation"].get("validated_output"))
         origin_calls = [(run, final)]
+        lineage_notes = []
         if binding["node_key"] == "N2":
             window, _ = self._source_window(run, payload, unit["unit_id"])
             relations = [item for item in captures if item["name"].startswith("validation-repair-result-")]
@@ -517,8 +555,8 @@ class DiagnosticReplay:
                 capture = _one(item for item in first_captures if item["name"] == f"{kind}-{call_id}-1")
                 _require(binding_data.get(f"historical_{kind}_ref") == capture["ref"]["path"], "LINEAGE_INVALID")
             feedback = final["task"]["validation_feedback"]
-            self._correction(original, first, run, final, binding_data["required_coverage"], window,
-                             feedback["context"], feedback["code"])
+            lineage_notes = self._correction(original, first, run, final, binding_data["required_coverage"], window,
+                             feedback["context"], feedback["code"], standalone_node_key=node["key"])
             _require(feedback["code"] == first["terminal"].get("error_code"), "LINEAGE_INVALID")
             origin_calls.insert(0, (original, first))
         from .extraction import validate_live_window
@@ -534,6 +572,8 @@ class DiagnosticReplay:
                              "call_attempt": call["call_attempt"], "trace_id": call["terminal"]["trace_id"],
                              "span_id": call["terminal"]["span_id"], "request_sha256": digest(call["request"]),
                              "response_sha256": digest(call["response"])} for owner, call in origin_calls]}
+        if lineage_notes:
+            origin["lineage_notes"] = lineage_notes
         return {"candidate": copy.deepcopy(final["candidate"]), "request_sha256": digest(task), "origin": origin}
 
     def preflight(self, ctx, value):

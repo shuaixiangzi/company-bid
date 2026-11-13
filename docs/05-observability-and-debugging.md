@@ -35,6 +35,8 @@
 
 `validation-repair-v11` 另允许两种不能叠加的精确修正与合同待补一起执行：完整同页原生编号条款只漏引一个中间行时，仅补回该行；一条要求完全属于相邻窗口且成功 owner 已有同源同字段要求时，仅删除该重复项。前者独立证明完整条款与下一边界；后者认证 owner 的真实调用、原响应、终态、N1、checkpoint、用量和 trace，并再次完整校验，不能只凭 reviewed 标记或回放产物冒充实际来源。其他旧要求及合法字段逐项保持，比较用副本不充当模型结果。新纠正清单最多 8 组、30,000 字符，旧合同仍为 20,000 字符；完整请求另受输入和最坏费用预留限制，每个单元最多一次纠正。新旧来源、允许改动、完整响应及失败原因均保留，历史回放重新认证全部证明。普通日志和 trace 只记元数据。
 
+历史独立诊断若只漏带冗余错误路径字段，不能假报字段已发送，也不能重写请求。唯一兼容情形限于 v11 合同纠正：原错误为 `LIVE_REQUIRED_BLOCK_UNRESOLVED`，过滤后上下文恰为 `{"field":"unresolved_block_ids"}`，发送的上下文恰为 `{}`，且原 N1、当前 N1 各自按两种上下文重建出的完整保护清单及 hash 都完全相同。独立来源认证、真实 wire、旧条目保护与完整校验均不变；新复验记录必须带 `lineage_notes` 明确记载原/发送上下文、hash 和遗漏事实。普通自动纠正、其它错误或字段不适用；后续请求应直接携带完整原错误上下文。
+
 ## Trace 实现
 
 采用 OpenTelemetry Python SDK，为节点和外部调用显式建 span；API/HTTP 可用标准 instrumentation 补充。跨 API 入队和 Worker 的上下文通过任务元数据传递。每次恢复或重跑有新的执行 trace，以 Span Link 关联前次尝试和复用产物，不维持一条跨多天的活动 span。OpenTelemetry 提供 attributes、events、exception 与 span links。[官方 Python instrumentation](https://opentelemetry.io/docs/languages/python/instrumentation/)
