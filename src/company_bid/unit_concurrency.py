@@ -10,7 +10,8 @@ import threading
 
 # Hard ceiling shared by model gateways in this CLI process. A deployed Worker
 # still needs its own configured fair scheduler and cross-process quota.
-_MODEL_REQUEST_SLOTS = threading.BoundedSemaphore(4)
+MAX_WINDOW_CONCURRENCY = 8
+_MODEL_REQUEST_SLOTS = threading.BoundedSemaphore(MAX_WINDOW_CONCURRENCY)
 
 
 @contextmanager
@@ -79,8 +80,8 @@ class UnitCoordinator:
 
 def run_parallel_units(ctx, jobs, concurrency):
     """Submit in source order; retain completed checkpoints and drain on error."""
-    if type(concurrency) is not int or not 2 <= concurrency <= 4:
-        raise ValueError("Parallel unit concurrency must be 2 through 4.")
+    if type(concurrency) is not int or not 2 <= concurrency <= MAX_WINDOW_CONCURRENCY:
+        raise ValueError(f"Parallel unit concurrency must be 2 through {MAX_WINDOW_CONCURRENCY}.")
     identities = [uid for uid, _ in jobs]
     if len(set(identities)) != len(identities):
         raise ValueError("Parallel units must have unique identities.")

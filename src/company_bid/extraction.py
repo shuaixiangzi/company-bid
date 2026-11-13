@@ -1508,7 +1508,8 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
                      "window_max_blocks": config.get("window_max_blocks", 60)}
     windows, ledger = _windows(documents, blocks, window_config)
     concurrency = config.get("window_concurrency", 1)
-    _fail(type(concurrency) is not int or not 1 <= concurrency <= 4, "WINDOW_CONCURRENCY_INVALID")
+    from .unit_concurrency import MAX_WINDOW_CONCURRENCY
+    _fail(type(concurrency) is not int or not 1 <= concurrency <= MAX_WINDOW_CONCURRENCY, "WINDOW_CONCURRENCY_INVALID")
     if concurrency == 1:
         results = [run_extraction_window(ctx, window, window_config, call_json) for window in windows]
     else:

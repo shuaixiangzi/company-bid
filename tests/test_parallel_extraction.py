@@ -43,7 +43,7 @@ def setup(tmp_path, monkeypatch, transport, *, concurrency=2, count=6):
     return ex, run, expected
 
 
-@pytest.mark.parametrize("concurrency", [1, 2, 4])
+@pytest.mark.parametrize("concurrency", [1, 2, 4, 8])
 def test_bounded_overlap_preserves_order_usage_trace_and_diagnostics(tmp_path, monkeypatch, concurrency):
     guard = threading.Lock()
     active = peak = 0
@@ -65,7 +65,7 @@ def test_bounded_overlap_preserves_order_usage_trace_and_diagnostics(tmp_path, m
             active -= 1
         return response(candidate(task))
 
-    ex, run, expected = setup(tmp_path, monkeypatch, transport, concurrency=concurrency)
+    ex, run, expected = setup(tmp_path, monkeypatch, transport, concurrency=concurrency, count=max(6, concurrency + 2))
     state = ex.execute(run)
     assert state["status"] == "succeeded", state.get("error_code")
     assert peak == concurrency and len(sent) == len(expected)
@@ -87,8 +87,9 @@ def test_bounded_overlap_preserves_order_usage_trace_and_diagnostics(tmp_path, m
         assert calls[e["call_id"]]["parent_span_id"] == units[e["unit_id"]]["span_id"]
 
 
-def test_failure_drains_inflight_success_and_resume_only_calls_unfinished(tmp_path, monkeypatch):
-    barrier = threading.Barrier(2)
+@pytest.mark.parametrize("concurrency", [2, 8])
+def test_failure_drains_inflight_success_and_resume_only_calls_unfinished(tmp_path, monkeypatch, concurrency):
+    barrier = threading.Barrier(concurrency)
     sent = []
     failed_phase = [True]
     guard = threading.Lock()
@@ -107,24 +108,25 @@ def test_failure_drains_inflight_success_and_resume_only_calls_unfinished(tmp_pa
                 time.sleep(.15)  # Must settle/checkpoint before node finalizes.
         return response(raw)
 
-    ex, run, expected = setup(tmp_path, monkeypatch, transport)
+    ex, run, expected = setup(tmp_path, monkeypatch, transport, concurrency=concurrency, count=concurrency + 2)
     state = ex.execute(run)
     assert state["status"] == "failed" and state["error_code"] == "LIVE_REQUIRED_BLOCK_UNRESOLVED"
-    assert set(sent) == set(expected[:2])
-    good = copy.deepcopy(state["nodes"][1]["units"][expected[1]])
-    assert good["status"] == "succeeded"
-    assert call_budget_summary(state["call_budget"])["known_usage_estimate_count"] == 2
+    assert set(sent) == set(expected[:concurrency])
+    good = {uid: copy.deepcopy(state["nodes"][1]["units"][uid]) for uid in expected[1:concurrency]}
+    assert all(unit["status"] == "succeeded" for unit in good.values())
+    assert call_budget_summary(state["call_budget"])["known_usage_estimate_count"] == concurrency
     failed_phase[0] = False
     restarted = Executor(ex.store.root, ex.nodes, ex.execution_config)
     completed = restarted.resume(run)
     assert completed["status"] == "succeeded", completed.get("error_code")
-    assert sent.count(expected[1]) == 1 and sent.count(expected[0]) == 2
-    assert completed["nodes"][1]["units"][expected[1]] == good
+    assert all(sent.count(uid) == 1 for uid in good) and sent.count(expected[0]) == 2
+    assert all(completed["nodes"][1]["units"][uid] == unit for uid, unit in good.items())
     assert inspect_diagnostics(ex.store.root, run)["gaps"] == []
 
 
-def test_concurrent_budget_admission_cannot_double_spend_or_drop_reservation(tmp_path):
-    barrier = threading.Barrier(2)
+@pytest.mark.parametrize("concurrency", [2, 8])
+def test_concurrent_budget_admission_cannot_double_spend_or_drop_reservation(tmp_path, concurrency):
+    barrier = threading.Barrier(concurrency)
     admitted = []
 
     def handler(ctx, value):
@@ -136,7 +138,7 @@ def test_concurrent_budget_admission_cannot_double_spend_or_drop_reservation(tmp
                 return {"uid": uid}
             return child.run_unit(uid, {}, work)
         return {"units": ctx.run_parallel_units([(uid, lambda child, uid=uid: job(child, uid))
-                                                 for uid in ("a", "b")], 2)}
+                                                 for uid in (f"u{i}" for i in range(concurrency))], concurrency)}
 
     ex = Executor(tmp_path, [NodeSpec("N2", "1", handler)], {})
     state = ex.execute(ex.create_run({}))
@@ -175,7 +177,7 @@ def test_repair_witnesses_wait_for_prior_checkpoint_and_exclude_later_success(tm
 
 
 def test_process_model_ceiling_is_shared_across_two_runs(tmp_path, monkeypatch):
-    barrier = threading.Barrier(4)
+    barrier = threading.Barrier(8)
     guard = threading.Lock()
     count = active = peak = 0
 
@@ -186,21 +188,21 @@ def test_process_model_ceiling_is_shared_across_two_runs(tmp_path, monkeypatch):
             position = count
             active += 1
             peak = max(peak, active)
-        if position <= 4:
+        if position <= 8:
             barrier.wait(timeout=5)
         time.sleep(.02)
         with guard:
             active -= 1
         return response(candidate(json.loads(wire["messages"][-1]["content"])))
 
-    runs = [setup(tmp_path / str(i), monkeypatch, transport, concurrency=4, count=4) for i in range(2)]
+    runs = [setup(tmp_path / str(i), monkeypatch, transport, concurrency=8, count=8) for i in range(2)]
     with ThreadPoolExecutor(max_workers=2) as pool:
         states = list(pool.map(lambda item: item[0].execute(item[1]), runs))
     assert all(s["status"] == "succeeded" for s in states)
-    assert count == 8 and peak == 4
+    assert count == 16 and peak == 8
 
 
-@pytest.mark.parametrize("limit", [0, 5, True, 2.0, "2"])
+@pytest.mark.parametrize("limit", [0, 9, True, 2.0, "2"])
 def test_invalid_concurrency_stops_before_provider(tmp_path, monkeypatch, limit):
     def never(*args):
         pytest.fail("Invalid concurrency must not reach a provider")
