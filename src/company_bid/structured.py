@@ -137,6 +137,24 @@ _CONTRACT_BLANK_REPAIR_INSTRUCTIONS = (
     "如存在缺读、未映射字符、图片漏读或实质冲突，保留未决并停止。返回完整JSON接受全部校验。"
 )
 
+_CONTRACT_PENDING_REPAIR_INSTRUCTIONS = (
+    "本次合同未决已由冻结N1独立界定完整编号条款或子项，source_proof仅证明原文已读和有限词法待约定字段。"
+    "value_not_supplied_in_read_text不等于读取失败，不宣称已证成PDF物理空白、无要求或已满足。"
+    "保留旧requirements/format_chapters原序、原字段、默认值与全部来源；仅按resolution_groups原序在尾部各追加一项。"
+    "新增项citation.block_ids精确使用组内全部ID，完整保留父层约束、条件、否定、责任后果及全部备选项；"
+    "clause_id/table_row_id=null，逐项使用required_response_fields：commercial/factual_response、mandatory=true、"
+    "confidence=low、not_prescribed、format_title=null、三类labels/keywords=[]。"
+    "甲方待提供事项不得冒充公司缺证据；不得猜日期、数量、金额、税率、付款方式或知识产权归属。"
+    "字面第0条及blocking_issues须保持待澄清，不解释回指、不选择备选或把已读冲突宣称解决。"
+    "只有完整新增原文待约定项后才能移除对应组未决，其余未决原序保留；范围未证成或存在其它错误则停止。"
+    "返回完整JSON接受原完整校验。"
+)
+
+
+def _extended_contract_repair(coverage):
+    return bool(coverage.get("owned_adjacent_requirement") or coverage.get("citation_gap_restore") or any(
+        group.get("resolution_kind") == "source_bound_contract_pending" for group in coverage.get("resolution_groups", [])))
+
 
 def _frozen_material_source(ctx):
     """Read the independent successful N1 checkpoint, never a model's context."""
@@ -713,7 +731,7 @@ def _valid_repair_fields(item: dict, model, excluded: set[str]) -> dict:
 
 
 def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnostic_context=None,
-                     source_witnesses=(), source_data=None) -> dict | None:
+                     source_witnesses=(), source_data=None, owner_witness=None) -> dict | None:
     """Keep a small source-checked inventory; unknown anchors disable repair."""
     from .extraction import _FormatChapter, _LiveWindowResponse, _Requirement
 
@@ -755,16 +773,38 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
         if not _existing_inventory_is_grounded(candidate, window,
                 context.get("candidate_index") if error_code == "FORMAT_TITLE_NOT_GROUNDED" else None,
                 label_failure=failure):
+            bounded_inventory = None
+            if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and source_data is not None and not source_witnesses:
+                if owner_witness is not None:
+                    from .adjacent_owner_sources import owned_adjacent_requirement_proof
+                    proof = owned_adjacent_requirement_proof(candidate, request, source_data["parsed"], source_data["manifest"], owner_witness)
+                    if proof is None:
+                        return None
+                    bounded_inventory = copy.deepcopy(candidate)
+                    bounded_inventory["requirements"].pop(proof["candidate_index"])
+                    coverage["owned_adjacent_requirement"] = proof
+                else:
+                    from .citation_gap_sources import native_citation_gap_restore
+                    proof = native_citation_gap_restore(candidate, request, source_data["parsed"], source_data["manifest"])
+                    if proof is not None:
+                        bounded_inventory = copy.deepcopy(candidate)
+                        index = proof["candidate_index"]
+                        bounded_inventory["requirements"][index]["citation"]["block_ids"] = proof["restored_block_ids"]
+                        coverage["citation_gap_restore"] = proof
+                        coverage["gap_original_citation"] = copy.deepcopy(candidate["requirements"][index]["citation"])
+            if bounded_inventory is not None and not _existing_inventory_is_grounded(bounded_inventory, window):
+                return None
             # This is one specific two-problem contract, not general multi-error
             # repair. Literal notes and prior-witness groups keep their old gate.
-            groups = _adjacent_resolution_groups(candidate, window) if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else None
-            if (groups is None or len(groups) != 1 or source_witnesses or
-                    groups[0].get("basis") != "same_page_native_consecutive_target_and_adjacent_lines"):
-                return None
-            label_restore = _exact_native_cell_label_restore(candidate, window, failure)
-            if label_restore is None:
-                return None
-            coverage["exact_cell_label_restore"] = label_restore
+            if bounded_inventory is None:
+                groups = _adjacent_resolution_groups(candidate, window) if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else None
+                if (groups is None or len(groups) != 1 or source_witnesses or
+                        groups[0].get("basis") != "same_page_native_consecutive_target_and_adjacent_lines"):
+                    return None
+                label_restore = _exact_native_cell_label_restore(candidate, window, failure)
+                if label_restore is None:
+                    return None
+                coverage["exact_cell_label_restore"] = label_restore
     if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED":
         groups = _adjacent_resolution_groups(candidate, window, source_witnesses)
         if groups is None:
@@ -777,7 +817,13 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
             if groups is None:
                 from .contract_blank_sources import contract_blank_source_groups
                 groups = contract_blank_source_groups(candidate, request, source_data["parsed"], source_data["manifest"])
+            if groups is None:
+                from .contract_pending_repair import contract_pending_source_groups
+                groups = contract_pending_source_groups(candidate, request, source_data["parsed"], source_data["manifest"])
         if groups is None:
+            return None
+        if (coverage.get("owned_adjacent_requirement") or coverage.get("citation_gap_restore")) and not all(
+                group.get("resolution_kind") in {"source_bound_contract_blank", "source_bound_contract_pending"} for group in groups):
             return None
         coverage["resolution_groups"] = groups
         coverage["original_unresolved_block_ids"] = coverage["window_fields"].pop("unresolved_block_ids")
@@ -858,8 +904,11 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
     if error_code == "FORMAT_TITLE_NOT_GROUNDED" and sum(
             bool(entry.get("editable_format_title")) for entry in coverage["entries"].get("requirements", [])) != 1:
         return None
-    # Diagnostic feedback is bounded independently of the provider input limit.
-    if len(json.dumps(coverage, ensure_ascii=False)) > 20000:
+    # Complete contract clauses can need several independent pending groups plus
+    # one exact citation/owner proof. Bound this finite v11 inventory separately;
+    # the provider still checks the full request size and reserves its full cost.
+    feedback_limit = 30000 if _extended_contract_repair(coverage) else 20000
+    if len(json.dumps(coverage, ensure_ascii=False)) > feedback_limit:
         return None
     return coverage
 
@@ -884,6 +933,39 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
         candidate = _normalized_repair_candidate(candidate, request)
     if not isinstance(candidate, dict):
         return False
+    owned = coverage.get("owned_adjacent_requirement")
+    gap = coverage.get("citation_gap_restore")
+    if owned and gap:
+        return False
+    if owned:
+        position, original = owned.get("candidate_index"), owned.get("original_typed_item")
+        groups = coverage.get("resolution_groups", [])
+        if (type(position) is not int or not isinstance(original, dict) or
+                owned.get("proof_sha256") != digest({k: v for k, v in owned.items() if k != "proof_sha256"}) or
+                owned.get("original_typed_item_sha256") != digest(original) or
+                not isinstance(candidate.get("requirements"), list) or
+                len(candidate["requirements"]) != coverage["counts"]["requirements"] - 1 + len(groups) or
+                not 0 <= position < coverage["counts"]["requirements"]):
+            return False
+        candidate = copy.deepcopy(candidate)
+        candidate["requirements"].insert(position, copy.deepcopy(original))
+    if gap:
+        position = gap.get("candidate_index")
+        original = coverage.get("gap_original_citation")
+        if (type(position) is not int or not isinstance(original, dict) or
+                gap.get("source_proof_sha256") != digest(gap.get("source_proof")) or
+                not isinstance(candidate.get("requirements"), list) or not 0 <= position < len(candidate["requirements"])):
+            return False
+        from .extraction import _Citation
+        try:
+            expected = _Citation.model_validate({**original, "block_ids": gap["restored_block_ids"]}, strict=True).model_dump(mode="json")
+            actual = _Citation.model_validate(candidate["requirements"][position].get("citation"), strict=True).model_dump(mode="json")
+        except ValidationError:
+            return False
+        if actual != expected:
+            return False
+        candidate = copy.deepcopy(candidate)
+        candidate["requirements"][position]["citation"] = copy.deepcopy(original)
     continuation = coverage.get("format_continuation")
     if continuation is not None:
         if not isinstance(continuation, dict):
@@ -950,7 +1032,7 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
         groups = coverage["resolution_groups"]
         added = candidate["requirements"][coverage["counts"]["requirements"]:]
         material_groups = [group for group in groups if group.get("resolution_kind") in {
-            "qualification_material_category_heading", "source_bound_material_heading", "source_bound_contract_blank"}]
+            "qualification_material_category_heading", "source_bound_material_heading", "source_bound_contract_blank", "source_bound_contract_pending"}]
         if material_groups:
             kinds = {group.get("resolution_kind") for group in groups}
             if (len(material_groups) != len(groups) or len(kinds) != 1 or len(added) != len(groups) or
@@ -959,7 +1041,7 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
                 return False
             for item, group in zip(added, groups):
                 from .contract_blank_sources import CONTRACT_BLANK_FIELDS
-                expected = CONTRACT_BLANK_FIELDS if group.get("resolution_kind") == "source_bound_contract_blank" else _MATERIAL_RESPONSE_FIELDS
+                expected = CONTRACT_BLANK_FIELDS if group.get("resolution_kind") in {"source_bound_contract_blank", "source_bound_contract_pending"} else _MATERIAL_RESPONSE_FIELDS
                 if (group.get("required_response_fields") != expected or
                         group.get("source_proof_sha256") != digest(group.get("source_proof")) or
                         item.get("citation", {}).get("block_ids") != group["block_ids"] or
@@ -1048,7 +1130,8 @@ def _repair_capture(ctx, name, value):
 
 def _validation_repair_request(request, code, context, coverage, call_id, attempt=1):
     """Shared wire builder for live correction and a provenance-labelled probe."""
-    instructions = (_CONTRACT_BLANK_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+    instructions = (_CONTRACT_PENDING_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and _extended_contract_repair(coverage) else
+                    _CONTRACT_BLANK_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
                     any(group.get("resolution_kind") == "source_bound_contract_blank" for group in coverage.get("resolution_groups", [])) else
                     _FORMAT_CONTINUATION_REPAIR_INSTRUCTIONS if code == "FORMAT_HEADING_NOT_GROUNDED" and
                     coverage.get("format_continuation") else
@@ -1066,6 +1149,17 @@ def _validation_repair_request(request, code, context, coverage, call_id, attemp
                     _REPAIR_INSTRUCTIONS)
     if coverage.get("exact_cell_label_restore"):
         instructions += _CELL_LABEL_REPAIR_INSTRUCTIONS
+    if coverage.get("owned_adjacent_requirement"):
+        instructions += (
+            "本次另有一条全部属于相邻窗的重复要求：owned_adjacent_requirement.candidate_index指定其旧索引。"
+            "独立证据已确认完整同源条款与全部业务字段被已成功owner真实响应承载；只删除这一个重复要求，"
+            "其余旧要求按原序逐字段保持，不改格式引用；再按上述规则追加待约定项。"
+            "原删除项、实际owner调用及原失败均保留在保护清单，不代表可删除任何尚未处理或不同业务字段的要求。")
+    if coverage.get("citation_gap_restore"):
+        instructions += (
+            "本次另有一处引用漏行：只将citation_gap_restore.candidate_index那一项的citation.block_ids"
+            "改为完整restored_block_ids，恢复同一条款中间漏掉的原生行。原首尾、全部条件/否定/责任后果"
+            "及所有业务字段不变，不能改为程序豁免、缩短引文或猜新内容；其余旧项和格式逐项保持。")
     result = copy.deepcopy(request)
     result["task_instructions"] = request.get("task_instructions", "") + "\n\n" + instructions
     result["validation_feedback"] = {"code": code, "context": context, "required_coverage": coverage,
@@ -1150,7 +1244,8 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
                            for group in rejected[2].get("resolution_groups", []))
         contract_blank = any(group.get("resolution_kind") == "source_bound_contract_blank"
                              for group in rejected[2].get("resolution_groups", []))
-        relation = {"schema_version": "validation-repair-v10" if contract_blank else
+        relation = {"schema_version": "validation-repair-v11" if _extended_contract_repair(rejected[2]) else
+                    "validation-repair-v10" if contract_blank else
                     "validation-repair-v9" if rejected[2].get("format_continuation") else
                     "validation-repair-v8" if source_bound else "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,

@@ -306,9 +306,15 @@ class DiagnosticReplay:
         from .structured import SYSTEM_PROMPT, PROMPT_VERSION
         _require(run.config.endpoint == self.provider_config.endpoint and run.config.service == self.provider_config.service,
                  "PROVIDER_MISMATCH")
+        # ``call.task`` was parsed from the authenticated historical request.
+        # Compare every JSON value against today's rebuilt task, then retain
+        # its original object ordering when rebuilding that historical wire.
+        # Canonical digests additionally distinguish bool/int/float values
+        # which Python object equality alone can treat as equal.
+        _require(call.get("task") == task and digest(call["task"]) == digest(task), "REQUEST_MISMATCH")
         _require(call["terminal"].get("prompt_version") == PROMPT_VERSION and
                  call["terminal"].get("model") == self.provider_config.model and
-                 call["request"] == build_json_request(self.provider_config, task, SYSTEM_PROMPT), "REQUEST_MISMATCH")
+                 call["request"] == build_json_request(self.provider_config, call["task"], SYSTEM_PROMPT), "REQUEST_MISMATCH")
 
     def _witnesses(self, coverage, run, full_window):
         from .extraction import validate_live_window
@@ -339,25 +345,40 @@ class DiagnosticReplay:
                 witnesses.append(group)
         return witnesses
 
+    def _completed_owner_witness(self, coverage):
+        proof = coverage.get("owned_adjacent_requirement")
+        if not proof:
+            return None
+        from .extraction import extraction_window_payload
+        binding = proof["binding"]
+        window = self.windows[binding["unit_id"]]
+        task = {**extraction_window_payload(window, self.window_config), "task_type": "extract_requirements"}
+        entry = self._load_entry(binding, task, window)
+        _require(entry["origin"] == proof["origin"], "OWNER_WITNESS_MISMATCH")
+        return {"binding": copy.deepcopy(binding), "entry": entry, "full_window": copy.deepcopy(window)}
+
     def _correction(self, first_run, first, final_run, final, coverage, window, context, code):
         from .structured import _repair_context, _repair_coverage, _covers_rejected_candidate, _validation_repair_request
         _require(_repair_context(first["validation"].get("diagnostic_context")) == context and
                  first["terminal"].get("error_code") == code, "LINEAGE_INVALID")
         witnesses = self._witnesses(coverage, first_run, window)
-        source_bound = bool(coverage.get("format_continuation")) or any(
-            group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank"}
+        source_bound = bool(coverage.get("format_continuation") or coverage.get("owned_adjacent_requirement") or
+                            coverage.get("citation_gap_restore")) or any(
+            group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank", "source_bound_contract_pending"}
             for group in coverage.get("resolution_groups", []))
         source_data = self._n1(first_run)[0] if source_bound else None
+        owner_witness = self._completed_owner_witness(coverage)
         rebuilt = _repair_coverage(first["candidate"], first["task"], error_code=code,
-                                   diagnostic_context=context, source_witnesses=witnesses, source_data=source_data)
+                                   diagnostic_context=context, source_witnesses=witnesses, source_data=source_data,
+                                   owner_witness=owner_witness)
         _require(rebuilt is not None and rebuilt == coverage, "LINEAGE_UNSUPPORTED")
         if source_bound:
             current = _repair_coverage(first["candidate"], first["task"], error_code=code,
-                                       diagnostic_context=context, source_data=self.current)
+                                       diagnostic_context=context, source_data=self.current, owner_witness=owner_witness)
             def source_identity(value):
                 value = copy.deepcopy(value)
                 for group in value.get("resolution_groups", []):
-                    if group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank"}:
+                    if group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank", "source_bound_contract_pending"}:
                         proof = group["source_proof"]
                         # Both full N1 views were independently validated. Only
                         # their container digests can include fresh read artifacts;
@@ -365,6 +386,14 @@ class DiagnosticReplay:
                         proof.pop("parsed_sha256", None)
                         proof.pop("source_reading_sha256", None)
                         group["source_proof_sha256"] = digest(proof)
+                for field in ("owned_adjacent_requirement", "citation_gap_restore"):
+                    if value.get(field):
+                        proof = value[field]["source_proof"]
+                        proof.pop("parsed_sha256", None)
+                        proof.pop("source_reading_sha256", None)
+                        value[field]["source_proof_sha256"] = digest(proof)
+                        if field == "owned_adjacent_requirement":
+                            value[field]["proof_sha256"] = digest({k: v for k, v in value[field].items() if k != "proof_sha256"})
                 if value.get("format_continuation"):
                     proof = value["format_continuation"]
                     proof.pop("parsed_sha256", None)
@@ -378,7 +407,7 @@ class DiagnosticReplay:
         # The actual feedback message keeps its historical object ordering and
         # call identity. Stored coverage JSON has sorted keys; reserializing it
         # must not relabel the old wire or invent a different feedback prompt.
-        self._wire(final_run, final, final["task"])
+        self._wire(final_run, final, expected)
         _require(final["task"] == expected and
                  _covers_rejected_candidate(copy.deepcopy(final["candidate"]), coverage, expected), "LINEAGE_INVALID")
 
@@ -419,15 +448,18 @@ class DiagnosticReplay:
             else:
                 relation_ref = _one(relations)
                 relation = run.capture(captures, relation_ref["name"])
-                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7", "validation-repair-v8", "validation-repair-v9", "validation-repair-v10"} and
+                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7", "validation-repair-v8", "validation-repair-v9", "validation-repair-v10", "validation-repair-v11"} and
                          relation.get("status") == "completed" and relation.get("unit_id") == unit["unit_id"] and
                          relation.get("repair_attempt") == 1 and relation.get("second_call_started") is True, "LINEAGE_INVALID")
                 source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
                                    for group in relation.get("required_coverage", {}).get("resolution_groups", []))
                 _require((relation["schema_version"] == "validation-repair-v8") == source_bound, "LINEAGE_INVALID")
-                _require((relation["schema_version"] == "validation-repair-v10") == any(
+                from .structured import _extended_contract_repair
+                extended = _extended_contract_repair(relation["required_coverage"])
+                _require((relation["schema_version"] == "validation-repair-v11") == extended, "LINEAGE_INVALID")
+                _require((relation["schema_version"] == "validation-repair-v10") == (not extended and any(
                     group.get("resolution_kind") == "source_bound_contract_blank"
-                    for group in relation.get("required_coverage", {}).get("resolution_groups", [])), "LINEAGE_INVALID")
+                    for group in relation.get("required_coverage", {}).get("resolution_groups", []))), "LINEAGE_INVALID")
                 _require((relation["schema_version"] == "validation-repair-v9") == bool(
                     relation.get("required_coverage", {}).get("format_continuation")), "LINEAGE_INVALID")
                 first = run.call(node, unit["unit_id"], attempt, relation["first_call_id"], relation["first_call_attempt"], passed=False)
