@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import re
+import threading
 from pathlib import Path
 
 from .provider import ChatConfig, ProviderFailure, build_json_request
@@ -267,6 +268,7 @@ class DiagnosticReplay:
         self._source_windows = {}
         self._source_file_hashes = {}
         self._source_file_paths = {}
+        self._summary_lock = threading.Lock()
         self._summary = {"schema_version": SUMMARY_VERSION, "diagnostic_only": True,
                          "publication_status": "diagnostic_only", "binding_count": 0,
                          "verified_binding_count": 0, "revalidated_count": 0, "live_miss_count": 0,
@@ -274,7 +276,8 @@ class DiagnosticReplay:
                          "live_checkpoint_reuse_count": 0, "historical_calls_charged_again": 0, "origins": []}
 
     def summary(self):
-        return copy.deepcopy(self._summary)
+        with self._summary_lock:
+            return copy.deepcopy(self._summary)
 
     def _run(self, alias, run_id):
         _require(alias in self.roots, "CONFIG_INVALID")
@@ -437,7 +440,7 @@ class DiagnosticReplay:
                     diagnostic_context=actual_context, source_data=self.current, owner_witness=owner_witness)
                 _require(current is not None and actual_current is not None and actual_current == current and
                          digest(actual_current) == digest(current), "SOURCE_CONTEXT_MISMATCH")
-            def source_identity(value):
+            def source_identity(value, source):
                 value = copy.deepcopy(value)
                 for group in value.get("resolution_groups", []):
                     if group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank", "source_bound_contract_pending"}:
@@ -453,6 +456,14 @@ class DiagnosticReplay:
                         proof = value[field]["source_proof"]
                         proof.pop("parsed_sha256", None)
                         proof.pop("source_reading_sha256", None)
+                        if field == "citation_gap_restore":
+                            # A fresh N0 copies identical sources into a new
+                            # run directory. _n1 already compared every other
+                            # manifest field and authenticated both originals;
+                            # keep that content identity in the comparison.
+                            _require(proof.get("manifest_sha256") == digest(source["manifest"]),
+                                     "SOURCE_CONTEXT_MISMATCH")
+                            proof["manifest_sha256"] = digest(_without_paths(source["manifest"]))
                         value[field]["source_proof_sha256"] = digest(proof)
                         if field == "owned_adjacent_requirement":
                             value[field]["proof_sha256"] = digest({k: v for k, v in value[field].items() if k != "proof_sha256"})
@@ -463,7 +474,7 @@ class DiagnosticReplay:
                     proof.pop("proof_sha256", None)
                     proof["proof_sha256"] = digest(proof)
                 return value
-            _require(current is not None and source_identity(current) == source_identity(coverage),
+            _require(current is not None and source_identity(current, self.current) == source_identity(coverage, source_data),
                      "SOURCE_CONTEXT_MISMATCH")
         expected = _validation_repair_request(first["task"], code, context, coverage, first["call_id"], first["call_attempt"])
         # The actual feedback message keeps its historical object ordering and
@@ -718,11 +729,12 @@ class DiagnosticReplay:
         for snapshot in self.snapshots:
             ctx.executor.store.read_bytes(snapshot["snapshot"])
         if key not in self.config["bindings"]:
-            self._summary["live_miss_count"] += 1
+            with self._summary_lock:
+                self._summary["live_miss_count"] += 1
             self._capture(ctx, "diagnostic-replay-live-miss", {"unit_id": unit_id, "request_sha256": digest(request),
                                                            "diagnostic_only": True, "reason": "key_not_declared"})
             return None
-        entry = self._entries[key]
+        entry = copy.deepcopy(self._entries[key])
         _require(entry["request_sha256"] == digest(request), "REQUEST_MISMATCH")
         origin = entry["origin"]
         links = [{"trace_id": call["trace_id"], "span_id": call["span_id"]} for call in origin["calls"]]
@@ -744,6 +756,7 @@ class DiagnosticReplay:
             ctx.call_event("candidate.revalidated", {"operation": "diagnostic_replay", "input_hash": digest(request),
                                                      "output_hash": digest(result), "status": "passed"})
         ctx._observer.check()
-        self._summary["revalidated_count"] += 1
-        self._summary["revalidated_this_attempt_count"] += 1
+        with self._summary_lock:
+            self._summary["revalidated_count"] += 1
+            self._summary["revalidated_this_attempt_count"] += 1
         return result

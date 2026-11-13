@@ -14,6 +14,9 @@ import re
 import time
 import traceback
 import uuid
+import threading
+from functools import wraps
+from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -235,6 +238,26 @@ def _error_diagnostic(exc: BaseException) -> dict:
     return details
 
 
+def _state_serialized(method):
+    @wraps(method)
+    def synchronized(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return synchronized
+
+
+def _admission_serialized(method):
+    @wraps(method)
+    def synchronized(self, *args, **kwargs):
+        coordinator = self._parallel_coordinator
+        # Reserve/record and stop have one ordering point. Once this protected
+        # reservation commits, the request is admitted and must be drained even
+        # if a sibling stops admission before its transport starts.
+        with coordinator.condition if coordinator is not None else nullcontext():
+            return method(self, *args, **kwargs)
+    return synchronized
+
+
 class NodeContext:
     def __init__(self, executor: "Executor", state: dict, record: dict, attempt: dict, observer: Observer, trace_id: str):
         self.executor, self._state, self._record, self._attempt, self._observer = executor, state, record, attempt, observer
@@ -245,11 +268,40 @@ class NodeContext:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self._capture_failed = False
         self._active_unit: dict = {}
+        self._state_lock = threading.RLock()
+        self._parallel_coordinator = None
+        self._parallel_unit_id = None
+
+    def parallel_child(self, coordinator, unit_id):
+        child = copy.copy(self)
+        child._active_unit = {}
+        child._capture_failed = False
+        child._parallel_coordinator = coordinator
+        child._parallel_unit_id = unit_id
+        return child
+
+    def run_parallel_units(self, jobs, concurrency):
+        from .unit_concurrency import run_parallel_units
+        return run_parallel_units(self, jobs, concurrency)
+
+    @_state_serialized
+    def node_record_snapshot(self):
+        return copy.deepcopy(self._record)
+
+    def prior_unit_record(self):
+        if self._parallel_coordinator is None:
+            return self.node_record_snapshot()
+        # Do not hold the state lock while waiting for earlier source windows.
+        prior = self._parallel_coordinator.prior_ids(self._parallel_unit_id)
+        snapshot = self.node_record_snapshot()
+        snapshot["units"] = {uid: snapshot["units"][uid] for uid in prior if uid in snapshot["units"]}
+        return snapshot
 
     @property
     def artifact_scope(self) -> str:
         return self.executor._artifact_scope(self._state)
 
+    @_state_serialized
     def _persist(self) -> None:
         self.executor._save(self._state)
 
@@ -265,6 +317,7 @@ class NodeContext:
         """Provider adapters can wrap each actual request in a genuine child span."""
         return self._observer.span("provider.call", {**(metadata or {}), **self._metadata()})
 
+    @_state_serialized
     def capture(self, name: str, payload: dict, *, partial: bool = False) -> dict:
         """Controlled JSON capture. Failure is durable and blocks node success.
 
@@ -299,6 +352,7 @@ class NodeContext:
     def read_artifact(self, reference: dict) -> bytes:
         return self.executor.store.read_bytes(reference)
 
+    @_state_serialized
     def _commit_call_budget(self, budget: dict, *, settling: bool = False, policy_stop: bool = False) -> None:
         # Preserve node/unit/attempt object identities. Only adopt a changed
         # budget after its independent state copy was durably saved.
@@ -325,6 +379,8 @@ class NodeContext:
             if key in candidate:
                 self._state[key] = candidate[key]
 
+    @_state_serialized
+    @_admission_serialized
     def reserve_call(self, call_id: str, call_attempt: int, estimated_upper_usd,
                      max_run_usd: float, max_run_calls: int, *, input_usd_per_million=None,
                      output_usd_per_million=None, unit_id: str | None = None, input_hash: str | None = None) -> None:
@@ -333,6 +389,9 @@ class NodeContext:
         This operates under execute's OS lock. It is an M1 local budget guard,
         not a multi-Worker quota, and never claims provider exactly-once calls.
         """
+        if self._parallel_coordinator is not None:
+            self._parallel_coordinator.check()
+        self._observer.check()
         _identifier(call_id, "Call identifier")
         try:
             estimate, limit = Decimal(str(estimated_upper_usd)), Decimal(str(max_run_usd))
@@ -375,8 +434,9 @@ class NodeContext:
                                        "settlement_status": "reserved_unknown_actual_cost"})
         self._commit_call_budget(changed)
         self.call_event("call.reserved", {"call_id": call_id, "call_attempt": call_attempt,
-                                          "count": changed["reservation_count"]})
+                                          "count": changed["reservation_count"], "status": "admitted"})
 
+    @_state_serialized
     def stop_provider_calls(self, code: str, *, call_id: str, call_attempt: int, response_sha256: str) -> None:
         """Latch a confirmed transport-policy stop without altering usage charges."""
         budget = self._state.get("call_budget", {})
@@ -406,6 +466,7 @@ class NodeContext:
         self.call_event("call.policy_stopped", {"call_id": call_id, "call_attempt": call_attempt,
                                                 "error_code": code, "output_hash": response_sha256})
 
+    @_state_serialized
     def settle_call_usage(self, call_id: str, call_attempt: int, input_tokens: int, output_tokens: int,
                           total_tokens: int, *, response_sha256: str, unit_id: str | None = None) -> dict:
         """Durably record complete usage before any candidate validation.
@@ -454,38 +515,39 @@ class NodeContext:
         return copy.deepcopy(item)
 
     def run_unit(self, unit_id: str, input_data: dict, fn: Callable[[], dict]) -> dict:
-        _identifier(unit_id, "Unit identifier")
-        if not isinstance(input_data, dict):
-            raise RuntimeContractError("Unit input must be a JSON object.")
-        input_data = redact_payload(input_data)
-        self.executor._artifact_scope(self._state, input_data)
-        input_hash = digest(input_data)
-        units = self._record["units"]
-        if unit_id not in units:
-            units[unit_id] = {"unit_id": unit_id, "status": "pending", "input_hash": input_hash,
-                              "input_ref": self.executor.store.put_json(self.run_id, "unit-input", input_data),
-                              "version": self._record["version"], "attempts": []}
-        record = units[unit_id]
-        if record["input_hash"] != input_hash or record["version"] != self._record["version"]:
-            raise ConfigurationChangedError("Changed unit input requires a child run.")
-        if record["status"] == "succeeded":
-            try:
-                output = self.executor._checkpoint_data(record)
-                self.executor._artifact_scope(self._state, output)
-            except ArtifactIntegrityError as exc:
-                raise CheckpointInvalidError(self.node_key) from exc
-            reuse_metadata = self._metadata(unit_id=unit_id, unit_attempt_id=record["attempts"][-1]["attempt_id"],
-                                            output_hash=record["output_hash"], reused_from_run_id=self.run_id)
-            with self._observer.span("unit.reuse", reuse_metadata,
-                                     links=record["attempts"][-1:]):
-                self._observer.event("unit.reused", reuse_metadata)
-            return output
+        with self._state_lock:
+            _identifier(unit_id, "Unit identifier")
+            if not isinstance(input_data, dict):
+                raise RuntimeContractError("Unit input must be a JSON object.")
+            input_data = redact_payload(input_data)
+            self.executor._artifact_scope(self._state, input_data)
+            input_hash = digest(input_data)
+            units = self._record["units"]
+            if unit_id not in units:
+                units[unit_id] = {"unit_id": unit_id, "status": "pending", "input_hash": input_hash,
+                                  "input_ref": self.executor.store.put_json(self.run_id, "unit-input", input_data),
+                                  "version": self._record["version"], "attempts": []}
+            record = units[unit_id]
+            if record["input_hash"] != input_hash or record["version"] != self._record["version"]:
+                raise ConfigurationChangedError("Changed unit input requires a child run.")
+            if record["status"] == "succeeded":
+                try:
+                    output = self.executor._checkpoint_data(record)
+                    self.executor._artifact_scope(self._state, output)
+                except ArtifactIntegrityError as exc:
+                    raise CheckpointInvalidError(self.node_key) from exc
+                reuse_metadata = self._metadata(unit_id=unit_id, unit_attempt_id=record["attempts"][-1]["attempt_id"],
+                                                output_hash=record["output_hash"], reused_from_run_id=self.run_id)
+                with self._observer.span("unit.reuse", reuse_metadata,
+                                         links=record["attempts"][-1:]):
+                    self._observer.event("unit.reused", reuse_metadata)
+                return output
 
-        attempt = {"attempt_id": uuid.uuid4().hex, "node_attempt_id": self.attempt_id, "started_at": utc_now(),
-                   "status": "running", "input_hash": input_hash}
-        record["attempts"].append(attempt)
-        record["status"] = "running"
-        self._persist()
+            attempt = {"attempt_id": uuid.uuid4().hex, "node_attempt_id": self.attempt_id, "started_at": utc_now(),
+                       "status": "running", "input_hash": input_hash}
+            record["attempts"].append(attempt)
+            record["status"] = "running"
+            self._persist()
         began = time.monotonic()
         metadata = self._metadata(unit_id=unit_id, unit_attempt_id=attempt["attempt_id"], input_hash=input_hash)
         checkpointed = False
@@ -493,43 +555,49 @@ class NodeContext:
         try:
             with self._observer.span("unit." + self.node_key, metadata) as span:
                 self._active_unit = {"unit_id": unit_id, "unit_attempt_id": attempt["attempt_id"]}
-                self._observer.event("unit.started", metadata)
-                attempt["trace_id"] = format(span.get_span_context().trace_id, "032x")
-                attempt["span_id"] = format(span.get_span_context().span_id, "016x")
-                self._persist()
+                with self._state_lock:
+                    self._observer.event("unit.started", metadata)
+                    attempt["trace_id"] = format(span.get_span_context().trace_id, "032x")
+                    attempt["span_id"] = format(span.get_span_context().span_id, "016x")
+                    self._persist()
                 output = fn()
-                if not isinstance(output, dict):
-                    raise RuntimeContractError("Unit output must be a JSON object.")
-                if self._capture_failed:
-                    raise CaptureFailedError("Required unit capture did not persist.")
-                output = redact_payload(output)
-                self.executor.store.validate_embedded_artifacts(output)
-                self.executor._artifact_scope(self._state, output)
-                reference = self.executor._write_checkpoint(self._state, self._record, attempt, input_hash, output, unit_id)
-                span.set_attribute("output_hash", digest(output))
-                span.set_attribute("validation_status", "passed")
-            self._observer.check()
-            record.update(status="succeeded", output_ref=reference, output_hash=digest(output))
-            attempt.update(status="succeeded", ended_at=utc_now(), output_hash=record["output_hash"],
-                           duration_ms=round((time.monotonic() - began) * 1000, 3))
-            self._persist()
-            checkpointed = True
-            self._observer.event("unit.checkpointed", {**metadata, "span_id": attempt["span_id"],
-                                  "output_hash": record["output_hash"], "duration_ms": attempt["duration_ms"]})
-            return output
-        except Exception as exc:
-            try:
-                self.capture("unit-error", _error_diagnostic(exc))
-            except Exception:
-                self._capture_failed = True
-                self._state["observability"]["capture_status"] = "write_failed"
-            if not checkpointed:
-                attempt.update(status="failed", ended_at=utc_now(), duration_ms=round((time.monotonic()-began)*1000, 3), **_safe_error(exc))
-                record["status"] = "failed"
+                with self._state_lock:
+                    if not isinstance(output, dict):
+                        raise RuntimeContractError("Unit output must be a JSON object.")
+                    if self._capture_failed:
+                        raise CaptureFailedError("Required unit capture did not persist.")
+                    output = redact_payload(output)
+                    self.executor.store.validate_embedded_artifacts(output)
+                    self.executor._artifact_scope(self._state, output)
+                    reference = self.executor._write_checkpoint(self._state, self._record, attempt, input_hash, output, unit_id)
+                    span.set_attribute("output_hash", digest(output))
+                    span.set_attribute("validation_status", "passed")
+            with self._state_lock:
+                self._observer.check()
+                record.update(status="succeeded", output_ref=reference, output_hash=digest(output))
+                attempt.update(status="succeeded", ended_at=utc_now(), output_hash=record["output_hash"],
+                               duration_ms=round((time.monotonic() - began) * 1000, 3))
                 self._persist()
-            self._observer.event("unit.failed", {**metadata, "span_id": attempt.get("span_id"),
-                                  "duration_ms": attempt.get("duration_ms"), **_safe_error(exc)})
-            raise
+                checkpointed = True
+                self._observer.event("unit.checkpointed", {**metadata, "span_id": attempt["span_id"],
+                                      "output_hash": record["output_hash"], "duration_ms": attempt["duration_ms"]})
+                return output
+        except Exception as exc:
+            if self._parallel_coordinator is not None:
+                self._parallel_coordinator.finish(self._parallel_coordinator.positions[unit_id], exc)
+            with self._state_lock:
+                try:
+                    self.capture("unit-error", _error_diagnostic(exc))
+                except Exception:
+                    self._capture_failed = True
+                    self._state["observability"]["capture_status"] = "write_failed"
+                if not checkpointed:
+                    attempt.update(status="failed", ended_at=utc_now(), duration_ms=round((time.monotonic()-began)*1000, 3), **_safe_error(exc))
+                    record["status"] = "failed"
+                    self._persist()
+                self._observer.event("unit.failed", {**metadata, "span_id": attempt.get("span_id"),
+                                      "duration_ms": attempt.get("duration_ms"), **_safe_error(exc)})
+                raise
         finally:
             self._active_unit = previous_unit
 

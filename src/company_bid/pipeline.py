@@ -24,7 +24,8 @@ class PipelineFailure(RuntimeError):
 def _version(*names: str) -> str:
     # Node-owned helpers are explicit transitive inputs. Extending an N3 helper
     # must invalidate N3 without relabeling unchanged N0/N1/N2 implementations.
-    dependencies = {"planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py"),
+    dependencies = {"runtime.py": ("unit_concurrency.py",),
+                    "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py"),
                     "pipeline.py": ("project_constraint_runtime.py",),
                     "project_constraint_runtime.py": ("project_constraints.py", "contract_pending_plan.py"),
                     "contract_pending_plan.py": ("contract_review_slots.py", "extraction.py"),

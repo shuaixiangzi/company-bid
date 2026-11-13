@@ -128,15 +128,23 @@ class Observer:
             raise RuntimeDependencyError("Install the pinned opentelemetry-sdk dependency to execute runs.") from exc
 
         self.run_dir, self.run_id = Path(run_dir), run_id
-        self.trace_status = "captured"
-        self.export_error = None
-        self._mutex = threading.Lock()
+        # One observer owns these two JSONL streams. SDK exporter callbacks and
+        # worker events use the same lock for whole-line writes and sticky
+        # error state. Never hold it while waiting for the SDK to flush/stop:
+        # those operations may themselves invoke an exporter callback.
+        self._mutex = threading.RLock()
+        self._close_mutex = threading.Lock()
+        self._trace_status = "captured"
+        self._export_error = None
+        self._event_error = None
+        self._closing = False
+        self._closed = False
         owner = self
 
         class DurableExporter(SpanExporter):
             def export(self, spans):
-                try:
-                    with owner._mutex:
+                with owner._mutex:
+                    try:
                         for span in spans:
                             context = span.context
                             # Explicit OTLP-compatible identity/timestamp/attribute
@@ -154,11 +162,12 @@ class Observer:
                                            "span_id": format(link.context.span_id, "016x")} for link in span.links],
                                 "resource": {"service.name": "company-bid-m1"},
                             })
-                    return SpanExportResult.SUCCESS
-                except Exception:
-                    owner.trace_status = "write_failed"
-                    owner.export_error = "TRACE_WRITE_FAILED"
-                    return SpanExportResult.FAILURE
+                        return SpanExportResult.SUCCESS
+                    except Exception:
+                        # Publish failure before releasing the write lock, so
+                        # a concurrent check cannot observe a false clean gap.
+                        owner._trace_failed("TRACE_WRITE_FAILED")
+                        return SpanExportResult.FAILURE
 
             def shutdown(self):
                 return None
@@ -166,6 +175,26 @@ class Observer:
         self.provider = TracerProvider(resource=Resource.create({"service.name": "company-bid-m1"}))
         self.provider.add_span_processor(SimpleSpanProcessor(DurableExporter()))
         self.tracer = self.provider.get_tracer("company_bid.m1", "1")
+
+    @property
+    def trace_status(self) -> str:
+        with self._mutex:
+            return self._trace_status
+
+    @property
+    def export_error(self) -> str | None:
+        with self._mutex:
+            return self._export_error
+
+    @property
+    def event_error(self) -> str | None:
+        with self._mutex:
+            return self._event_error
+
+    def _trace_failed(self, code: str) -> None:
+        with self._mutex:
+            self._trace_status = "write_failed"
+            self._export_error = self._export_error or code
 
     @contextmanager
     def span(self, name: str, metadata: dict | None = None, links: list[dict] | None = None) -> Iterator[Any]:
@@ -193,13 +222,52 @@ class Observer:
         context = get_current_span().get_span_context()
         correlation = ({"trace_id": format(context.trace_id, "032x"), "span_id": format(context.span_id, "016x")}
                        if context.is_valid else {})
-        append_json(self.run_dir / "events.jsonl", {"time": utc_now(), "event": event,
-                                                    "run_id": self.run_id, **correlation, **safe_metadata(metadata)})
+        record = {"time": utc_now(), "event": event,
+                  "run_id": self.run_id, **correlation, **safe_metadata(metadata)}
+        with self._mutex:
+            if self._closing or self._closed:
+                raise ObservabilityWriteError("The local observer is closing or closed.")
+            try:
+                append_json(self.run_dir / "events.jsonl", record)
+            except Exception as error:
+                self._event_error = self._event_error or "EVENT_WRITE_FAILED"
+                raise ObservabilityWriteError("A local diagnostic event could not be persisted.") from error
 
     def check(self) -> None:
-        if self.export_error:
-            raise ObservabilityWriteError("A local OpenTelemetry span could not be persisted.")
+        with self._mutex:
+            if self._export_error:
+                raise ObservabilityWriteError("A local OpenTelemetry span could not be persisted.")
+            if self._event_error:
+                raise ObservabilityWriteError("A local diagnostic event could not be persisted.")
 
     def close(self) -> None:
-        self.provider.force_flush()
-        self.provider.shutdown()
+        # The scheduler must drain every worker/span first. This separate lock
+        # makes concurrent/repeated closes idempotent without blocking exporter
+        # callbacks on the JSONL/error-state lock.
+        with self._close_mutex:
+            with self._mutex:
+                if self._closed:
+                    return
+                self._closing = True
+            try:
+                try:
+                    if self.provider.force_flush() is False:
+                        self._trace_failed("TRACE_FLUSH_FAILED")
+                except Exception:
+                    self._trace_failed("TRACE_FLUSH_FAILED")
+                except BaseException:
+                    self._trace_failed("TRACE_FLUSH_FAILED")
+                    raise
+            finally:
+                try:
+                    try:
+                        self.provider.shutdown()
+                    except Exception:
+                        self._trace_failed("TRACE_SHUTDOWN_FAILED")
+                    except BaseException:
+                        self._trace_failed("TRACE_SHUTDOWN_FAILED")
+                        raise
+                finally:
+                    with self._mutex:
+                        self._closing = False
+                        self._closed = True

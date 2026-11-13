@@ -1507,9 +1507,15 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
     window_config = {"window_max_chars": config.get("window_max_chars", 14000),
                      "window_max_blocks": config.get("window_max_blocks", 60)}
     windows, ledger = _windows(documents, blocks, window_config)
-    results = []
-    for window in windows:
-        results.append(run_extraction_window(ctx, window, window_config, call_json))
+    concurrency = config.get("window_concurrency", 1)
+    _fail(type(concurrency) is not int or not 1 <= concurrency <= 4, "WINDOW_CONCURRENCY_INVALID")
+    if concurrency == 1:
+        results = [run_extraction_window(ctx, window, window_config, call_json) for window in windows]
+    else:
+        _fail(not callable(getattr(ctx, "run_parallel_units", None)), "WINDOW_CONCURRENCY_UNSUPPORTED")
+        results = ctx.run_parallel_units([(window["window_id"],
+            lambda child, window=window: run_extraction_window(child, window, window_config, call_json))
+            for window in windows], concurrency)
 
     try:
         deferred_closure = _close_deferred_context(windows, results)

@@ -307,189 +307,195 @@ class ChatProposalProvider:
                 raise ProviderFailure("PROVIDER_SESSION_INVALID")
             headers = {"User-Agent": OPENCODE_GO_USER_AGENT, "x-opencode-session": session}
         call_id = uuid.uuid4().hex
+        from .unit_concurrency import model_request_slot
         for attempt in range(1, self.config.max_attempts + 1):
-            metadata = {"call_id": call_id, "call_attempt": attempt,
-                        "provider": "opencode_go" if headers is not None else "chat_completions",
-                        "unit_id": unit_id, "operation": task_type,
-                        "model": self.config.model, "prompt_version": prompt_version,
-                        "input_hash": digest(payload), "usage_status": "unknown"}
-            # No authentication headers, endpoint credentials, or key values
-            # are serialized. Go's owned non-secret headers have a separate
-            # controlled transport capture.
-            captured = ctx.capture(f"request-{call_id}-{attempt}", redact_secret(payload, secret))
-            if captured["status"] == "write_failed":
-                raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
-            if headers is not None:
-                captured = ctx.capture(f"transport-{call_id}-{attempt}", {"service": "opencode_go",
-                                       "endpoint": self.config.endpoint, "headers": headers})
+            with model_request_slot(ctx) as release_slot:
+                metadata = {"call_id": call_id, "call_attempt": attempt,
+                            "provider": "opencode_go" if headers is not None else "chat_completions",
+                            "unit_id": unit_id, "operation": task_type,
+                            "model": self.config.model, "prompt_version": prompt_version,
+                            "input_hash": digest(payload), "usage_status": "unknown"}
+                # No authentication headers, endpoint credentials, or key values
+                # are serialized. Go's owned non-secret headers have a separate
+                # controlled transport capture.
+                captured = ctx.capture(f"request-{call_id}-{attempt}", redact_secret(payload, secret))
                 if captured["status"] == "write_failed":
                     raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
-            ctx.reserve_call(call_id, attempt, upper_usd, self.config.max_run_usd, self.config.max_run_calls,
-                             input_usd_per_million=self.config.input_usd_per_million,
-                             output_usd_per_million=self.config.output_usd_per_million,
-                             unit_id=unit_id, input_hash=metadata["input_hash"])
-            started = time.monotonic()
-            retryable = False
-            with ctx.call_span(metadata) as span:
-                metadata.update(trace_id=format(span.get_span_context().trace_id, "032x"),
-                                span_id=format(span.get_span_context().span_id, "016x"))
-                ctx.call_event("call.started", metadata)
-                try:
-                    if headers is None:
-                        response = self.transport(self.config.endpoint, payload, secret, self.config.timeout_seconds)
-                    else:
-                        response = self.transport(self.config.endpoint, payload, secret, self.config.timeout_seconds, headers=headers)
-                    raw_body = response if isinstance(response, bytes) else None
-                    if isinstance(response, bytes):
-                        if len(response) > 4 * 1024 * 1024:
-                            ctx.capture(f"response-error-{call_id}-{attempt}", redact_secret({"body_status": "truncated", "body": response[:65536].decode("utf-8", errors="replace")}, secret), partial=True)
-                            raise ProviderFailure("PROVIDER_RESPONSE_TOO_LARGE")
-                        try:
-                            response = json.loads(response)
-                        except (ValueError, UnicodeError):
-                            invalid_response = redact_secret({"body_status": "invalid_json", "body": response.decode("utf-8", errors="replace")}, secret)
-                            billing = _go_billing(None) if headers is not None else None
-                            _capture_response(ctx, f"response-error-{call_id}-{attempt}", invalid_response, billing,
-                                              call_id=call_id, attempt=attempt, response_sha256=digest(invalid_response),
-                                              secret=secret, rejected_response=True)
-                            if billing is not None:
-                                raise ProviderFailure("PROVIDER_BILLING_INVALID") from None
-                            raise ProviderFailure("PROVIDER_SCHEMA_INVALID") from None
-                    clean = redact_secret(response, secret)
-                    if headers is not None:
-                        try:
-                            json.dumps(clean, allow_nan=False)
-                        except (ValueError, TypeError, OverflowError):
-                            invalid_response = {"body_status": "noncanonical_json", "body": redact_secret(
-                                raw_body.decode("utf-8", errors="replace") if raw_body is not None else
-                                json.dumps(clean, ensure_ascii=False, default=lambda _: "[non-JSON value]"), secret)}
-                            billing = _go_billing(clean)
-                            billing.update(billing_status="invalid", policy_error_code="PROVIDER_BILLING_INVALID")
-                            _capture_response(ctx, f"response-error-{call_id}-{attempt}", invalid_response, billing,
-                                              call_id=call_id, attempt=attempt, response_sha256=digest(invalid_response),
-                                              secret=secret, rejected_response=True)
-                            raise ProviderFailure("PROVIDER_BILLING_INVALID")
-                    billing = _go_billing(clean) if headers is not None else None
-                    captured = _capture_response(ctx, f"response-{call_id}-{attempt}", clean, billing,
-                                                 call_id=call_id, attempt=attempt,
-                                                 response_sha256=digest(clean) if billing is not None else "", secret=secret)
+                if headers is not None:
+                    captured = ctx.capture(f"transport-{call_id}-{attempt}", {"service": "opencode_go",
+                                           "endpoint": self.config.endpoint, "headers": headers})
                     if captured["status"] == "write_failed":
                         raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
-                    usage = (response.get("usage") or {}) if isinstance(response, dict) else {}
-                    if not isinstance(usage, dict):
-                        usage = {}
-                    for remote, local in [("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"), ("total_tokens", "total_tokens")]:
-                        value = usage.get(remote)
-                        metadata[local] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-                    metadata["usage_status"] = "known" if _valid_usage(metadata["input_tokens"], metadata["output_tokens"], metadata["total_tokens"]) else "unknown"
-                    if metadata["usage_status"] == "known":
-                        estimate = usage_cost_estimate(metadata["input_tokens"], metadata["output_tokens"],
-                                                       self.config.input_usd_per_million, self.config.output_usd_per_million)
-                        if estimate <= Decimal("1e308"):
-                            metadata["cost"] = float(estimate)
-                    if isinstance(clean, dict) and isinstance(clean.get("id"), str):
-                        metadata["provider_request_id"] = clean["id"]
-                    metadata["output_hash"] = digest(clean)
-                    settlement = None
+                ctx.reserve_call(call_id, attempt, upper_usd, self.config.max_run_usd, self.config.max_run_calls,
+                                 input_usd_per_million=self.config.input_usd_per_million,
+                                 output_usd_per_million=self.config.output_usd_per_million,
+                                 unit_id=unit_id, input_hash=metadata["input_hash"])
+                started = time.monotonic()
+                retryable = False
+                with ctx.call_span(metadata) as span:
+                    metadata.update(trace_id=format(span.get_span_context().trace_id, "032x"),
+                                    span_id=format(span.get_span_context().span_id, "016x"))
+                    ctx.call_event("call.started", metadata)
                     try:
+                        try:
+                            if headers is None:
+                                response = self.transport(self.config.endpoint, payload, secret, self.config.timeout_seconds)
+                            else:
+                                response = self.transport(self.config.endpoint, payload, secret, self.config.timeout_seconds, headers=headers)
+                        finally:
+                            # Release before source validation can await prior windows.
+                            release_slot()
+                        raw_body = response if isinstance(response, bytes) else None
+                        if isinstance(response, bytes):
+                            if len(response) > 4 * 1024 * 1024:
+                                ctx.capture(f"response-error-{call_id}-{attempt}", redact_secret({"body_status": "truncated", "body": response[:65536].decode("utf-8", errors="replace")}, secret), partial=True)
+                                raise ProviderFailure("PROVIDER_RESPONSE_TOO_LARGE")
+                            try:
+                                response = json.loads(response)
+                            except (ValueError, UnicodeError):
+                                invalid_response = redact_secret({"body_status": "invalid_json", "body": response.decode("utf-8", errors="replace")}, secret)
+                                billing = _go_billing(None) if headers is not None else None
+                                _capture_response(ctx, f"response-error-{call_id}-{attempt}", invalid_response, billing,
+                                                  call_id=call_id, attempt=attempt, response_sha256=digest(invalid_response),
+                                                  secret=secret, rejected_response=True)
+                                if billing is not None:
+                                    raise ProviderFailure("PROVIDER_BILLING_INVALID") from None
+                                raise ProviderFailure("PROVIDER_SCHEMA_INVALID") from None
+                        clean = redact_secret(response, secret)
+                        if headers is not None:
+                            try:
+                                json.dumps(clean, allow_nan=False)
+                            except (ValueError, TypeError, OverflowError):
+                                invalid_response = {"body_status": "noncanonical_json", "body": redact_secret(
+                                    raw_body.decode("utf-8", errors="replace") if raw_body is not None else
+                                    json.dumps(clean, ensure_ascii=False, default=lambda _: "[non-JSON value]"), secret)}
+                                billing = _go_billing(clean)
+                                billing.update(billing_status="invalid", policy_error_code="PROVIDER_BILLING_INVALID")
+                                _capture_response(ctx, f"response-error-{call_id}-{attempt}", invalid_response, billing,
+                                                  call_id=call_id, attempt=attempt, response_sha256=digest(invalid_response),
+                                                  secret=secret, rejected_response=True)
+                                raise ProviderFailure("PROVIDER_BILLING_INVALID")
+                        billing = _go_billing(clean) if headers is not None else None
+                        captured = _capture_response(ctx, f"response-{call_id}-{attempt}", clean, billing,
+                                                     call_id=call_id, attempt=attempt,
+                                                     response_sha256=digest(clean) if billing is not None else "", secret=secret)
+                        if captured["status"] == "write_failed":
+                            raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
+                        usage = (response.get("usage") or {}) if isinstance(response, dict) else {}
+                        if not isinstance(usage, dict):
+                            usage = {}
+                        for remote, local in [("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"), ("total_tokens", "total_tokens")]:
+                            value = usage.get(remote)
+                            metadata[local] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+                        metadata["usage_status"] = "known" if _valid_usage(metadata["input_tokens"], metadata["output_tokens"], metadata["total_tokens"]) else "unknown"
                         if metadata["usage_status"] == "known":
-                            settlement = ctx.settle_call_usage(call_id, attempt, metadata["input_tokens"], metadata["output_tokens"],
-                                metadata["total_tokens"], response_sha256=metadata["output_hash"], unit_id=unit_id)
-                    finally:
-                        # A rejected billing policy must also latch when usage
-                        # settlement/event persistence fails. Never pretend that
-                        # an unsuccessful settlement was committed.
-                        if billing is not None:
-                            _record_go_billing(ctx, billing, call_id=call_id, attempt=attempt,
-                                               response_sha256=metadata["output_hash"], secret=secret)
-                    if billing is not None and billing["policy_error_code"]:
-                        raise ProviderFailure(billing["policy_error_code"])
-                    if settlement is not None and settlement["exceeds_reserved_upper"]:
-                        raise ProviderFailure("PROVIDER_USAGE_EXCEEDS_RESERVATION")
-                    choices = clean.get("choices") or []
-                    if not choices or choices[0].get("finish_reason") != "stop":
-                        raise ProviderFailure("PROVIDER_TRUNCATED_OR_INCOMPLETE")
-                    candidate = json.loads(choices[0]["message"]["content"])
-                    if not isinstance(candidate, dict):
-                        raise ProviderFailure("PROVIDER_SCHEMA_INVALID")
-                    try:
-                        proposal = validate(candidate)
-                    except (ProviderFailure, ValidationError):
-                        raise
+                            estimate = usage_cost_estimate(metadata["input_tokens"], metadata["output_tokens"],
+                                                           self.config.input_usd_per_million, self.config.output_usd_per_million)
+                            if estimate <= Decimal("1e308"):
+                                metadata["cost"] = float(estimate)
+                        if isinstance(clean, dict) and isinstance(clean.get("id"), str):
+                            metadata["provider_request_id"] = clean["id"]
+                        metadata["output_hash"] = digest(clean)
+                        settlement = None
+                        try:
+                            if metadata["usage_status"] == "known":
+                                settlement = ctx.settle_call_usage(call_id, attempt, metadata["input_tokens"], metadata["output_tokens"],
+                                    metadata["total_tokens"], response_sha256=metadata["output_hash"], unit_id=unit_id)
+                        finally:
+                            # A rejected billing policy must also latch when usage
+                            # settlement/event persistence fails. Never pretend that
+                            # an unsuccessful settlement was committed.
+                            if billing is not None:
+                                _record_go_billing(ctx, billing, call_id=call_id, attempt=attempt,
+                                                   response_sha256=metadata["output_hash"], secret=secret)
+                        if billing is not None and billing["policy_error_code"]:
+                            raise ProviderFailure(billing["policy_error_code"])
+                        if settlement is not None and settlement["exceeds_reserved_upper"]:
+                            raise ProviderFailure("PROVIDER_USAGE_EXCEEDS_RESERVATION")
+                        choices = clean.get("choices") or []
+                        if not choices or choices[0].get("finish_reason") != "stop":
+                            raise ProviderFailure("PROVIDER_TRUNCATED_OR_INCOMPLETE")
+                        candidate = json.loads(choices[0]["message"]["content"])
+                        if not isinstance(candidate, dict):
+                            raise ProviderFailure("PROVIDER_SCHEMA_INVALID")
+                        try:
+                            proposal = validate(candidate)
+                        except (ProviderFailure, ValidationError):
+                            raise
+                        except Exception as error:
+                            error_code = getattr(error, "code", "PROVIDER_SCHEMA_INVALID" if isinstance(error, (ValueError, KeyError, TypeError, AttributeError)) else "PROVIDER_VALIDATION_FAILED")
+                            if not isinstance(error_code, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", error_code):
+                                error_code = "PROVIDER_VALIDATION_FAILED"
+                            context = getattr(error, "diagnostic_context", None)
+                            if isinstance(context, dict):
+                                captured = ctx.capture(f"validation-{call_id}-{attempt}", redact_secret({
+                                    "status": "failed", "error_code": error_code,
+                                    "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id,
+                                    "diagnostic_context": context}, secret))
+                                if captured["status"] == "write_failed":
+                                    raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
+                            raise ProviderFailure(error_code) from None
+                        if not isinstance(proposal, dict):
+                            raise ProviderFailure("PROVIDER_VALIDATOR_CONTRACT_INVALID")
+                        validation_capture = ctx.capture(f"validation-{call_id}-{attempt}", {
+                            "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id,
+                            "status": "passed", "validated_output": proposal})
+                        if validation_capture["status"] == "write_failed":
+                            raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
+                        metadata.update(elapsed_ms=round((time.monotonic()-started)*1000), validation_status="passed")
+                        from .observability import safe_metadata
+                        span.set_attributes(safe_metadata(metadata))
+                        ctx.call_event("call.completed", metadata)
+                        return proposal
+                    except HTTPError as error:
+                        code = "PROVIDER_AUTH_FAILED" if error.code in (401, 403) else "PROVIDER_HTTP_ERROR"
+                        metadata["http_status"] = error.code
+                        retryable = error.code == 429 or 500 <= error.code < 600
+                        try:
+                            raw_error = error.read(65537)
+                            error_capture = {"http_status": error.code, "body_status": "truncated" if len(raw_error) > 65536 else "captured",
+                                             "body": raw_error[:65536].decode("utf-8", errors="replace")}
+                        except Exception:
+                            error_capture = {"http_status": error.code, "body_status": "unavailable"}
+                        captured = ctx.capture(f"response-error-{call_id}-{attempt}", redact_secret(error_capture, secret), partial=error_capture["body_status"] != "captured")
+                        if captured["status"] == "write_failed":
+                            code, retryable = "DIAGNOSTICS_CAPTURE_FAILED", False
+                    except (TimeoutError, URLError):
+                        code, retryable = "PROVIDER_NETWORK_ERROR", True
+                        captured = ctx.capture(f"response-error-{call_id}-{attempt}", {"error_code": code, "response_status": "unavailable", "billing_status": "unknown_may_be_charged"}, partial=True)
+                        if captured["status"] == "write_failed":
+                            code, retryable = "DIAGNOSTICS_CAPTURE_FAILED", False
+                    except ProviderFailure as error:
+                        code = error.error_code
+                    except (ProviderUsageSettlementError, ProviderBudgetPersistenceError, ProviderBudgetLedgerError) as error:
+                        code = error.code
+                    except (ValidationError, ValueError, KeyError, TypeError, AttributeError) as error:
+                        code = "PROVIDER_SCHEMA_INVALID"
+                        # Only schema locations/types; exception strings may echo credentials.
+                        details = [{"loc": list(item["loc"]), "type": item["type"]}
+                                   for item in error.errors(include_input=False, include_url=False)] if isinstance(error, ValidationError) else []
+                        ctx.capture(f"validation-{call_id}-{attempt}", redact_secret({"status": "failed", "error_code": code,
+                                    "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id, "schema_errors": details}, secret))
                     except Exception as error:
-                        error_code = getattr(error, "code", "PROVIDER_SCHEMA_INVALID" if isinstance(error, (ValueError, KeyError, TypeError, AttributeError)) else "PROVIDER_VALIDATION_FAILED")
-                        if not isinstance(error_code, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", error_code):
-                            error_code = "PROVIDER_VALIDATION_FAILED"
-                        context = getattr(error, "diagnostic_context", None)
-                        if isinstance(context, dict):
-                            captured = ctx.capture(f"validation-{call_id}-{attempt}", redact_secret({
-                                "status": "failed", "error_code": error_code,
-                                "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id,
-                                "diagnostic_context": context}, secret))
-                            if captured["status"] == "write_failed":
-                                raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-                        raise ProviderFailure(error_code) from None
-                    if not isinstance(proposal, dict):
-                        raise ProviderFailure("PROVIDER_VALIDATOR_CONTRACT_INVALID")
-                    validation_capture = ctx.capture(f"validation-{call_id}-{attempt}", {
-                        "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id,
-                        "status": "passed", "validated_output": proposal})
-                    if validation_capture["status"] == "write_failed":
-                        raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED")
-                    metadata.update(elapsed_ms=round((time.monotonic()-started)*1000), validation_status="passed")
+                        # An unexpected adapter failure is still an actual attempt.
+                        # Keep a safe private stack and a terminal event, never the
+                        # exception message or local values that may echo a key.
+                        from .runtime import _error_diagnostic
+                        code = "PROVIDER_EXECUTION_ERROR"
+                        ctx.capture(f"adapter-error-{call_id}-{attempt}", redact_secret(_error_diagnostic(error), secret))
+                    if code != "DIAGNOSTICS_CAPTURE_FAILED":
+                        ctx.capture(f"failure-{call_id}-{attempt}", {"status": "failed", "error_code": code,
+                                    "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id})
+                    metadata.update(error_code=code, validation_status="failed", elapsed_ms=round((time.monotonic()-started)*1000))
                     from .observability import safe_metadata
                     span.set_attributes(safe_metadata(metadata))
-                    ctx.call_event("call.completed", metadata)
-                    return proposal
-                except HTTPError as error:
-                    code = "PROVIDER_AUTH_FAILED" if error.code in (401, 403) else "PROVIDER_HTTP_ERROR"
-                    metadata["http_status"] = error.code
-                    retryable = error.code == 429 or 500 <= error.code < 600
-                    try:
-                        raw_error = error.read(65537)
-                        error_capture = {"http_status": error.code, "body_status": "truncated" if len(raw_error) > 65536 else "captured",
-                                         "body": raw_error[:65536].decode("utf-8", errors="replace")}
-                    except Exception:
-                        error_capture = {"http_status": error.code, "body_status": "unavailable"}
-                    captured = ctx.capture(f"response-error-{call_id}-{attempt}", redact_secret(error_capture, secret), partial=error_capture["body_status"] != "captured")
-                    if captured["status"] == "write_failed":
-                        code, retryable = "DIAGNOSTICS_CAPTURE_FAILED", False
-                except (TimeoutError, URLError):
-                    code, retryable = "PROVIDER_NETWORK_ERROR", True
-                    captured = ctx.capture(f"response-error-{call_id}-{attempt}", {"error_code": code, "response_status": "unavailable", "billing_status": "unknown_may_be_charged"}, partial=True)
-                    if captured["status"] == "write_failed":
-                        code, retryable = "DIAGNOSTICS_CAPTURE_FAILED", False
-                except ProviderFailure as error:
-                    code = error.error_code
-                except (ProviderUsageSettlementError, ProviderBudgetPersistenceError, ProviderBudgetLedgerError) as error:
-                    code = error.code
-                except (ValidationError, ValueError, KeyError, TypeError, AttributeError) as error:
-                    code = "PROVIDER_SCHEMA_INVALID"
-                    # Only schema locations/types; exception strings may echo credentials.
-                    details = [{"loc": list(item["loc"]), "type": item["type"]}
-                               for item in error.errors(include_input=False, include_url=False)] if isinstance(error, ValidationError) else []
-                    ctx.capture(f"validation-{call_id}-{attempt}", redact_secret({"status": "failed", "error_code": code,
-                                "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id, "schema_errors": details}, secret))
-                except Exception as error:
-                    # An unexpected adapter failure is still an actual attempt.
-                    # Keep a safe private stack and a terminal event, never the
-                    # exception message or local values that may echo a key.
-                    from .runtime import _error_diagnostic
-                    code = "PROVIDER_EXECUTION_ERROR"
-                    ctx.capture(f"adapter-error-{call_id}-{attempt}", redact_secret(_error_diagnostic(error), secret))
-                if code != "DIAGNOSTICS_CAPTURE_FAILED":
-                    ctx.capture(f"failure-{call_id}-{attempt}", {"status": "failed", "error_code": code,
-                                "call_id": call_id, "call_attempt": attempt, "unit_id": unit_id})
-                metadata.update(error_code=code, validation_status="failed", elapsed_ms=round((time.monotonic()-started)*1000))
-                from .observability import safe_metadata
-                span.set_attributes(safe_metadata(metadata))
-                from opentelemetry.trace import Status, StatusCode
-                span.set_status(Status(StatusCode.ERROR, code))
-                ctx.call_event("call.failed", metadata)
-            if not retryable or attempt == self.config.max_attempts:
-                raise ProviderFailure(code)
-            ctx.call_event("call.retry_scheduled", {**metadata, "retry_reason": code})
-            self.sleep(min(2 ** (attempt - 1), 4))
+                    from opentelemetry.trace import Status, StatusCode
+                    span.set_status(Status(StatusCode.ERROR, code))
+                    ctx.call_event("call.failed", metadata)
+                if not retryable or attempt == self.config.max_attempts:
+                    raise ProviderFailure(code)
+                ctx.call_event("call.retry_scheduled", {**metadata, "retry_reason": code})
+                self.sleep(min(2 ** (attempt - 1), 4))
         raise AssertionError("bounded attempt loop must return or fail")
 
 

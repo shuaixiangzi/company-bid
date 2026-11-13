@@ -433,9 +433,11 @@ def _prior_source_span_witnesses(ctx, request: dict, candidate: dict) -> list:
     unresolved = set(normalized.get("unresolved_block_ids", []))
     targets = {block["block_id"] for block in window.get("blocks", [])}
     available = {block["block_id"]: block for block in [*window.get("blocks", []), *window.get("adjacent_context", [])]}
-    record, executor = getattr(ctx, "_record", {}), getattr(ctx, "executor", None)
+    executor = getattr(ctx, "executor", None)
     if executor is None or not unresolved & targets:
         return []
+    snapshot = getattr(ctx, "prior_unit_record", None)
+    record = snapshot() if callable(snapshot) else getattr(ctx, "_record", {})
     found = {}
     for prior in record.get("units", {}).values():
         if prior.get("status") != "succeeded" or prior.get("version") != record.get("version"):
@@ -1174,7 +1176,9 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
     # third candidate after a bounded repair was already scheduled. Failed
     # windows require diagnosis/a changed child run; successful units are
     # returned by the executor before reaching this gateway.
-    previous = [capture for attempt in getattr(ctx, "_record", {}).get("attempts", [])
+    snapshot = getattr(ctx, "node_record_snapshot", None)
+    record = snapshot() if callable(snapshot) else getattr(ctx, "_record", {})
+    previous = [capture for attempt in record.get("attempts", [])
                 for capture in attempt.get("captures", [])
                 if capture.get("unit_id") == unit_id and
                 capture.get("name", "").startswith("validation-repair-scheduled-")]
