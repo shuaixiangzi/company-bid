@@ -31,6 +31,8 @@
 
 格式续文被误报为另一份新格式时，只有完整 N1 能独立证明唯一前窗原函、连续声明及真实边界，且该声明的全部原文已被原固定文本要求完整承载，才允许纠正一个被定位的错误格式声明。原业务要求和其它格式的数量、字段、来源及顺序不变；原始候选和删除前保护清单保存，只有受证明约束的一项格式声明与根级窗口格式状态可变。用于核对的比较视图不是模型响应，不得交给业务校验或覆盖原始内容；真正第二候选仍接受完整原校验。历史复验同时校对原 N1 与当前 N1 的完整来源证明，不能仅凭窗口局部相等忽略远处父条件变化。
 
+合同模板原本留空也须与读取失败分开。仅对完整原生 PDF、合同条款范围、连续原文和下一条边界均可核验的有限空字段形式，记录 `reading_status=read`、`value_status=blank_in_source`、`response_status=pending_manual`。字段中存在实质文字、未映射字符、未读对象、图片漏读或边界不明时，不按空白解除未决。一次有界纠正仅追加完整原字的合同待补项，旧要求、格式和其它未决保持；不能推断日期、进度、质量值、无要求或接受结论。N3 再从冻结 N1 独立核对，在正文与待补清单保留原文和同号缺项，不进入事实自动填入或付费技术写作。来源证明、校准关系与待补落点保存于受控产物；普通日志和 trace 只记元数据。
+
 ## Trace 实现
 
 采用 OpenTelemetry Python SDK，为节点和外部调用显式建 span；API/HTTP 可用标准 instrumentation 补充。跨 API 入队和 Worker 的上下文通过任务元数据传递。每次恢复或重跑有新的执行 trace，以 Span Link 关联前次尝试和复用产物，不维持一条跨多天的活动 span。OpenTelemetry 提供 attributes、events、exception 与 span links。[官方 Python instrumentation](https://opentelemetry.io/docs/languages/python/instrumentation/)

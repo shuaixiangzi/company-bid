@@ -14,6 +14,7 @@ from company_bid.pipeline import build_executor
     ("diagnostic_replay.py", {"N2"}),
     ("material_heading_sources.py", {"N2", "N3"}),
     ("format_continuation_sources.py", {"N2", "N3"}),
+    ("contract_blank_sources.py", {"N2", "N3"}),
     ("pipeline.py", {"N4", "N5", "N6"}),
     ("slots.py", {"N3"}),
     ("extraction.py", {"N2", "N3"}),

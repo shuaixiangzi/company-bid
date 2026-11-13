@@ -124,6 +124,19 @@ _FORMAT_CONTINUATION_REPAIR_INSTRUCTIONS = (
     "若不能按此窄合同保留全部原要求则停止；返回完整JSON接受原完整校验。"
 )
 
+_CONTRACT_BLANK_REPAIR_INSTRUCTIONS = (
+    "上一候选将合同模板中原本留空的字段列为读取未决。source_bound_contract_blank的source_proof"
+    "证明完整冻结原文、空字段和下一条边界；reading_status=read、value_status=blank_in_source，"
+    "不是读取失败，也不是无要求、默认同意或已满足。不得猜填日期、进度、质量标准或其他条款。"
+    "保留原候选全部requirements、format_chapters、原序、来源、protected_fields及默认值。"
+    "仅在requirements尾部按resolution_groups原序各追加一个合同待补响应项，citation.block_ids精确等于该组block_ids，"
+    "clause_id和table_row_id为null；完整填写required_response_fields：commercial/factual_response、mandatory=true、"
+    "confidence=low、not_prescribed、format_title=null、三类labels/keywords=[]。"
+    "完整保留原条款字句和空位，原文为空不能改写成公司承诺、技术方案或程序事项。"
+    "仅在新增项完整承载该组原文后移除该组未决，其余未决按原序保留；不能修改旧条款或借用远处证据ID。"
+    "如存在缺读、未映射字符、图片漏读或实质冲突，保留未决并停止。返回完整JSON接受全部校验。"
+)
+
 
 def _frozen_material_source(ctx):
     """Read the independent successful N1 checkpoint, never a model's context."""
@@ -761,6 +774,9 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
         if groups is None and not source_witnesses and source_data is not None:
             from .material_heading_sources import material_heading_source_groups
             groups = material_heading_source_groups(candidate, request, source_data["parsed"], source_data["manifest"])
+            if groups is None:
+                from .contract_blank_sources import contract_blank_source_groups
+                groups = contract_blank_source_groups(candidate, request, source_data["parsed"], source_data["manifest"])
         if groups is None:
             return None
         coverage["resolution_groups"] = groups
@@ -934,7 +950,7 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
         groups = coverage["resolution_groups"]
         added = candidate["requirements"][coverage["counts"]["requirements"]:]
         material_groups = [group for group in groups if group.get("resolution_kind") in {
-            "qualification_material_category_heading", "source_bound_material_heading"}]
+            "qualification_material_category_heading", "source_bound_material_heading", "source_bound_contract_blank"}]
         if material_groups:
             kinds = {group.get("resolution_kind") for group in groups}
             if (len(material_groups) != len(groups) or len(kinds) != 1 or len(added) != len(groups) or
@@ -942,12 +958,14 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
                     not 1 <= len(groups) <= 8):
                 return False
             for item, group in zip(added, groups):
-                if (group.get("required_response_fields") != _MATERIAL_RESPONSE_FIELDS or
+                from .contract_blank_sources import CONTRACT_BLANK_FIELDS
+                expected = CONTRACT_BLANK_FIELDS if group.get("resolution_kind") == "source_bound_contract_blank" else _MATERIAL_RESPONSE_FIELDS
+                if (group.get("required_response_fields") != expected or
                         group.get("source_proof_sha256") != digest(group.get("source_proof")) or
                         item.get("citation", {}).get("block_ids") != group["block_ids"] or
                         item["citation"].get("clause_id") or item["citation"].get("table_row_id") or
-                        any(field not in item or item[field] != value for field, value in _MATERIAL_RESPONSE_FIELDS.items()) or
-                        _valid_repair_fields(item, _Requirement, {"citation"}) != _MATERIAL_RESPONSE_FIELDS):
+                        any(field not in item or item[field] != value for field, value in expected.items()) or
+                        _valid_repair_fields(item, _Requirement, {"citation"}) != expected):
                     return False
         resolved = set()
         for item in added:
@@ -1030,7 +1048,9 @@ def _repair_capture(ctx, name, value):
 
 def _validation_repair_request(request, code, context, coverage, call_id, attempt=1):
     """Shared wire builder for live correction and a provenance-labelled probe."""
-    instructions = (_FORMAT_CONTINUATION_REPAIR_INSTRUCTIONS if code == "FORMAT_HEADING_NOT_GROUNDED" and
+    instructions = (_CONTRACT_BLANK_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+                    any(group.get("resolution_kind") == "source_bound_contract_blank" for group in coverage.get("resolution_groups", [])) else
+                    _FORMAT_CONTINUATION_REPAIR_INSTRUCTIONS if code == "FORMAT_HEADING_NOT_GROUNDED" and
                     coverage.get("format_continuation") else
                     _SOURCE_MATERIAL_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
                     any(group.get("resolution_kind") == "source_bound_material_heading"
@@ -1128,7 +1148,10 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
         source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
                            for group in rejected[2].get("resolution_groups", []))
-        relation = {"schema_version": "validation-repair-v9" if rejected[2].get("format_continuation") else
+        contract_blank = any(group.get("resolution_kind") == "source_bound_contract_blank"
+                             for group in rejected[2].get("resolution_groups", []))
+        relation = {"schema_version": "validation-repair-v10" if contract_blank else
+                    "validation-repair-v9" if rejected[2].get("format_continuation") else
                     "validation-repair-v8" if source_bound else "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],

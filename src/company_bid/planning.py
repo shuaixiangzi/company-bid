@@ -27,9 +27,10 @@ from .preparation_rules import preparation_rule, manual_signing_submission, proo
 from .plan_component_controls import collect_plan_controls, component_targets
 from .project_constraint_runtime import plan_project_constraints
 from .format_continuation_sources import fixed_letter_items as _fixed_letter_items
+from .contract_blank_sources import contract_blank_plan_items
 
 
-PLANNING_VERSION = "bid-plan-v21"
+PLANNING_VERSION = "bid-plan-v22"
 
 
 class _Fill(_Strict):
@@ -945,6 +946,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         existing_ids = {item["requirement_id"] for item in extracted["requirements"]}
         _fail(any(item["requirement_id"] in existing_ids for item in derived_requirements), "PREPARATION_SOURCE_RULE_CONFLICT")
         planned_requirements = [*extracted["requirements"], *derived_requirements]
+        contract_blanks = contract_blank_plan_items(planned_requirements, parsed, manifest)
+        contract_blank_handling = []
+        _capture(ctx, "n3-contract-source-blanks", {"items": contract_blanks,
+            "n2_candidate_mutation": False, "status": "source_read_values_pending" if contract_blanks else "not_detected"})
         source_controls = collect_plan_controls(planned_requirements, blocks, units, documents, _native_source_span)
         global_control_ids = {item["requirement_id"] for item in source_controls["global_controls"]}
         global_control_handling = []
@@ -1312,6 +1317,20 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 detail = details[rid]
                 placements.append({"requirement_id": rid, "section_id": section["section_id"],
                                    "response_mode": detail["response_mode"], "render_body": section["render_body"]})
+                if rid in contract_blanks:
+                    proof = contract_blanks[rid]["source_proof"]
+                    section["render_body"] = True
+                    section["nonwriting_requirement_refs"].append(rid)
+                    section["fixed_content"].append({"kind": "paragraph", "text": "合同模板原文（留空内容待补）：\n" + detail["text"],
+                        "source_refs": next(item["source_refs"] for item in requirements if item["requirement_id"] == rid)})
+                    marker = issue(section, [rid], "合同第" + proof["clause_number"] + "条：" + "、".join(proof["pending_fields"]) + "待补",
+                        "合同原文已完整读取，该位置在原模板中留空；未确定具体值或适用结论，不属于读取失败。",
+                        "线下核对并补充合同明确内容；不得猜填日期、进度、质量标准，不将留空解释为无要求或已满足。")
+                    contract_blank_handling.append({"requirement_id": rid, "section_id": section["section_id"],
+                        "issue_id": marker, "source_proof_sha256": contract_blanks[rid]["source_proof_sha256"],
+                        "reading_status": "read", "value_status": "blank_in_source", "response_status": "pending_manual",
+                        "writing_unit_ids": [], "adopted_fact_ids": [], "values_inferred": False})
+                    continue
                 if rid in global_control_ids:
                     requirement = next(item for item in requirements if item["requirement_id"] == rid)
                     _fail(bool(requirement.get("source_contexts")), "GLOBAL_CONTROL_CONTEXT_UNRESOLVED")
@@ -1579,6 +1598,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                       "values_policy": "preserve_source_slots_with_explicit_missing_issues_no_guessed_values"},
                   "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
+                  "contract_source_blanks": contract_blank_handling,
                   "review_actions": review_actions,
                   "component_dispositions": component_matrix, "component_number_conflicts": conflict_handling,
                   "global_critical_controls": global_control_handling,

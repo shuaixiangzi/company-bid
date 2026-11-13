@@ -345,7 +345,8 @@ class DiagnosticReplay:
                  first["terminal"].get("error_code") == code, "LINEAGE_INVALID")
         witnesses = self._witnesses(coverage, first_run, window)
         source_bound = bool(coverage.get("format_continuation")) or any(
-            group.get("resolution_kind") == "source_bound_material_heading" for group in coverage.get("resolution_groups", []))
+            group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank"}
+            for group in coverage.get("resolution_groups", []))
         source_data = self._n1(first_run)[0] if source_bound else None
         rebuilt = _repair_coverage(first["candidate"], first["task"], error_code=code,
                                    diagnostic_context=context, source_witnesses=witnesses, source_data=source_data)
@@ -356,7 +357,7 @@ class DiagnosticReplay:
             def source_identity(value):
                 value = copy.deepcopy(value)
                 for group in value.get("resolution_groups", []):
-                    if group.get("resolution_kind") == "source_bound_material_heading":
+                    if group.get("resolution_kind") in {"source_bound_material_heading", "source_bound_contract_blank"}:
                         proof = group["source_proof"]
                         # Both full N1 views were independently validated. Only
                         # their container digests can include fresh read artifacts;
@@ -418,12 +419,15 @@ class DiagnosticReplay:
             else:
                 relation_ref = _one(relations)
                 relation = run.capture(captures, relation_ref["name"])
-                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7", "validation-repair-v8", "validation-repair-v9"} and
+                _require(relation.get("schema_version") in {"validation-repair-v5", "validation-repair-v6", "validation-repair-v7", "validation-repair-v8", "validation-repair-v9", "validation-repair-v10"} and
                          relation.get("status") == "completed" and relation.get("unit_id") == unit["unit_id"] and
                          relation.get("repair_attempt") == 1 and relation.get("second_call_started") is True, "LINEAGE_INVALID")
                 source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
                                    for group in relation.get("required_coverage", {}).get("resolution_groups", []))
                 _require((relation["schema_version"] == "validation-repair-v8") == source_bound, "LINEAGE_INVALID")
+                _require((relation["schema_version"] == "validation-repair-v10") == any(
+                    group.get("resolution_kind") == "source_bound_contract_blank"
+                    for group in relation.get("required_coverage", {}).get("resolution_groups", [])), "LINEAGE_INVALID")
                 _require((relation["schema_version"] == "validation-repair-v9") == bool(
                     relation.get("required_coverage", {}).get("format_continuation")), "LINEAGE_INVALID")
                 first = run.call(node, unit["unit_id"], attempt, relation["first_call_id"], relation["first_call_attempt"], passed=False)
