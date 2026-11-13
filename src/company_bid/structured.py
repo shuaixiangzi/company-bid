@@ -67,6 +67,15 @@ _LITERAL_NOTE_REPAIR_INSTRUCTIONS = (
     "只有追加该完整原字备注后才可移除对应未决ID，不能仅清空标记、改旧候选或引用远处内容。"
     "若仍有实质冲突、缺读或不能按该窄合同保留原字，则保留未决并停止。返回完整JSON接受原校验。"
 )
+_CELL_LABEL_REPAIR_INSTRUCTIONS = (
+    "本次反馈同时包含一个额外的、严格限界的标签问题：exact_cell_label_restore定位旧候选的唯一"
+    "attachment_keywords元素，并提供同一已选原生PDF单元格中唯一的含LF原字required_replacement。"
+    "该片段是来源原字恢复，不是物理断词证明，不允许删除LF合并原文或解释其它空白。"
+    "仅将editable_label指定index元素替换成required_replacement，完整保留该数组原数量、原序及其余元素；"
+    "不能删词、改同义词、换来源或改变业务类别。其它protected_fields全部保留。"
+    "同时仍须按resolution_groups完整追加处理相邻来源组；仅修标签不能清除任何未决。"
+    "不确定的实质内容仍须保持未决，第二个错误不在此纠正授权内；返回完整JSON接受原校验。"
+)
 
 
 def _literal_placeholder_resolution_groups(candidate: dict, window: dict) -> list | None:
@@ -312,7 +321,7 @@ def _adjacent_resolution_groups(candidate: dict, window: dict, witnesses=()) -> 
     return eligible
 
 
-def _existing_inventory_is_grounded(candidate: dict, window: dict, editable_title_index=None) -> bool:
+def _existing_inventory_is_grounded(candidate: dict, window: dict, editable_title_index=None, *, label_failure=None) -> bool:
     """Reject an extra paid correction when another existing item is invalid.
 
     This checks local selections, not the remote reading packet's private
@@ -344,7 +353,12 @@ def _existing_inventory_is_grounded(candidate: dict, window: dict, editable_titl
                 return False
             item["citation"] = _citation(item["citation"], available, skips, clauses, continuations, rows)
             _guard_heading_only_requirement(item, available, skips)
-            _label_grounding(item, available, window)
+            try:
+                _label_grounding(item, available, window)
+            except PlanningError as error:
+                if label_failure is not None and error.code == "EXTRACTION_LABEL_NOT_GROUNDED":
+                    label_failure.update(candidate_index=index, **error.diagnostic_context)
+                raise
             if item["category"] == "technical" and item["response_mode"] == "writing":
                 _guard_clause_selection(item["citation"], available, clauses)
             rule = _RESPONSE_CATEGORY_RULES.get(item["response_mode"])
@@ -366,6 +380,81 @@ def _existing_inventory_is_grounded(candidate: dict, window: dict, editable_titl
         return True
     except (ValidationError, PlanningError, KeyError, TypeError, AttributeError, ValueError):
         return False
+
+
+def _exact_native_cell_label_restore(candidate: dict, window: dict, failure: dict) -> dict | None:
+    """Restore one label to a unique original LF substring, without joining it.
+
+    Logical grid coordinates prove where the original string is stored. They
+    do not establish physical line geometry or license removing a line break.
+    Every other inventory guard must pass after this one exact replacement.
+    """
+    from .extraction import PlanningError, _citation, build_clause_catalog, build_table_continuations, build_table_row_catalog
+
+    index, label_index = failure.get("candidate_index"), failure.get("label_index")
+    if (failure.get("field") != "attachment_keywords" or type(index) is not int or type(label_index) is not int or
+            window.get("source_format") != "pdf" or not re.fullmatch(r"[a-f0-9]{64}", str(window.get("source_sha256", ""))) or
+            window.get("source_sha256") == "0" * 64):
+        return None
+    try:
+        item = candidate["requirements"][index]
+        label = item["attachment_keywords"][label_index]
+        if not isinstance(label, str) or not 2 <= len(label) <= 80 or not label.isalnum():
+            return None
+        blocks = [*window["blocks"], *window.get("adjacent_context", [])]
+        available = {block["block_id"]: block for block in blocks}
+        if len(available) != len(blocks):
+            return None
+        skips = {row["block_id"]: row for row in window.get("safe_skip_blocks", [])}
+        document = {"source_id": window["source_id"], "sha256": window["source_sha256"], "format": "pdf"}
+        continuations = build_table_continuations(document, blocks, skips)
+        rows = build_table_row_catalog(document, blocks, continuations)
+        citation = _citation(item["citation"], available, skips, build_clause_catalog(window), continuations, rows)
+        matches, seen = [], set()
+        for ref in citation.get("cell_refs", []):
+            key = ref.get("block_id", citation["block_id"])
+            block = available[key]
+            row, column = ref["row"], ref["column"]
+            if (type(row) is not int or type(column) is not int or (key, row, column) in seen):
+                return None
+            seen.add((key, row, column))
+            locator = re.fullmatch(r"pdf/page\[(\d+)\]/table\[(\d+)\]", str(block.get("locator", "")))
+            if (not locator or block.get("kind") != "table" or block.get("origin") != "native" or
+                    block.get("source_id") != window["source_id"] or block.get("read_disposition") or key in skips or
+                    block.get("text_basis") != "table_rows_tsv_v1" or type(block.get("page")) is not int or
+                    block["page"] != int(locator[1])):
+                return None
+            cell = block["rows"][row][column]
+            for split in range(1, len(label)):
+                replacement = label[:split] + "\n" + label[split:]
+                start = 0
+                while (offset := cell.find(replacement, start)) >= 0:
+                    if replacement not in citation["quote"]:
+                        return None
+                    matches.append((block, row, column, cell, offset, replacement))
+                    start = offset + 1
+        if len(matches) != 1:
+            return None
+        block, row, column, cell, offset, replacement = matches[0]
+        corrected = copy.deepcopy(candidate)
+        corrected["requirements"][index]["attachment_keywords"][label_index] = replacement
+        if not _existing_inventory_is_grounded(corrected, window):
+            return None
+        proof = {"rule": "exact_native_cell_lf_label_restore_v1", "window_id": window["window_id"],
+            "source_id": window["source_id"], "source_sha256": window["source_sha256"],
+            "block_id": block["block_id"], "locator": block["locator"], "page": block["page"],
+            "row": row, "column": column, "cell_start": offset, "cell_end": offset + len(replacement),
+            "cell_sha256": hashlib.sha256(cell.encode()).hexdigest(),
+            "block_text_sha256": hashlib.sha256(block["text"].encode()).hexdigest(),
+            "grid_sha256": digest({key: block.get(key, []) for key in ("rows", "merges", "column_widths", "header_rows")}),
+            "selected_block_ids": citation["block_ids"], "quote_sha256": citation["quote_sha256"],
+            "original_label_sha256": hashlib.sha256(label.encode()).hexdigest(),
+            "physical_line_join_proven": False, "source_text_modified": False,
+            "replacement_basis": "unique_exact_original_cell_substring_with_one_LF"}
+        return {"candidate_index": index, "field": "attachment_keywords", "label_index": label_index,
+                "required_replacement": replacement, "source_proof": proof, "source_proof_sha256": digest(proof)}
+    except (PlanningError, KeyError, IndexError, TypeError, AttributeError, ValueError):
+        return None
 
 
 def _valid_repair_fields(item: dict, model, excluded: set[str]) -> dict:
@@ -397,14 +486,26 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
     coverage = {"counts": {}, "anchors": {}, "entries": {},
                 "window_fields": _valid_repair_fields(candidate, _LiveWindowResponse, {"requirements", "format_chapters"})}
     context = _repair_context(diagnostic_context)
+    label_restore = None
     if error_code in {"FORMAT_TITLE_NOT_GROUNDED", "LIVE_REQUIRED_BLOCK_UNRESOLVED"}:
         try:
             _LiveWindowResponse.model_validate(candidate, strict=True)
         except ValidationError:
             return None
+        failure = {}
         if not _existing_inventory_is_grounded(candidate, window,
-                context.get("candidate_index") if error_code == "FORMAT_TITLE_NOT_GROUNDED" else None):
-            return None
+                context.get("candidate_index") if error_code == "FORMAT_TITLE_NOT_GROUNDED" else None,
+                label_failure=failure):
+            # This is one specific two-problem contract, not general multi-error
+            # repair. Literal notes and prior-witness groups keep their old gate.
+            groups = _adjacent_resolution_groups(candidate, window) if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else None
+            if (groups is None or len(groups) != 1 or source_witnesses or
+                    groups[0].get("basis") != "same_page_native_consecutive_target_and_adjacent_lines"):
+                return None
+            label_restore = _exact_native_cell_label_restore(candidate, window, failure)
+            if label_restore is None:
+                return None
+            coverage["exact_cell_label_restore"] = label_restore
     if error_code == "LIVE_REQUIRED_BLOCK_UNRESOLVED":
         groups = _adjacent_resolution_groups(candidate, window, source_witnesses)
         if groups is None:
@@ -471,6 +572,13 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
                 values = protected.pop(label_field)
                 entry["editable_label"] = {"field": label_field, "label_index": label_index,
                                            "prefix": values[:label_index], "suffix": values[label_index + 1:]}
+            if label_restore and field == "requirements" and label_restore["candidate_index"] == index:
+                field_name, position = label_restore["field"], label_restore["label_index"]
+                values = protected.pop(field_name)
+                entry["editable_label"] = {"field": field_name, "label_index": position,
+                    "prefix": values[:position], "suffix": values[position + 1:],
+                    "required_replacement": label_restore["required_replacement"],
+                    "source_proof_sha256": label_restore["source_proof_sha256"]}
             if (error_code == "FORMAT_TITLE_NOT_GROUNDED" and field == "requirements" and
                     context.get("candidate_type") == "requirement" and context.get("candidate_index") == index and
                     context.get("field") == "format_title" and isinstance(protected.get("format_title"), str) and
@@ -544,6 +652,8 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
             if editable:
                 values = fields.get(editable["field"])
                 prefix, suffix = editable["prefix"], editable["suffix"]
+                if "required_replacement" in editable and values != prefix + [editable["required_replacement"]] + suffix:
+                    return False
                 if (not isinstance(values, list) or len(values) not in {len(prefix) + len(suffix), len(prefix) + len(suffix) + 1} or
                         values[:len(prefix)] != prefix or (suffix and values[-len(suffix):] != suffix)):
                     return False
@@ -639,6 +749,8 @@ def _validation_repair_request(request, code, context, coverage, call_id, attemp
                         for group in coverage.get("resolution_groups", [])) else
                     _ADJACENT_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else
                     _REPAIR_INSTRUCTIONS)
+    if coverage.get("exact_cell_label_restore"):
+        instructions += _CELL_LABEL_REPAIR_INSTRUCTIONS
     result = copy.deepcopy(request)
     result["task_instructions"] = request.get("task_instructions", "") + "\n\n" + instructions
     result["validation_feedback"] = {"code": code, "context": context, "required_coverage": coverage,
@@ -714,7 +826,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise
         if first_context.capture_failed or getattr(ctx, "_capture_failed", False):
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
-        relation = {"schema_version": "validation-repair-v5", "unit_id": unit_id, "task_type": task_type,
+        relation = {"schema_version": "validation-repair-v6", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],

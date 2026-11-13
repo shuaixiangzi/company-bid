@@ -59,7 +59,7 @@ def test_literal_note_requires_exact_source_append_and_keeps_real_obligations(tm
     window, first, second = literal_case(tmp_path, block_limit=block_limit)
     state, validated, relation, feedback = run_repair(tmp_path, monkeypatch, window, first, second)
     assert state["status"] == "succeeded" and validated == [first, second]
-    assert relation["schema_version"] == "validation-repair-v5" and relation["status"] == "completed"
+    assert relation["schema_version"] == "validation-repair-v6" and relation["status"] == "completed"
     assert relation["first_candidate_hash"] == digest(first)
     assert relation["second_candidate_hash"] == digest(second)
     assert relation["first_request_hash"] != relation["repair_request_hash"]
