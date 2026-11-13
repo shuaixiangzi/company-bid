@@ -18,7 +18,7 @@ def read_json(path):
 
 
 def safe_summary(state):
-    summary = {key: state.get(key) for key in ("run_id", "status", "parent_run_id", "fork_from_node", "cursor", "error_code", "observability", "call_budget") if key in state}
+    summary = {key: state.get(key) for key in ("run_id", "status", "parent_run_id", "fork_from_node", "cursor", "error_code", "artifact_scope", "observability", "call_budget") if key in state}
     if state.get("error_code"):
         summary["error_type"] = state.get("error_type")
     return summary
@@ -46,7 +46,7 @@ def parser():
     fork.add_argument("--input", type=Path)
     fork.add_argument("--proposals", type=Path)
     fork.add_argument("--recorded-candidates", type=Path)
-    for action in ("inspect", "result", "repair", "diagnose"):
+    for action in ("inspect", "result", "diagnostic-result", "repair", "diagnose"):
         actions.add_parser(action).add_argument("run_id")
     compare = actions.add_parser("diff")
     compare.add_argument("old_run")
@@ -116,12 +116,24 @@ def main(argv=None):
             atomic_json(target, report)
             print(json.dumps({"comparison": str(target.resolve())}))
             return 0
-        elif args.command == "result":
+        elif args.command in ("result", "diagnostic-result"):
             state = executor.inspect(args.run_id)
             if state["status"] != "succeeded":
                 raise ProviderFailure("RUN_NOT_PUBLISHED")
             output = executor.output(args.run_id)
-            if config.get("pipeline") == "library":
+            diagnostic = executor.artifact_scope(args.run_id) == "diagnostic"
+            if args.command == "result" and diagnostic:
+                raise ProviderFailure("DIAGNOSTIC_RESULT_NOT_PUBLISHED")
+            if args.command == "diagnostic-result":
+                if (not diagnostic or output.get("publication_status") != "diagnostic_only" or "files" in output or
+                        not isinstance(output.get("diagnostic_files"), dict)):
+                    raise ProviderFailure("RUN_NOT_DIAGNOSTIC_RESULT")
+                print(json.dumps({"run_id": args.run_id, "publication_status": "diagnostic_only",
+                    "diagnostic_files": {k: {**v, "path": str(args.root.resolve() / v["path"])}
+                                         for k, v in output["diagnostic_files"].items()},
+                    "generation_mode": output["generation_mode"]}, ensure_ascii=False))
+                return 0
+            if state["execution_config"].get("pipeline") == "library":
                 print(json.dumps({"run_id": args.run_id, "snapshot_id": output["snapshot_id"], "library_status": output["status"],
                                   "counts": output["counts"], "snapshot_path": str(args.root.resolve() / output["snapshot_artifact"]["path"])}, ensure_ascii=False))
                 return 0

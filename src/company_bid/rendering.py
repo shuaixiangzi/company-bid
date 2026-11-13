@@ -553,7 +553,27 @@ def _render_issues(package):
     return document
 
 
-def render_package(package: DocumentPackage, output_dir: Path) -> dict:
+DIAGNOSTIC_MARKER = "诊断回放产物 · 仅供诊断核对 · 不可作为正式投标文件"
+
+
+def _mark_diagnostic(document, package):
+    """Mark the actual first page, including a source-prescribed cover."""
+    document.core_properties.title = "【诊断回放】" + document.core_properties.title
+    paragraph = document.paragraphs[0].insert_paragraph_before(DIAGNOSTIC_MARKER)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.keep_with_next = True
+    _font(paragraph.runs[0], name=package.style.font_family, size=14, bold=True, color="A80000")
+    for section in document.sections:
+        for header in (section.header, section.first_page_header, section.even_page_header):
+            header.is_linked_to_previous = False
+            if any(paragraph.text == DIAGNOSTIC_MARKER for paragraph in header.paragraphs):
+                continue
+            paragraph = header.add_paragraph(DIAGNOSTIC_MARKER)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _font(paragraph.runs[0], name=package.style.font_family, size=9, bold=True, color="A80000")
+
+
+def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bool = False) -> dict:
     """Assemble both files completely and exclusively; never overwrite results.
 
     Pagination uses real Word fields. The caller must visually verify the
@@ -561,7 +581,8 @@ def render_package(package: DocumentPackage, output_dir: Path) -> dict:
     """
     package = DocumentPackage.model_validate(package.model_dump())
     output_dir = Path(output_dir)
-    targets = {"bid_docx": output_dir / "投标文件.docx", "issues_docx": output_dir / "待补清单.docx"}
+    prefix = "诊断回放-" if diagnostic else ""
+    targets = {"bid_docx": output_dir / (prefix + "投标文件.docx"), "issues_docx": output_dir / (prefix + "待补清单.docx")}
     if any(path.exists() for path in targets.values()):
         raise FileExistsError("output already exists; use a new immutable result directory")
     _validate_files(package)
@@ -570,8 +591,12 @@ def render_package(package: DocumentPackage, output_dir: Path) -> dict:
     try:
         with tempfile.TemporaryDirectory(prefix=".render-", dir=output_dir) as staging:
             staged = {key: Path(staging) / path.name for key, path in targets.items()}
-            _render_bid(package).save(staged["bid_docx"])
-            _render_issues(package).save(staged["issues_docx"])
+            bid, issues = _render_bid(package), _render_issues(package)
+            if diagnostic:
+                _mark_diagnostic(bid, package)
+                _mark_diagnostic(issues, package)
+            bid.save(staged["bid_docx"])
+            issues.save(staged["issues_docx"])
             for key, target in targets.items():
                 with target.open("xb") as dest:
                     published.append(target)

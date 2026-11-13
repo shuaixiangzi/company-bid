@@ -9,6 +9,7 @@ unbounded retries or run other nodes themselves.
 from __future__ import annotations
 
 import copy
+import json
 import re
 import time
 import traceback
@@ -40,6 +41,22 @@ class CheckpointInvalidError(RuntimeContractError):
 
 class CaptureFailedError(RuntimeContractError):
     code = "DIAGNOSTICS_CAPTURE_FAILED"
+
+
+class DiagnosticPublicationError(RuntimeContractError):
+    code = "DIAGNOSTIC_PUBLICATION_SCOPE_INVALID"
+
+
+def diagnostic_artifact(value: dict) -> bool:
+    """Recognize only explicit provenance fields, never source text or a title."""
+    if not isinstance(value, dict):
+        return False
+    chain = value.get("chain_diagnostics")
+    return (value.get("artifact_scope") == "diagnostic" or
+            value.get("publication_status") == "diagnostic_only" or
+            "diagnostic_files" in value or "diagnostic_replay" in value or
+            isinstance(chain, dict) and ("diagnostic_replay" in chain or
+                                        chain.get("publication_status") == "diagnostic_only"))
 
 
 class ProviderBudgetError(RuntimeContractError):
@@ -228,6 +245,10 @@ class NodeContext:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self._capture_failed = False
         self._active_unit: dict = {}
+
+    @property
+    def artifact_scope(self) -> str:
+        return self.executor._artifact_scope(self._state)
 
     def _persist(self) -> None:
         self.executor._save(self._state)
@@ -437,6 +458,7 @@ class NodeContext:
         if not isinstance(input_data, dict):
             raise RuntimeContractError("Unit input must be a JSON object.")
         input_data = redact_payload(input_data)
+        self.executor._artifact_scope(self._state, input_data)
         input_hash = digest(input_data)
         units = self._record["units"]
         if unit_id not in units:
@@ -449,6 +471,7 @@ class NodeContext:
         if record["status"] == "succeeded":
             try:
                 output = self.executor._checkpoint_data(record)
+                self.executor._artifact_scope(self._state, output)
             except ArtifactIntegrityError as exc:
                 raise CheckpointInvalidError(self.node_key) from exc
             reuse_metadata = self._metadata(unit_id=unit_id, unit_attempt_id=record["attempts"][-1]["attempt_id"],
@@ -481,6 +504,7 @@ class NodeContext:
                     raise CaptureFailedError("Required unit capture did not persist.")
                 output = redact_payload(output)
                 self.executor.store.validate_embedded_artifacts(output)
+                self.executor._artifact_scope(self._state, output)
                 reference = self.executor._write_checkpoint(self._state, self._record, attempt, input_hash, output, unit_id)
                 span.set_attribute("output_hash", digest(output))
                 span.set_attribute("validation_status", "passed")
@@ -535,6 +559,55 @@ class Executor:
         return [{"key": node.key, "version": node.version,
                  "config_keys": list(node.config_keys) if node.config_keys is not None else None} for node in self.nodes]
 
+    def _artifact_scope(self, state: dict, value: dict | None = None) -> str:
+        if (state.get("artifact_scope") == "diagnostic" or
+                state["execution_config"].get("run_purpose") == "diagnostic_replay" or
+                diagnostic_artifact(value)):
+            state["artifact_scope"] = "diagnostic"
+        return state.get("artifact_scope", "standard")
+
+    def artifact_scope(self, run_id: str) -> str:
+        """Derive scope from frozen config and validated artifacts without writes."""
+        state = self.store.read_state(run_id)
+        self._validate(state)
+        return self._artifact_scope(state)
+
+    def _diagnostic_completion_event(self, state: dict, observer: Observer | None = None) -> None:
+        """Recover a diagnostic completion event without publishing or rerendering."""
+        if self._artifact_scope(state) != "diagnostic":
+            return
+        record = state["nodes"][-1]
+        reference = record["output_ref"]
+        event_name = "artifact.diagnostic_created"
+        # A crash can occur after the event append but before state persistence.
+        # The immutable final artifact identity makes that retry idempotent.
+        path = self.store.run_dir(state["run_id"]) / "events.jsonl"
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("Invalid diagnostic event record.")
+                    if (event.get("event") == event_name and event.get("artifact_id") == reference["artifact_id"] and
+                            event.get("output_hash") == record["output_hash"]):
+                        return
+            except (OSError, ValueError, TypeError) as exc:
+                raise ObservabilityWriteError("Diagnostic completion evidence is unreadable.") from exc
+        attempt = record["attempts"][-1] if record["attempts"] else record.get("reused_trace", {})
+        metadata = {"node_key": record["key"], "node_version": record["version"],
+                    "node_attempt_id": attempt.get("attempt_id"), "trace_id": attempt.get("trace_id"),
+                    "span_id": attempt.get("span_id"), "artifact_id": reference["artifact_id"],
+                    "output_hash": record["output_hash"]}
+        own_observer = observer is None
+        observer = observer or Observer(self.store.run_dir(state["run_id"]), state["run_id"])
+        try:
+            observer.event(event_name, metadata)
+            observer.check()
+        finally:
+            if own_observer:
+                observer.close()
+                observer.check()
+
     def create_run(self, initial_input: dict) -> str:
         if not isinstance(initial_input, dict):
             raise RuntimeContractError("Initial input must be a JSON object.")
@@ -551,6 +624,7 @@ class Executor:
                  "observability": {"trace_status": "not_started", "capture_status": "not_started" if self.execution_config.get("debug_capture", True) else "disabled_by_policy"},
                  "nodes": [{"key": node.key, "version": node.version, "status": "pending", "attempts": [], "units": {}}
                            for node in self.nodes]}
+        self._artifact_scope(state, initial_input)
         self.store.write_state(state)
         return run_id
 
@@ -588,6 +662,7 @@ class Executor:
             initial = self.store.read_json(state["initial_input_ref"])
             if digest(initial) != state["initial_input_hash"]:
                 raise ArtifactIntegrityError("Frozen input changed.")
+            self._artifact_scope(state, initial)
         except ArtifactIntegrityError as exc:
             raise CheckpointInvalidError(self.nodes[0].key) from exc
         previous_hash = state["initial_input_hash"]
@@ -597,15 +672,17 @@ class Executor:
                 if record["status"] == "succeeded":
                     if seen_pending or record["input_hash"] != previous_hash:
                         raise ArtifactIntegrityError("Checkpoint prefix is invalid.")
-                    self._checkpoint_data(record)
+                    self._artifact_scope(state, self._checkpoint_data(record))
                     previous_hash = record["output_hash"]
                 else:
                     seen_pending = True
                 for unit in record["units"].values():
-                    if digest(self.store.read_json(unit["input_ref"])) != unit["input_hash"]:
+                    unit_input = self.store.read_json(unit["input_ref"])
+                    if digest(unit_input) != unit["input_hash"]:
                         raise ArtifactIntegrityError("Frozen unit input changed.")
+                    self._artifact_scope(state, unit_input)
                     if unit["status"] == "succeeded":
-                        self._checkpoint_data(unit)
+                        self._artifact_scope(state, self._checkpoint_data(unit))
             except (ArtifactIntegrityError, KeyError, TypeError) as exc:
                 raise CheckpointInvalidError(record["key"]) from exc
         expected_cursor = next((i for i, item in enumerate(state["nodes"]) if item["status"] != "succeeded"), len(self.nodes))
@@ -633,10 +710,12 @@ class Executor:
                 self._save(state)
                 raise
             if state["status"] == "succeeded":
+                self._diagnostic_completion_event(state)
                 return state
             if state["cursor"] == len(self.nodes):
                 # Reconcile a durable final checkpoint even when the process or
                 # diagnostic sink failed before its caller saw completion.
+                self._diagnostic_completion_event(state)
                 state.update(status="succeeded", error_code=None)
                 self._save(state)
                 return state
@@ -682,6 +761,7 @@ class Executor:
                         context = None
                         input_data = (self.store.read_json(state["initial_input_ref"]) if index == 0 else
                                       self._checkpoint_data(state["nodes"][index - 1]))
+                        self._artifact_scope(state, input_data)
                         input_hash = digest(input_data)
                         attempt = {"attempt_id": uuid.uuid4().hex, "job_attempt_id": job_attempt["attempt_id"],
                                    "status": "running", "started_at": utc_now(), "input_hash": input_hash,
@@ -707,6 +787,8 @@ class Executor:
                                 raise RuntimeContractError("Node output must be a JSON object.")
                             result = redact_payload(result)
                             self.store.validate_embedded_artifacts(result)
+                            if self._artifact_scope(state, result) == "diagnostic" and "files" in result:
+                                raise DiagnosticPublicationError("Diagnostic artifacts cannot use ordinary publication fields.")
                             context.capture("node-output", result)
                             if context._capture_failed:
                                 raise CaptureFailedError("Required debug capture did not persist.")
@@ -729,8 +811,11 @@ class Executor:
                         if state["status"] == "paused_debug":
                             observer.event("node.paused", {**metadata, "span_id": attempt["span_id"], "status": "paused_debug"})
                         if state["status"] == "succeeded":
-                            observer.event("artifact.published", {**metadata, "span_id": attempt["span_id"],
-                                           "artifact_id": reference["artifact_id"], "output_hash": digest(result)})
+                            if self._artifact_scope(state) == "diagnostic":
+                                self._diagnostic_completion_event(state, observer)
+                            else:
+                                observer.event("artifact.published", {**metadata, "span_id": attempt["span_id"],
+                                               "artifact_id": reference["artifact_id"], "output_hash": digest(result)})
                         if spec.key == stop_after:
                             break
                     job_attempt.update(status="succeeded" if state["status"] == "succeeded" else "paused_debug", ended_at=utc_now())
@@ -806,7 +891,7 @@ class Executor:
                 if record["status"] != "succeeded" or record["key"] != keys[index] or record["version"] != self.nodes[index].version:
                     raise ConfigurationChangedError("The requested prefix cannot be reused with these node versions.")
                 try:
-                    self._checkpoint_data(record)
+                    self._artifact_scope(parent, self._checkpoint_data(record))
                 except ArtifactIntegrityError as exc:
                     raise CheckpointInvalidError(record["key"]) from exc
                 new_config = execution_config if execution_config is not None else self.execution_config
@@ -823,6 +908,16 @@ class Executor:
                     raise ConfigurationChangedError("The selected prefix consumes changed configuration; fork earlier.")
             if not repair:
                 self._validate(parent)
+            else:
+                # Preserve known diagnostic provenance even when a repair may
+                # discard a damaged later checkpoint. Never modify the parent.
+                self._artifact_scope(parent, self.store.read_json(parent["initial_input_ref"]))
+                for record in parent["nodes"][start:]:
+                    if record["status"] == "succeeded":
+                        try:
+                            self._artifact_scope(parent, self._checkpoint_data(record))
+                        except ArtifactIntegrityError:
+                            pass  # The original repair contract discards this suffix.
             initial = initial_input if initial_input is not None else self.store.read_json(parent["initial_input_ref"])
             config = execution_config if execution_config is not None else self.execution_config
             child_executor = Executor(self.store.root, self.nodes, config)
@@ -830,6 +925,8 @@ class Executor:
             child = self.store.read_state(child_id)
             child.update(parent_run_id=run_id, fork_from_node=from_node, fork_reason="checkpoint_repair" if repair else "rerun",
                          cursor=start)
+            if self._artifact_scope(parent) == "diagnostic":
+                child["artifact_scope"] = "diagnostic"
             for index in range(start):
                 original = parent["nodes"][index]
                 reused = copy.deepcopy(original)

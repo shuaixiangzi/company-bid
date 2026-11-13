@@ -890,13 +890,34 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
 
 
 class JsonTaskGateway:
-    def __init__(self, options: dict, recorded_candidates: dict | None = None, *, transport=None):
+    def __init__(self, options: dict, recorded_candidates: dict | None = None, *, transport=None,
+                 diagnostic_replay: dict | None = None):
         self.options = options
         self.recorded = recorded_candidates or {}
         self.transport = transport
+        self.replay = None
+        if options.get("mode") == "diagnostic_mixed":
+            from .diagnostic_replay import DiagnosticReplay
+            config = ChatConfig(**{key: value for key, value in options.items()
+                                   if key not in {"mode", "validation_repair_attempts"}})
+            self.replay = DiagnosticReplay(diagnostic_replay, config)
+
+    def preflight(self, ctx, value):
+        if self.replay is None:
+            raise ProviderFailure("DIAGNOSTIC_REPLAY_MODE_REQUIRED")
+        return self.replay.preflight(ctx, value)
+
+    def summary(self):
+        return self.replay.summary() if self.replay is not None else {}
 
     def __call__(self, ctx, task_type: str, unit_id: str, payload: dict, validate):
         mode = self.options.get("mode", "recorded")
+        if mode == "diagnostic_mixed":
+            result = self.replay.candidate(ctx, task_type, unit_id, {**payload, "task_type": task_type}, validate)
+            if result is not None:
+                return result
+            options = {**self.options, "mode": "chat_completions"}
+            return JsonTaskGateway(options, transport=self.transport)(ctx, task_type, unit_id, payload, validate)
         repair_attempts = self.options.get("validation_repair_attempts", 0)
         if (type(repair_attempts) is not int or repair_attempts not in (0, 1) or
                 repair_attempts and (mode != "chat_completions" or type(self.options.get("max_attempts")) is not int or

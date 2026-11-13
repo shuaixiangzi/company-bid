@@ -11,7 +11,7 @@ from .models import (AttachmentBlock, DocumentPackage, HeadingBlock, IssueBlock,
                      file_sha256)
 from .provider import ChatConfig, ChatProposalProvider, PreparedProposalProvider, ProviderFailure
 from .rendering import render_package
-from .runtime import Executor, NodeSpec
+from .runtime import Executor, NodeSpec, diagnostic_artifact
 from .storage import digest
 
 
@@ -290,13 +290,15 @@ def build_executor(root: Path, config: dict) -> Executor:
         if "document_style" in ctx.execution_config:
             package_data["style"] = ctx.execution_config["document_style"]
         package = DocumentPackage.model_validate(package_data)
-        rendered = render_package(package, ctx.artifact_dir / "documents")
+        diagnostic = ctx.artifact_scope == "diagnostic" or diagnostic_artifact(value)
+        rendered = render_package(package, ctx.artifact_dir / "documents", diagnostic=diagnostic)
         files = {}
         for key in ("bid_docx", "issues_docx"):
             path = Path(rendered[key]["path"])
-            files[key] = ctx.store_bytes(key + ".docx", path.read_bytes(),
+            files[key] = ctx.store_bytes(("diagnostic-" if diagnostic else "") + key + ".docx", path.read_bytes(),
                                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        return {"files": files, "validation": value["validation"],
+        return {**({"diagnostic_files": files, "publication_status": "diagnostic_only", "artifact_scope": "diagnostic"}
+                    if diagnostic else {"files": files}), "validation": value["validation"],
                 "generation_mode": value["generation_mode"], "external_model_verified": value["external_model_verified"],
                 "input_kind": value.get("input_kind", "manual_prepared"), "synthetic": package.synthetic,
                 "chain_diagnostics": value.get("chain_diagnostics", {}),

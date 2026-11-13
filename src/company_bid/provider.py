@@ -137,6 +137,39 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def build_json_request(config: ChatConfig, user_input: dict, system_prompt: str,
+                       image: dict | None = None) -> dict:
+    """Build the actual wire object without credentials, I/O, or call records."""
+    if len(json.dumps(user_input, ensure_ascii=False)) > config.max_input_chars:
+        raise ProviderFailure("PROVIDER_INPUT_BUDGET_EXCEEDED")
+    user_content = json.dumps(user_input, ensure_ascii=False)
+    if image is not None:
+        from PIL import Image
+        data, media_type = image.get("data"), image.get("media_type")
+        if (not isinstance(data, bytes) or not 1 <= len(data) <= 1_500_000 or
+                media_type not in ("image/png", "image/jpeg") or
+                image.get("sha256") != hashlib.sha256(data).hexdigest()):
+            raise ProviderFailure("PROVIDER_IMAGE_INVALID")
+        try:
+            with Image.open(io.BytesIO(data)) as decoded:
+                if (decoded.format != {"image/png": "PNG", "image/jpeg": "JPEG"}[media_type] or
+                        max(decoded.size) > 3072 or decoded.width * decoded.height > 6_000_000):
+                    raise ValueError
+                decoded.verify()
+        except Exception:
+            raise ProviderFailure("PROVIDER_IMAGE_INVALID") from None
+        user_content = [{"type": "text", "text": user_content}, {"type": "image_url", "image_url": {
+            "url": "data:" + media_type + ";base64," + base64.b64encode(data).decode("ascii"), "detail": "high"}}]
+    payload = {"model": config.model, "messages": [
+        {"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+        "temperature": 0.2, "max_tokens": config.max_output_tokens, "response_format": {"type": "json_object"}}
+    if config.thinking_mode is not None:
+        payload["thinking"] = {"type": config.thinking_mode}
+    if config.reasoning_effort is not None:
+        payload["reasoning_effort"] = config.reasoning_effort
+    return payload
+
+
 def http_request(endpoint: str, payload: dict, secret: str, timeout: int, *, headers: dict | None = None) -> bytes:
     extra = headers or {}
     if (not isinstance(extra, dict) or set(extra) - {"User-Agent", "x-opencode-session"} or
@@ -260,37 +293,7 @@ class ChatProposalProvider:
         secret = os.environ.get(self.config.auth_env, "")
         if not secret:
             raise ProviderFailure("PROVIDER_CREDENTIAL_MISSING")
-        if len(json.dumps(user_input, ensure_ascii=False)) > self.config.max_input_chars:
-            raise ProviderFailure("PROVIDER_INPUT_BUDGET_EXCEEDED")
-        user_content = json.dumps(user_input, ensure_ascii=False)
-        if image is not None:
-            from PIL import Image
-            data = image.get("data")
-            media_type = image.get("media_type")
-            if (not isinstance(data, bytes) or not 1 <= len(data) <= 1_500_000
-                    or media_type not in ("image/png", "image/jpeg")
-                    or image.get("sha256") != hashlib.sha256(data).hexdigest()):
-                raise ProviderFailure("PROVIDER_IMAGE_INVALID")
-            try:
-                with Image.open(io.BytesIO(data)) as decoded:
-                    if (decoded.format != {"image/png": "PNG", "image/jpeg": "JPEG"}[media_type]
-                            or max(decoded.size) > 3072 or decoded.width * decoded.height > 6_000_000):
-                        raise ValueError
-                    decoded.verify()
-            except Exception:
-                raise ProviderFailure("PROVIDER_IMAGE_INVALID") from None
-            user_content = [{"type": "text", "text": user_content},
-                            {"type": "image_url", "image_url": {
-                                "url": "data:" + media_type + ";base64," + base64.b64encode(data).decode("ascii"), "detail": "high"}}]
-        payload = {"model": self.config.model, "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ], "temperature": 0.2, "max_tokens": self.config.max_output_tokens,
-            "response_format": {"type": "json_object"}}
-        if self.config.thinking_mode is not None:
-            payload["thinking"] = {"type": self.config.thinking_mode}
-        if self.config.reasoning_effort is not None:
-            payload["reasoning_effort"] = self.config.reasoning_effort
+        payload = build_json_request(self.config, user_input, system_prompt, image)
         # UTF-8 byte count plus generous framing allowance is a conservative
         # request-token bound. Reserve at frozen configured peak prices; unknown
         # outcomes keep the reservation, so restart cannot reset the run budget.

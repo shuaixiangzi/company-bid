@@ -8,6 +8,7 @@ from company_bid.pipeline import build_executor
 @pytest.mark.parametrize("changed_file, affected", [
     ("writing_prompt.py", {"N4"}),
     ("planning.py", {"N3"}),
+    ("diagnostic_replay.py", {"N2"}),
     ("pipeline.py", {"N4", "N5", "N6"}),
     ("slots.py", {"N3"}),
     ("extraction.py", {"N2", "N3"}),

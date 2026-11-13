@@ -13,6 +13,15 @@ from .structured import JsonTaskGateway
 
 
 def intake_nodes(root: Path, version, settings: dict):
+    extraction_options = settings.get("structured_provider", settings.get("provider", {}))
+    if (settings.get("provider", {}).get("mode") == "diagnostic_mixed" or
+            settings.get("mapping_provider", {}).get("mode") == "diagnostic_mixed"):
+        raise ProviderFailure("DIAGNOSTIC_PROVIDER_SCOPE_INVALID")
+    if extraction_options.get("mode") == "diagnostic_mixed":
+        if (settings.get("run_purpose") != "diagnostic_replay" or
+                settings.get("mapping_provider", {}).get("mode") not in {"recorded", "chat_completions", "prepared"}):
+            raise ProviderFailure("DIAGNOSTIC_PROVIDER_SCOPE_INVALID")
+
     def freeze(ctx, value):
         manifest = IntakeManifest.model_validate(value["manifest"])
         data = manifest.model_dump(mode="json")
@@ -69,13 +78,23 @@ def intake_nodes(root: Path, version, settings: dict):
         options = options or ctx.execution_config.get("structured_provider", ctx.execution_config.get("provider", {}))
         if options.get("mode") == "prepared":
             options = {"mode": "recorded"}
+        if options.get("mode") == "diagnostic_mixed":
+            return JsonTaskGateway(options, value.get("recorded_candidates", {}),
+                                   diagnostic_replay=ctx.execution_config.get("diagnostic_replay"))
         return JsonTaskGateway(options, value.get("recorded_candidates", {}))
 
     def extract(ctx, value):
         from .extraction import extract_requirements
-        extracted = extract_requirements(ctx, value["parsed"], value["manifest"], gateway(ctx, value),
+        caller = gateway(ctx, value)
+        diagnostic = caller.options.get("mode") == "diagnostic_mixed"
+        if diagnostic:
+            caller.preflight(ctx, value)
+        extracted = extract_requirements(ctx, value["parsed"], value["manifest"], caller,
                                          ctx.execution_config.get("extraction", {}))
-        return {**value, "extracted": extracted}
+        result = {**value, "extracted": extracted}
+        if diagnostic:
+            result["diagnostic_replay"] = {**caller.summary(), "publication_status": "diagnostic_only"}
+        return result
 
     def plan(ctx, value):
         from .planning import plan_bid
@@ -87,7 +106,7 @@ def intake_nodes(root: Path, version, settings: dict):
             raise ProviderFailure("AUTOMATIC_PLAN_ORIGIN_INVALID")
         # Full intermediate content remains in the preceding node checkpoints;
         # downstream diagnostics carry references instead of duplicating it.
-        return {"prepared": prepared.model_dump(mode="json"), "proposals": value.get("proposals", {}),
+        output = {"prepared": prepared.model_dump(mode="json"), "proposals": value.get("proposals", {}),
                 "source_artifacts": value["source_artifacts"], "input_kind": "automatic",
                 "chain_diagnostics": {"parser_coverage": value["parsed"].get("coverage", {}),
                                       "library_preparation_note": value["manifest"]["preparation_note"],
@@ -96,6 +115,10 @@ def intake_nodes(root: Path, version, settings: dict):
                                       "extraction_coverage": value["extracted"].get("coverage", {}),
                                       "generation_mode": "recorded" if gateway(ctx, value, mapping=True).options.get("mode") == "recorded" else "model_candidates",
                                       "semantic_review": "requires_source_review"}}
+        if "diagnostic_replay" in value:
+            output["chain_diagnostics"]["diagnostic_replay"] = value["diagnostic_replay"]
+            output["chain_diagnostics"]["publication_status"] = "diagnostic_only"
+        return output
 
     core = ("chain.py", "intake.py", "material_records.py", "models.py", "runtime.py", "storage.py", "observability.py")
     freeze_version = hashlib.sha256((version(*core, "evidence.py") + "|" + importlib.metadata.version("pypdfium2")).encode()).hexdigest()
@@ -107,13 +130,14 @@ def intake_nodes(root: Path, version, settings: dict):
     mapping_provider_key = "mapping_provider" if settings.get("mapping_provider") else extraction_provider_key
     # Include selection switches even when absent: adding an override changes
     # what the handler consumes, including fork(execution_config=...) calls.
-    extraction_keys = tuple(dict.fromkeys(("structured_provider", extraction_provider_key, "extraction")))
+    extraction_keys = tuple(dict.fromkeys(("structured_provider", extraction_provider_key, "extraction",
+                                          "run_purpose", "diagnostic_replay")))
     mapping_keys = tuple(dict.fromkeys(("mapping_provider", mapping_provider_key, "planning") +
                          (() if settings.get("mapping_provider") else ("structured_provider",))))
     reading_keys = ("reading", "ocr") + (("provider",) if settings.get("ocr") is not None and "provider" not in settings["ocr"] else ())
     return [NodeSpec("N0", freeze_version, freeze, config_keys=()),
             NodeSpec("N1", parser_version, read, config_keys=reading_keys),
-            NodeSpec("N2", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "provider.py", "structured.py"), extract,
+            NodeSpec("N2", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "provider.py", "structured.py", "diagnostic_replay.py"), extract,
                      config_keys=extraction_keys),
             NodeSpec("N3", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py", "preparation_rules.py", "material_matching.py", "slots.py", "provider.py", "structured.py"), plan,
                      config_keys=mapping_keys)]
