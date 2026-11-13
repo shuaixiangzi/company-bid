@@ -34,6 +34,7 @@ def source_data(tmp_path):
         row = block(parsed, identity, text, origin='native')
         row['locator'] = f'pdf/page[1]/line[{index}]'
     document['units'][0]['coverage']['image_count'] = 0
+    document['expected_units'] = len(document['units'])
     path = Path(manifest['sources'][0]['path'])
     path.write_text('\n'.join(text for _, text in lines), encoding='utf8')
     manifest['sources'][0]['sha256'] = document['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -197,7 +198,7 @@ def test_production_n2_n6_correction_keeps_pending_word_and_trace(tmp_path, monk
     assert len(sent) == 2 and done['nodes'][2]['output_ref'] == n2_ref and executor.output(run, 'N2') == n2
     prepared = executor.output(run, 'N3')['prepared']
     issues = [i for i in prepared['issues'] if '合同第' in i['title']]
-    assert len(issues) == 4 and all('原模板中留空' in i['reason'] for i in issues)
+    assert len(issues) == 4 and all('已读原文未给出' in i['reason'] and '物理留白未判定' in i['reason'] for i in issues)
     assert all(not s['writing_tasks'] and not s['fact_refs'] for s in prepared['sections'])
     n5 = executor.output(run, 'N5')
     pending_ids = {rid for i in issues for rid in i['requirement_refs']}
@@ -208,7 +209,7 @@ def test_production_n2_n6_correction_keeps_pending_word_and_trace(tmp_path, monk
              for k in ('bid_docx', 'issues_docx')]
     for issue in issues:
         assert all(issue['issue_id'] in text for text in texts)
-    assert '合同模板原文（留空内容待补）' in texts[0] and '期限为： 至 。' in texts[0]
+    assert '合同待约定原文（已读文本未给值）' in texts[0] and '期限为： 至 。' in texts[0]
     diagnostic = inspect_diagnostics(executor.store.root, run)
     assert diagnostic['actual_call_attempts'] == 2 and diagnostic['gaps'] == []
 

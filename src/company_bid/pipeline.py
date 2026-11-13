@@ -26,7 +26,8 @@ def _version(*names: str) -> str:
     # must invalidate N3 without relabeling unchanged N0/N1/N2 implementations.
     dependencies = {"planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py"),
                     "pipeline.py": ("project_constraint_runtime.py",),
-                    "project_constraint_runtime.py": ("project_constraints.py",),
+                    "project_constraint_runtime.py": ("project_constraints.py", "contract_pending_plan.py"),
+                    "contract_pending_plan.py": ("contract_review_slots.py", "extraction.py"),
                     "project_constraints.py": ("table_continuations.py",),
                     "structured.py": ("material_heading_sources.py", "format_continuation_sources.py", "contract_blank_sources.py",
                                       "contract_pending_repair.py", "adjacent_owner_sources.py", "citation_gap_sources.py"),

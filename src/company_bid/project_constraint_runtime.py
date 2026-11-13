@@ -59,6 +59,71 @@ def _derived_requirements(report, prepared, parsed):
     return derived
 
 
+def _contract_pending_requirements(report, prepared, n1, requirements):
+    """Rebuild source derivations; a report is never its own expectation."""
+    from .contract_pending_plan import contract_pending_plan
+    from .contract_review_slots import _CONTRACT
+    from .extraction import _id
+
+    recorded = report.get("contract_pending_plan")
+    contract_present = any(_CONTRACT.fullmatch(block.get("text", ""))
+        for document in n1["parsed"]["documents"] if document["role"] == "tender"
+        for unit in document["units"] for block in unit["blocks"])
+    if not contract_present:
+        if recorded and (recorded.get("bindings") or recorded.get("derived_requirements") or recorded.get("errors")):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+        return []
+    rebuilt = contract_pending_plan(requirements, n1["parsed"], n1["manifest"])
+    if rebuilt["errors"] or not isinstance(recorded, dict) or digest(recorded) != digest(rebuilt):
+        raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+    known = {item["requirement_id"]: item for item in prepared["requirements"]}
+    sources = {item["source_id"]: item for item in prepared["sources"]}
+    original = {item["requirement_id"]: item for item in requirements}
+    derived = {item["requirement_id"]: item for item in rebuilt["derived_requirements"]}
+    for rid in rebuilt["bindings"]:
+        actual, expected = known.get(rid), derived.get(rid, original.get(rid))
+        if (not actual or not expected or any(actual[key] != expected[key] for key in
+                ("text", "category", "mandatory", "response_mode")) or
+                any(rid in task["requirement_refs"] for section in prepared["sections"] for task in section["writing_tasks"])):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+        if rid in derived:
+            expected_refs = []
+            for citation in expected["citations"]:
+                ref = _id("SCOPE-", citation)
+                scoped = sources.get(ref)
+                parent = next((item for item in n1["manifest"]["sources"] if item["source_id"] == citation["source_id"]), None)
+                locator = (f"{citation['locator']}; basis={citation['basis']}; chars[{citation['start']}:{citation['end']}]; "
+                           f"quote_sha256={citation['quote_sha256']}; through={citation['end_locator']}; blocks=" + ",".join(citation["block_ids"]))
+                if not scoped or not parent or scoped["sha256"] != parent["sha256"] or scoped["locator"] != locator:
+                    raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+                expected_refs.append(ref)
+            if actual["source_refs"] != expected_refs:
+                raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+    issues = {item["issue_id"]: item for item in prepared["issues"]}
+    expected_rows = {(rid, item["pending_id"]): item for rid, items in rebuilt["bindings"].items() for item in items}
+    rows = report.get("contract_pending_handling", [])
+    if (len(rows) != len(expected_rows) or len({(row["requirement_id"], row["catalog_pending_id"]) for row in rows}) != len(rows)):
+        raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+    for row in rows:
+        key = row["requirement_id"], row["catalog_pending_id"]
+        pending = expected_rows.get(key)
+        if (not pending or row["source_proof_sha256"] != pending["source_proof_sha256"] or
+                row["pending_fields"] != pending["pending_fields"] or row["scope"] != pending["scope"] or
+                row["owner_party"] != pending["owner_party"] or row["response_status"] != "pending_manual" or
+                row["reading_status"] != "read" or row["value_status"] != pending["value_status"] or
+                row["physical_blank_status"] != "not_determined" or row["satisfaction_status"] != "not_determined" or
+                row["values_inferred"] is not False or row["writing_unit_ids"] or row["adopted_fact_ids"] or
+                len(row["issue_ids"]) != 1 + len(pending["blocking_issues"]) or
+                any(issue_id not in issues or key[0] not in issues[issue_id]["requirement_refs"] or
+                    issues[issue_id]["source_requirement"] != known[key[0]]["text"] for issue_id in row["issue_ids"])):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+        blocking = row.get("blocking_issues", [])
+        if ([{key: value for key, value in item.items() if key != "issue_id"} for item in blocking] != pending["blocking_issues"] or
+                [item["issue_id"] for item in blocking] != row["issue_ids"][1:]):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+    return copy.deepcopy(list(derived.values()))
+
+
 def plan_project_constraints(parsed, requirements, manifest, sections):
     """Attach only proved prohibitions; retain the finite detector's unknowns."""
     sets = []
@@ -117,6 +182,7 @@ def load_project_constraints(ctx, prepared=None):
             raise ProjectConstraintError("PROJECT_CONSTRAINT_PLAN_INPUT_CHANGED")
         requirements = copy.deepcopy(n2["extracted"]["requirements"])
         requirements.extend(_derived_requirements(report, prepared, n1["parsed"]))
+        requirements.extend(_contract_pending_requirements(report, prepared, n1, requirements))
         # Rebuild independently from the frozen source and pre-serialization
         # task identities. Never use the actual N4 context as an expectation.
         sections = copy.deepcopy(prepared["sections"])

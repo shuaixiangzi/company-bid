@@ -27,10 +27,11 @@ from .preparation_rules import preparation_rule, manual_signing_submission, proo
 from .plan_component_controls import collect_plan_controls, component_targets
 from .project_constraint_runtime import plan_project_constraints
 from .format_continuation_sources import fixed_letter_items as _fixed_letter_items
-from .contract_blank_sources import contract_blank_plan_items
+from .contract_pending_plan import contract_pending_plan
+from .contract_review_slots import _CONTRACT as _CONTRACT_SOURCE_HEADING
 
 
-PLANNING_VERSION = "bid-plan-v22"
+PLANNING_VERSION = "bid-plan-v23"
 
 
 class _Fill(_Strict):
@@ -946,10 +947,21 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         existing_ids = {item["requirement_id"] for item in extracted["requirements"]}
         _fail(any(item["requirement_id"] in existing_ids for item in derived_requirements), "PREPARATION_SOURCE_RULE_CONFLICT")
         planned_requirements = [*extracted["requirements"], *derived_requirements]
-        contract_blanks = contract_blank_plan_items(planned_requirements, parsed, manifest)
-        contract_blank_handling = []
-        _capture(ctx, "n3-contract-source-blanks", {"items": contract_blanks,
-            "n2_candidate_mutation": False, "status": "source_read_values_pending" if contract_blanks else "not_detected"})
+        # This finite catalogue has an explicit contract-chapter scope. Other
+        # document formats/chapters keep their existing planning paths; they do
+        # not earn a claim that every possible contract field was checked.
+        contract_scope_present = any(_CONTRACT_SOURCE_HEADING.fullmatch(block["text"]) for block in blocks.values()
+                                     if block["source_id"] in {document["source_id"] for document in documents})
+        contract_pending = contract_pending_plan(planned_requirements, parsed, manifest) if contract_scope_present else {
+            "rule": "contract_pending_plan_v1", "derived_requirements": [], "bindings": {}, "binding_proofs": {},
+            "derivations": {}, "errors": [], "n2_candidate_mutation": False,
+            "catalog_summary": {"exhaustive": False, "coverage_status": "supported_contract_scope_not_detected"},
+            "limitations": ["Only explicitly scoped native contract chapters are supported; other possible fields remain unclassified."]}
+        _capture(ctx, "n3-contract-pending-plan", contract_pending)
+        _fail(bool(contract_pending["errors"]), "CONTRACT_PENDING_REQUIRES_SOURCE_REVIEW")
+        planned_requirements.extend(contract_pending["derived_requirements"])
+        contract_bindings = contract_pending["bindings"]
+        contract_pending_handling = []
         source_controls = collect_plan_controls(planned_requirements, blocks, units, documents, _native_source_span)
         global_control_ids = {item["requirement_id"] for item in source_controls["global_controls"]}
         global_control_handling = []
@@ -1155,6 +1167,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     "unsupplied_format_permission": "只对已独立证成未提供格式的内容使用默认版式；原有指定格式必须保留，未读或冲突不能据此解除。",
                     "manual_signing_submission": "线下核对封面签署、盖章及递交事项；适用父层范围仍未确定，本项不用于选择正文、报价或判定资格，尚未执行任何事项。",
                 }[rule["source_rule"]]
+            if requirement["requirement_id"] in contract_bindings:
+                action = review_actions[-1]
+                action["instruction"] = "按保留的完整合同原文逐项明确待约定字段及来源回指；甲方信息由甲方确认，未确定值或适用性，不将本记录视为已履行或已满足。"
 
         def issue(section, refs, title, reason, action):
             value = {"issue_id": f"M-{len(issues) + 1:03d}", "title": title, "section_id": section["section_id"],
@@ -1317,19 +1332,48 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 detail = details[rid]
                 placements.append({"requirement_id": rid, "section_id": section["section_id"],
                                    "response_mode": detail["response_mode"], "render_body": section["render_body"]})
-                if rid in contract_blanks:
-                    proof = contract_blanks[rid]["source_proof"]
+                if rid in contract_bindings:
+                    pending_items = contract_bindings[rid]
+                    requirement = next(item for item in requirements if item["requirement_id"] == rid)
                     section["render_body"] = True
-                    section["nonwriting_requirement_refs"].append(rid)
-                    section["fixed_content"].append({"kind": "paragraph", "text": "合同模板原文（留空内容待补）：\n" + detail["text"],
-                        "source_refs": next(item["source_refs"] for item in requirements if item["requirement_id"] == rid)})
-                    marker = issue(section, [rid], "合同第" + proof["clause_number"] + "条：" + "、".join(proof["pending_fields"]) + "待补",
-                        "合同原文已完整读取，该位置在原模板中留空；未确定具体值或适用结论，不属于读取失败。",
-                        "线下核对并补充合同明确内容；不得猜填日期、进度、质量标准，不将留空解释为无要求或已满足。")
-                    contract_blank_handling.append({"requirement_id": rid, "section_id": section["section_id"],
-                        "issue_id": marker, "source_proof_sha256": contract_blanks[rid]["source_proof_sha256"],
-                        "reading_status": "read", "value_status": "blank_in_source", "response_status": "pending_manual",
-                        "writing_unit_ids": [], "adopted_fact_ids": [], "values_inferred": False})
+                    section["nonwriting_requirement_refs"] = list(dict.fromkeys([*section["nonwriting_requirement_refs"], rid]))
+                    section["fixed_content"].append({"kind": "paragraph", "text": "合同待约定原文（已读文本未给值）：\n" + detail["text"],
+                                                     "source_refs": requirement["source_refs"]})
+                    contexts = {}
+                    for pending in pending_items:
+                        proof = pending["source_proof"]
+                        for member in [proof["scope_heading"], proof["article_heading"], *proof["article_preamble"], *proof["parent_context"]]:
+                            contexts[member["block_id"]] = member
+                    ordered_context = sorted(contexts.values(), key=lambda member: member["ordinal"])
+                    context_refs = [scoped_source({key: member[key] for key in ("source_id", "block_id", "locator")}) for member in ordered_context]
+                    if ordered_context:
+                        section["fixed_content"].append({"kind": "paragraph", "text": "合同来源范围及父条件（原文）：\n" + "\n".join(member["text"] for member in ordered_context),
+                                                         "source_refs": context_refs})
+                        section["source_refs"] = list(dict.fromkeys([*section["source_refs"], *context_refs]))
+                    for pending in pending_items:
+                        scope = pending["scope"]
+                        clause_label = ("合同" if scope["kind"] == "main_contract" else scope["title"]) + "第" + pending["clause_number"] + "条"
+                        if pending["subclause_number"]:
+                            clause_label += "（" + pending["subclause_number"] + "）"
+                        owner = pending["owner_party"]
+                        fields = "、".join(field["field"] for field in pending["pending_fields"])
+                        marker = issue(section, [rid], clause_label + "：" + ("甲方待约定" if owner == "甲方" else "合同待约定") + "：" + fields,
+                            "已读原文未给出这些字段的值，需明确约定或补充信息；物理留白未判定，尚未确定具体值、适用性或符合性。",
+                            "由甲方确认并提供本项资料、工作条件或协作内容；不列为公司缺材料，不猜填。" if owner == "甲方" else
+                            "按完整原文及全部备选核对并明确约定；不猜填数值、不代选选项，不将本项视为已满足。")
+                        row = {"requirement_id": rid, "section_id": section["section_id"], "catalog_pending_id": pending["pending_id"],
+                            "issue_ids": [marker], "source_proof_sha256": pending["source_proof_sha256"], "scope": copy.deepcopy(scope),
+                            "pending_fields": copy.deepcopy(pending["pending_fields"]), "owner_party": owner,
+                            "reading_status": "read", "value_status": pending["value_status"], "response_status": "pending_manual",
+                            "physical_blank_status": "not_determined", "satisfaction_status": "not_determined",
+                            "writing_unit_ids": [], "adopted_fact_ids": [], "values_inferred": False}
+                        for blocking in pending["blocking_issues"]:
+                            clarification = issue(section, [rid], clause_label + "：原文第0条回指待澄清",
+                                "完整来源含字面“第0条”回指，引用对象尚未证成；原文、全部备选及固定比例均已保留。",
+                                "向合同提供方澄清真实引用条款；不解释第0条、不确定知识产权归属，也不据此判定任何备选已经适用。")
+                            row["issue_ids"].append(clarification)
+                            row.setdefault("blocking_issues", []).append({**copy.deepcopy(blocking), "issue_id": clarification})
+                        contract_pending_handling.append(row)
                     continue
                 if rid in global_control_ids:
                     requirement = next(item for item in requirements if item["requirement_id"] == rid)
@@ -1598,7 +1642,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                       "values_policy": "preserve_source_slots_with_explicit_missing_issues_no_guessed_values"},
                   "drafting_instruction_omissions": instruction_omissions,
                   "factual_responses": factual_response_reports,
-                  "contract_source_blanks": contract_blank_handling,
+                  "contract_pending_plan": contract_pending,
+                  "contract_pending_handling": contract_pending_handling,
                   "review_actions": review_actions,
                   "component_dispositions": component_matrix, "component_number_conflicts": conflict_handling,
                   "global_critical_controls": global_control_handling,
