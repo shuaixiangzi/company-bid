@@ -29,7 +29,8 @@ def fixture(tmp_path):
                 "company": {"company_id": "C", "name": "合成公司", "source_refs": ["company"]},
                 "sources": [tender, company], "source_roles": {"tender": "tender", "company": "company_material"},
                 "facts": [], "attachments": [], "synthetic": True}
-    parsed = {"documents": [{"source_id": "tender", "role": "tender", "sha256": tender["sha256"], "units": []}],
+    parsed = {"documents": [{"source_id": "tender", "role": "tender", "sha256": tender["sha256"],
+                              "format": "pdf", "expected_units": 0, "units": []}],
               "coverage": {"status": "complete", "required_complete": True}}
     return manifest, parsed
 
@@ -39,10 +40,12 @@ def line(parsed, page, text, *, footer=False):
     unit = next((unit for unit in units if unit["page"] == page), None)
     if unit is None:
         unit = {"unit_id": f"P{page}", "source_id": "tender", "locator": f"pdf/page[{page}]", "page": page,
-                "coverage": {"status": "read"}, "blocks": []}
+                "coverage": {"status": "read", "origin": "native", "image_count": 0,
+                             "unread_objects": [], "unmapped_glyphs": []}, "blocks": []}
         units.append(unit)
+        parsed["documents"][0]["expected_units"] = len(units)
     index = len(unit["blocks"])
-    block = {"block_id": f"P{page}-L{index}", "source_id": "tender", "kind": "paragraph", "text": text,
+    block = {"block_id": f"P{page}-L{index}", "source_id": "tender", "kind": "paragraph", "origin": "native", "text": text,
              "locator": f"pdf/page[{page}]/line[{index}]",
              "bbox": [60, 773, 80, 782] if footer else [60, 60 + index * 14, 500, 72 + index * 14]}
     unit["blocks"].append(block)

@@ -67,7 +67,7 @@ def _contract_pending_requirements(report, prepared, n1, requirements):
 
     recorded = report.get("contract_pending_plan")
     contract_present = any(_CONTRACT.fullmatch(block.get("text", ""))
-        for document in n1["parsed"]["documents"] if document["role"] == "tender"
+        for document in n1["parsed"]["documents"] if document["role"] == "tender" and document.get("format") == "pdf"
         for unit in document["units"] for block in unit["blocks"])
     if not contract_present:
         if recorded and (recorded.get("bindings") or recorded.get("derived_requirements") or recorded.get("errors")):

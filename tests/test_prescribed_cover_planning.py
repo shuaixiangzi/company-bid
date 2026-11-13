@@ -22,6 +22,10 @@ def cover_case(tmp_path, change=None):
     line(parsed, "FORM", "一、合成说明书", page=3)
     line(parsed, "BODY", "合成模板的固定声明原文。", page=3)
     line(parsed, "END", "第六章 合同条款", page=4)
+    document = parsed["documents"][0]
+    document["expected_units"] = len(document["units"])
+    for unit in document["units"]:
+        unit["coverage"].update(origin="native", image_count=0, unread_objects=[], unmapped_glyphs=[])
 
     def candidate(ctx, task, unit, payload, validate):
         targets = {value["block_id"]: value for value in payload["window"]["blocks"]}

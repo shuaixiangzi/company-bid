@@ -667,6 +667,10 @@ def test_fixed_table_and_cross_page_continuation_keep_footer_and_contract_out_of
     pdf_line(parsed, 3, 0, "第六章 合同条款", [60, 60, 500, 78])
     pdf_line(parsed, 3, 1, "合同约定内容不得混入上一格式。", [60, 100, 500, 112])
     pdf_line(parsed, 3, 2, "- 3 -", [290, 773, 305, 782])
+    document = parsed["documents"][0]
+    document.update(format="pdf", expected_units=len(document["units"]))
+    for unit in document["units"]:
+        unit["coverage"].update(origin="native", image_count=0, unread_objects=[], unmapped_glyphs=[])
     ctx = Context()
     extracted = extract(ctx, parsed, manifest, lambda payload: response(payload, formats=[{"title": heading["text"], "level": 1,
         "citation": cite(heading), "content_block_ids": [table["block_id"]]}]))

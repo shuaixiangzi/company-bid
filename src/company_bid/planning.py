@@ -951,7 +951,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         # document formats/chapters keep their existing planning paths; they do
         # not earn a claim that every possible contract field was checked.
         contract_scope_present = any(_CONTRACT_SOURCE_HEADING.fullmatch(block["text"]) for block in blocks.values()
-                                     if block["source_id"] in {document["source_id"] for document in documents})
+                                     if block["source_id"] in {document["source_id"] for document in documents
+                                                               if document.get("format") == "pdf"})
         contract_pending = contract_pending_plan(planned_requirements, parsed, manifest) if contract_scope_present else {
             "rule": "contract_pending_plan_v1", "derived_requirements": [], "bindings": {}, "binding_proofs": {},
             "derivations": {}, "errors": [], "n2_candidate_mutation": False,

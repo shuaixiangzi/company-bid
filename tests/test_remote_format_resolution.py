@@ -96,6 +96,9 @@ def test_complete_remote_format_resolves_only_derived_n3_state(tmp_path):
     original = copy.deepcopy((manifest, parsed, extracted))
     ctx = Context()
     prepared = plan_bid(ctx, extracted, parsed, manifest, no_call, {})
+    contract = ctx.captures["n3-contract-pending-plan"]
+    assert contract["catalog_summary"] == {"exhaustive": False, "coverage_status": "supported_contract_scope_not_detected"}
+    assert not contract["bindings"] and not contract["derived_requirements"]
 
     resolution, = ctx.captures["n3-planning-report"]["remote_format_resolutions"]
     assert resolution["requirement_id"] == requirement["requirement_id"]
