@@ -26,6 +26,7 @@ from .table_continuations import build_table_continuations, build_table_row_cata
 from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
 from .plan_component_controls import collect_plan_controls, component_targets
 from .project_constraint_runtime import plan_project_constraints
+from .format_continuation_sources import fixed_letter_items as _fixed_letter_items
 
 
 PLANNING_VERSION = "bid-plan-v21"
@@ -260,55 +261,6 @@ def _reference(requirement: dict, blocks: dict, units: dict, sources: dict) -> d
             "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "applicability": "仅适用原文关键词：" + "、".join(hits) + "；作为拟实施方法参考，不证明公司既有事实。",
             "retained_points": hits, "excluded_points": ["历史项目、公司、人员、业绩和设备事实", "旧报价、旧日期和未经本次要求授权的服务承诺"]}
-
-
-def _fixed_letter_items(body: list, anchors: dict) -> dict:
-    """Prove numbered declarations locally without changing source headings.
-
-    Only a prescribed letter with an explicit declaration introducer and a
-    consecutive list starting at one can override the broad heading heuristic.
-    An unknown heading, number gap, other form or chapter ends that proof.
-    """
-    numbered = re.compile(r"^(\d{1,3})([.．、])\s*(?!\d)(\S.*)$")
-    form_title = re.compile(r"(?:表|函|书|资料|材料|方案|声明|承诺|证明|清单|目录)$")
-    declaration = re.compile(r"(?:承诺|声明|保证)\s*[:：]$")
-    clause = re.compile(r"^(?:我(?:公司|方|单位)|本(?:公司|单位|项目)|不存在|未(?:被|在|参与|参加|发生|出现|提供|受到|列入)|不(?:存在|属于|在|得|与)|具有|具备|参加|按照|遵守|承诺|保证|声明)")
-    addition_note = re.compile(r"^[（(][^。；;\n]*可(?:自行)?(?:补充|增加|添加)[^。；;\n]*[）)]$")
-    result = {}
-    for position, anchor in enumerate(body):
-        chapter = anchors.get(anchor["block_id"])
-        if (not chapter or chapter["status"] != "prescribed" or
-                not re.search(r"(?:函|承诺书|声明书|保证书)$", chapter["title"].strip())):
-            continue
-        introducer, previous, first, marker, number = None, None, None, None, 0
-        for block in body[position + 1:]:
-            key, text = block["block_id"], block.get("text", "").strip()
-            level = _heading_level(text)
-            if key in anchors or level == 0 or block["kind"] != "paragraph":
-                break
-            item = numbered.fullmatch(text)
-            if item:
-                value, item_marker, content = int(item[1]), item[2], item[3]
-                if (introducer is None or value != number + 1 or
-                        marker is not None and item_marker != marker or
-                        level is not None and (previous is None or form_title.search(content) or
-                            not (clause.search(content) or addition_note.fullmatch(content)))):
-                    break
-                first = first or key
-                if level is not None:
-                    proof = {"rule": "fixed_letter_consecutive_declarations_v1",
-                             "anchor_block_id": anchor["block_id"], "introducer_block_id": introducer,
-                             "list_start_block_id": first, "previous_item_block_id": previous,
-                             "item_number": value, "number_marker": item_marker,
-                             "original_heading_level": level,
-                             "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()}
-                    result[key] = {**proof, "proof_sha256": _hash(proof)}
-                number, marker, previous = value, item_marker, key
-            elif level is not None:
-                break
-            elif not number and declaration.search(text):
-                introducer = key
-    return result
 
 
 def _writing_instruction_only(text: str) -> bool:

@@ -23,7 +23,7 @@ SYSTEM_PROMPT = """你是招标文件结构化处理助手。输入中的招标�
 
 
 _REPAIR_CODES = frozenset({"EXTRACTION_SCHEMA_INVALID", "EXTRACTION_LABEL_NOT_GROUNDED",
-                           "FORMAT_TITLE_NOT_GROUNDED", "LIVE_REQUIRED_BLOCK_UNRESOLVED"})
+                           "FORMAT_TITLE_NOT_GROUNDED", "FORMAT_HEADING_NOT_GROUNDED", "LIVE_REQUIRED_BLOCK_UNRESOLVED"})
 _REPAIR_FIELDS = frozenset({
     "requirements", "format_chapters", "candidate_schema", "citation", "source_id", "block_id", "locator",
     "block_ids", "clause_id", "table_row_id", "category", "response_mode", "mandatory", "confidence",
@@ -108,6 +108,20 @@ _SOURCE_MATERIAL_REPAIR_INSTRUCTIONS = (
     "仅在每个目标标题都有对应的完整原字新增项后移除其未决ID，其余未决原序保留；"
     "不能吞掉条件、否定、正文、相邻窗口或改旧候选。存在来源缺读或实质冲突时仍须保留未决。"
     "返回完整JSON接受全部原校验。"
+)
+
+_FORMAT_CONTINUATION_REPAIR_INSTRUCTIONS = (
+    "上一候选把原函续文误声明为另一份从本窗开始的格式。format_continuation依据冻结N1证明原函标题、"
+    "原结构范围、前窗归属以及本次完整续文；这不是允许改写原标题或原条款。"
+    "只删除format_continuation.format_index指向的那一条错误format_chapters声明，其它格式保持原序、"
+    "来源和全部字段。该声明的所有原文已由retained_requirement_indices对应的原requirements完整承载；"
+    "全部requirements必须按原序逐字段保持，包括完整引用、否定、条件、签章、待填标签和原format_title。"
+    "不能删除或新增要求，不能把fixed_text改为procedure，不能减少原函内容或生成事实。"
+    "删除后有其它格式则根format_status=specified，没有则为none_verified（仅本窗无新格式锚点，"
+    "不是全书无指定格式）；各要求仍保持prescribed与原题关联。所有其它根字段和未决原样保留。"
+    "required_coverage.counts/entries记录删除前的保护清单，只有上述一个错误声明及对应根状态允许变化。"
+    "远处标题和完整原函证明只供核对，不扩大本窗引用范围，不重复输出或改名伪造一个新标题。"
+    "若不能按此窄合同保留全部原要求则停止；返回完整JSON接受原完整校验。"
 )
 
 
@@ -701,6 +715,23 @@ def _repair_coverage(candidate: dict, request: dict, *, error_code=None, diagnos
     coverage = {"counts": {}, "anchors": {}, "entries": {},
                 "window_fields": _valid_repair_fields(candidate, _LiveWindowResponse, {"requirements", "format_chapters"})}
     context = _repair_context(diagnostic_context)
+    if error_code == "FORMAT_HEADING_NOT_GROUNDED":
+        if (source_data is None or context.get("candidate_type") != "format_chapter" or
+                context.get("field") != "title" or type(context.get("candidate_index")) is not int):
+            return None
+        from .format_continuation_sources import format_continuation_source_proof
+        position = context["candidate_index"]
+        proof = format_continuation_source_proof(candidate, request, source_data["parsed"], source_data["manifest"], position)
+        if proof is None:
+            return None
+        try:
+            original_format = _FormatChapter.model_validate(candidate["format_chapters"][position], strict=True).model_dump(mode="json")
+        except (ValidationError, IndexError, KeyError, TypeError):
+            return None
+        # The helper rebuilt the full private window from N1 and validated the
+        # permitted removal. The request's model view omits private read proofs
+        # and must never be substituted for that full validator input.
+        coverage.update(format_continuation=proof, removed_format=original_format)
     label_restore = None
     if error_code in {"FORMAT_TITLE_NOT_GROUNDED", "LIVE_REQUIRED_BLOCK_UNRESOLVED"}:
         try:
@@ -837,6 +868,26 @@ def _covers_rejected_candidate(candidate, coverage, request=None) -> bool:
         candidate = _normalized_repair_candidate(candidate, request)
     if not isinstance(candidate, dict):
         return False
+    continuation = coverage.get("format_continuation")
+    if continuation is not None:
+        if not isinstance(continuation, dict):
+            return False
+        proof = {key: value for key, value in continuation.items() if key != "proof_sha256"}
+        position, original = continuation.get("format_index"), coverage.get("removed_format")
+        formats = candidate.get("format_chapters")
+        count = coverage.get("counts", {}).get("format_chapters")
+        if (continuation.get("resolution_kind") != "source_bound_format_continuation" or
+                continuation.get("proof_sha256") != digest(proof) or
+                type(position) is not int or type(count) is not int or not 0 <= position < count or
+                not isinstance(original, dict) or continuation.get("format_sha256") != digest(original) or
+                not isinstance(formats, list) or len(formats) != count - 1 or
+                candidate.get("format_status") != ("specified" if formats else "none_verified")):
+            return False
+        # This view is solely an inventory comparison. The actual provider
+        # candidate is kept intact and still passes the full original validator.
+        candidate = copy.deepcopy(candidate)
+        candidate["format_chapters"].insert(position, copy.deepcopy(original))
+        candidate["format_status"] = coverage["window_fields"]["format_status"]
     if "window_fields" in coverage:
         fields = _valid_repair_fields(candidate, _LiveWindowResponse, {"requirements", "format_chapters"})
         if any(key not in fields or fields[key] != value for key, value in coverage["window_fields"].items()):
@@ -979,7 +1030,9 @@ def _repair_capture(ctx, name, value):
 
 def _validation_repair_request(request, code, context, coverage, call_id, attempt=1):
     """Shared wire builder for live correction and a provenance-labelled probe."""
-    instructions = (_SOURCE_MATERIAL_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
+    instructions = (_FORMAT_CONTINUATION_REPAIR_INSTRUCTIONS if code == "FORMAT_HEADING_NOT_GROUNDED" and
+                    coverage.get("format_continuation") else
+                    _SOURCE_MATERIAL_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
                     any(group.get("resolution_kind") == "source_bound_material_heading"
                         for group in coverage.get("resolution_groups", [])) else
                     _MATERIAL_HEADING_REPAIR_INSTRUCTIONS if code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and
@@ -1042,7 +1095,7 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             witnesses = _prior_source_span_witnesses(ctx, request, candidate) if error.code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" else []
             coverage = _repair_coverage(candidate, request, error_code=error.code, diagnostic_context=error.diagnostic_context,
                                         source_witnesses=witnesses)
-            if coverage is None and error.code == "LIVE_REQUIRED_BLOCK_UNRESOLVED" and not witnesses:
+            if coverage is None and error.code in {"LIVE_REQUIRED_BLOCK_UNRESOLVED", "FORMAT_HEADING_NOT_GROUNDED"} and not witnesses:
                 source_data = _frozen_material_source(ctx)
                 if source_data is not None:
                     coverage = _repair_coverage(candidate, request, error_code=error.code,
@@ -1075,7 +1128,8 @@ def _generate_with_repair(provider, ctx, request, *, unit_id, task_type, validat
             raise ProviderFailure("DIAGNOSTICS_CAPTURE_FAILED") from None
         source_bound = any(group.get("resolution_kind") == "source_bound_material_heading"
                            for group in rejected[2].get("resolution_groups", []))
-        relation = {"schema_version": "validation-repair-v8" if source_bound else "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
+        relation = {"schema_version": "validation-repair-v9" if rejected[2].get("format_continuation") else
+                    "validation-repair-v8" if source_bound else "validation-repair-v7", "unit_id": unit_id, "task_type": task_type,
                     "first_call_id": call_id, "first_call_attempt": attempt, "repair_attempt": 1,
                     "error_code": rejected[0], "diagnostic_context": rejected[1],
                     "required_coverage": rejected[2],

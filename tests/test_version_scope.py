@@ -13,6 +13,7 @@ from company_bid.pipeline import build_executor
     ("project_constraint_runtime.py", {"N3", "N4", "N5", "N6"}),
     ("diagnostic_replay.py", {"N2"}),
     ("material_heading_sources.py", {"N2", "N3"}),
+    ("format_continuation_sources.py", {"N2", "N3"}),
     ("pipeline.py", {"N4", "N5", "N6"}),
     ("slots.py", {"N3"}),
     ("extraction.py", {"N2", "N3"}),
