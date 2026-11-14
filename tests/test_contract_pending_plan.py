@@ -121,7 +121,7 @@ def test_existing_technical_or_writing_overlap_is_an_error_and_never_downgraded(
     assert not result["derived_requirements"] and not result["bindings"] and req == before
 
 
-def test_even_partial_technical_overlap_blocks_that_source_item_and_unrelated_writing_does_not():
+def test_partial_technical_pending_overlap_and_unbounded_contract_writing_require_source_review():
     parsed, manifest = rights()
     item = catalog(parsed, manifest)[0]
     req = requirement(parsed, manifest, item["block_ids"][:1], category="technical", mode="writing")
@@ -131,7 +131,9 @@ def test_even_partial_technical_overlap_blocks_that_source_item_and_unrelated_wr
     parsed, manifest = simple()
     req = requirement(parsed, manifest, ["B1-3"], category="technical", mode="writing")
     result = contract_pending_plan([req], parsed, manifest)
-    assert not result["errors"] and len(result["derived_requirements"]) == 1
+    assert result["errors"] == [{"code": "requires_source_review", "reason": "contract_review_source_or_boundary_not_proven",
+                                 "source_id": "S", "clause_number": "1.2"}]
+    assert len(result["derived_requirements"]) == 1
 
 
 @pytest.mark.parametrize("change", ["missing_source", "source_hash", "unread", "ocr_needed", "glyph", "image", "expected_units", "reading_incomplete"])

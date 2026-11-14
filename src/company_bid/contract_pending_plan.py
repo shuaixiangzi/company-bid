@@ -7,6 +7,7 @@ Neither binding nor derivation supplies a value or accepts an obligation.
 from __future__ import annotations
 
 import copy
+import re
 
 from .contract_review_slots import contract_review_slot_catalog
 from .extraction import PlanningError, _citation, _index, _pdf_footer_skips
@@ -16,6 +17,7 @@ from .storage import digest
 RULE = "contract_pending_plan_v1"
 _WIRE_FIELDS = ("source_id", "block_id", "locator", "block_ids", "quote")
 _IDENTITY_FIELDS = ("unit_id", "page", "start", "end", "end_locator", "pages", "skipped_block_ids", "quote_sha256")
+SOURCE_REVIEW_RULE = "contract_source_review_v1"
 
 
 def _error(reason, **context):
@@ -58,6 +60,136 @@ def _derived_identity(item):
             "scope": item["scope"], "clause_number": item["clause_number"], "subclause_number": item["subclause_number"],
             "members": [{key: member[key] for key in ("block_id", "locator", "text_sha256")} for member in proof["members"]],
             "pending_fields": item["pending_fields"], "blocking_issues": item["blocking_issues"]}
+
+
+def contract_source_review_plan(requirements: list[dict], parsed: dict, manifest: dict,
+                                *, pending_bindings: dict | None = None) -> dict:
+    """Keep proved contract clauses out of standalone technical drafting.
+
+    A contract source role establishes a review boundary, never acceptance of
+    its terms. Literal zero-article references are retained as unresolved text.
+    The finite native catalogue proves scope and full clause boundaries; the
+    actual citation and all source identities are independently reconstructed.
+    """
+    from .contract_review_slots import _ARTICLE, _CLAUSE, _CONTRACT, _member
+
+    result = {"rule": SOURCE_REVIEW_RULE, "items": [], "bindings": {}, "derived_requirements": [],
+              "derivations": {}, "errors": [], "exhaustive": False, "n2_candidate_mutation": False,
+              "satisfaction": "not_determined", "values_inferred": False}
+    try:
+        catalog = contract_review_slot_catalog(parsed, manifest)
+        blocks, units, documents = _index(parsed, manifest)
+    except (PlanningError, KeyError, TypeError, ValueError, AttributeError) as exc:
+        result["errors"].append(_error("contract_review_source_unavailable", source_error_code=getattr(exc, "code", "SOURCE_STRUCTURE_INVALID")))
+        return result
+    result["catalog_sha256"] = digest(catalog)
+    if catalog["unavailable_sources"] or catalog["unresolved_scopes"]:
+        result["errors"].append(_error("contract_review_scope_or_reading_not_proven"))
+        return result
+    if not isinstance(requirements, list) or any(not isinstance(r, dict) for r in requirements):
+        result["errors"].append(_error("contract_review_requirement_identity_invalid"))
+        return result
+    ids = [r.get("requirement_id") for r in requirements]
+    if (any(not isinstance(rid, str) or not rid for rid in ids) or len(set(ids)) != len(ids) or
+            any(not isinstance(r.get("text"), str) or not isinstance(r.get("citations"), list) or not r["citations"] for r in requirements)):
+        result["errors"].append(_error("contract_review_requirement_identity_invalid"))
+        return result
+    skips = _pdf_footer_skips(blocks)
+    documents_by_id = {document["source_id"]: document for document in documents}
+    known_ids = set(ids)
+    # The established IP-field handler already preserves these exact source
+    # anomalies. Do not produce a second, competing disposition for that span.
+    handled_zero_spans = {tuple(item["block_ids"]) for items in (pending_bindings or {}).values() for item in items
+                          if any(issue.get("kind") == "literal_zero_article_reference" for issue in item["blocking_issues"])}
+    for clause in catalog["uncovered_clauses"]:
+        selected = [blocks[key] for key in clause["block_ids"]]
+        text = "\n".join(block["text"] for block in selected)
+        source_ids = set(clause["block_ids"])
+        overlaps = [r for r in requirements if any(source_ids & set(_citation_ids(c)) for c in r["citations"])]
+        writing = [r for r in overlaps if r.get("category") == "technical" or r.get("response_mode") == "writing"]
+        zero_count = len(re.findall(r"第0条", text))
+        zero_unhandled = zero_count and tuple(clause["block_ids"]) not in handled_zero_spans
+        if not writing and not zero_unhandled:
+            continue
+        # A partial technical child must not turn every independent commercial
+        # sibling into another copy of the whole parent contract clause.
+        targets = overlaps if zero_unhandled else writing
+        if clause["reason"] == "source_or_boundary_not_proven":
+            result["errors"].append(_error("contract_review_source_or_boundary_not_proven", source_id=clause["source_id"],
+                                           clause_number=clause["clause_number"]))
+            continue
+        checked, invalid = {}, False
+        for requirement in targets:
+            complete = set()
+            for citation in requirement["citations"]:
+                if not source_ids & set(_citation_ids(citation)):
+                    continue
+                try:
+                    _, covered = _checked_citation(citation, requirement, blocks, skips)
+                    complete.update(covered)
+                except (PlanningError, KeyError, TypeError, ValueError) as exc:
+                    result["errors"].append(_error("contract_review_overlapping_citation_not_proven",
+                        requirement_id=requirement["requirement_id"], source_error_code=getattr(exc, "code", "CITATION_STRUCTURE_INVALID")))
+                    invalid = True
+            checked[requirement["requirement_id"]] = complete
+        if invalid:
+            continue
+        first = selected[0]
+        try:
+            citation = _citation({**{key: first[key] for key in ("source_id", "block_id", "locator")},
+                "block_ids": list(clause["block_ids"]), "quote": text}, blocks, skips)
+            body = [b for b in blocks.values() if b["source_id"] == clause["source_id"]]
+            start = next(i for i, b in enumerate(body) if b["block_id"] == first["block_id"])
+            stop = next(i for i, b in enumerate(body) if b["block_id"] == selected[-1]["block_id"]) + 1
+            ancestor = next(b for b in reversed(body[:start]) if _CONTRACT.fullmatch(b["text"]))
+            scope = next(b for b in reversed(body[:start]) if b["text"] == clause["scope"]["title"])
+            article = next(b for b in reversed(body[:start]) if _ARTICLE.fullmatch(b["text"]))
+            article_index = next(i for i, b in enumerate(body) if b["block_id"] == article["block_id"])
+            first_clause = next(i for i in range(article_index + 1, start + 1) if _CLAUSE.fullmatch(body[i]["text"]))
+            preamble = [b for b in body[article_index + 1:first_clause] if b["block_id"] not in skips]
+            boundary = next(b for b in body[stop:] if b["block_id"] not in skips)
+        except (PlanningError, KeyError, TypeError, ValueError, StopIteration) as exc:
+            result["errors"].append(_error("contract_review_complete_source_not_proven", source_id=clause["source_id"],
+                                           source_error_code=getattr(exc, "code", "SOURCE_STRUCTURE_INVALID")))
+            continue
+        proof = {"rule": SOURCE_REVIEW_RULE, "catalog_sha256": digest(catalog), "source_id": clause["source_id"],
+            "source_sha256": documents_by_id[clause["source_id"]]["sha256"], "parsed_sha256": digest(parsed),
+            "source_reading_sha256": digest(documents_by_id[clause["source_id"]]), "scope": copy.deepcopy(clause["scope"]),
+            "clause_number": clause["clause_number"], "contract_ancestor": _member(ancestor), "scope_heading": _member(scope),
+            "article_heading": _member(article), "article_preamble": [_member(b) for b in preamble],
+            "members": [_member(b) for b in selected], "next_boundary": _member(boundary),
+            "citation_sha256": digest(citation), "coverage": [{"unit_id": key, "coverage_sha256": digest(units[key]["coverage"])}
+                for key in dict.fromkeys(b["unit_id"] for b in [ancestor, scope, article, *preamble, *selected, boundary])]}
+        reasons = (["contract_terms_are_not_standalone_technical_drafting"] if writing else [])
+        if zero_unhandled:
+            reasons.append("literal_zero_article_reference_requires_clarification")
+        item = {"rule": SOURCE_REVIEW_RULE, "scope": copy.deepcopy(clause["scope"]), "clause_number": clause["clause_number"],
+            "block_ids": list(clause["block_ids"]), "text": text, "citation": citation,
+            "source_proof": proof, "source_proof_sha256": digest(proof),
+            "reasons": reasons,
+            "literal_zero_reference_count": zero_count if zero_unhandled else 0, "resolved_reference": None,
+            "response_status": "pending_manual", "satisfaction": "not_determined", "values_inferred": False}
+        item["review_id"] = "CONTRACT-REVIEW-" + digest(item)[:24]
+        result["items"].append(item)
+        for requirement in targets:
+            result["bindings"].setdefault(requirement["requirement_id"], []).append(copy.deepcopy(item))
+        if any(source_ids <= complete for complete in checked.values()):
+            continue
+        rid = "R-CONTRACT-REVIEW-" + digest({"source_proof_sha256": item["source_proof_sha256"], "reasons": item["reasons"]})[:24]
+        if rid in known_ids:
+            result["errors"].append(_error("contract_review_derived_id_collision", requirement_id=rid))
+            continue
+        provenance = {"kind": "derived_from_frozen_source", "not_model_output": True, "rule": SOURCE_REVIEW_RULE,
+            "review_id": item["review_id"], "source_proof_sha256": item["source_proof_sha256"],
+            "overlapping_original_requirement_ids": sorted(checked), "n2_candidate_mutation": False, "values_inferred": False}
+        result["derived_requirements"].append({"requirement_id": rid, "text": text, "citations": [copy.deepcopy(citation)],
+            "category": "commercial", "response_mode": "factual_response", "mandatory": True, "confidence": "low",
+            "format_status": "not_prescribed", "format_title": None, "required_fact_labels": [],
+            "attachment_keywords": [], "reference_keywords": [], "window_ids": [], "derivation": provenance})
+        result["derivations"][rid] = copy.deepcopy(provenance)
+        result["bindings"][rid] = [copy.deepcopy(item)]
+        known_ids.add(rid)
+    return result
 
 
 def contract_pending_plan(requirements: list[dict], parsed: dict, manifest: dict) -> dict:
@@ -192,4 +324,7 @@ def contract_pending_plan(requirements: list[dict], parsed: dict, manifest: dict
         bind(rid, item, "derived_complete_frozen_source_span", [citation])
     result["catalog_summary"].update(bound_item_count=len({item["pending_id"] for items in result["bindings"].values() for item in items}),
                                       derived_requirement_count=len(result["derived_requirements"]))
+    if not result["errors"]:
+        result["source_review"] = contract_source_review_plan(requirements, parsed, manifest, pending_bindings=result["bindings"])
+        result["errors"].extend(result["source_review"]["errors"])
     return result

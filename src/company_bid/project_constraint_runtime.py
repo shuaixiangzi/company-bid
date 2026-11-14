@@ -121,6 +121,69 @@ def _contract_pending_requirements(report, prepared, n1, requirements):
         if ([{key: value for key, value in item.items() if key != "issue_id"} for item in blocking] != pending["blocking_issues"] or
                 [item["issue_id"] for item in blocking] != row["issue_ids"][1:]):
             raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_PENDING_CHANGED")
+    reviewed = _contract_source_review_requirements(report, prepared, n1, requirements, rebuilt)
+    return copy.deepcopy([*derived.values(), *reviewed])
+
+
+def _contract_source_review_requirements(report, prepared, n1, requirements, rebuilt):
+    """Check the actual frozen disposition, not only its declared report."""
+    from .extraction import _id
+
+    review = rebuilt.get("source_review", {})
+    bindings = review.get("bindings", {})
+    derived = {item["requirement_id"]: item for item in review.get("derived_requirements", [])}
+    original = {item["requirement_id"]: item for item in requirements}
+    known = {item["requirement_id"]: item for item in prepared["requirements"]}
+    sources = {item["source_id"]: item for item in prepared["sources"]}
+    sections = {section["section_id"]: section for section in prepared["sections"]}
+    issues = {item["issue_id"]: item for item in prepared["issues"]}
+
+    def changed():
+        raise ProjectConstraintError("PROJECT_CONSTRAINT_CONTRACT_SOURCE_REVIEW_CHANGED")
+
+    expected_rows = {(rid, item["review_id"]): item for rid, items in bindings.items() for item in items}
+    rows = report.get("contract_source_review_handling", [])
+    if (review.get("errors") or len(rows) != len(expected_rows) or
+            len({(row.get("requirement_id"), row.get("review_id")) for row in rows}) != len(rows)):
+        changed()
+    for rid, items in bindings.items():
+        actual, expected = known.get(rid), derived.get(rid, original.get(rid))
+        if (not actual or not expected or any(actual[key] != expected[key] for key in
+                ("text", "category", "mandatory", "response_mode")) or
+                any(rid in task["requirement_refs"] for section in sections.values() for task in section["writing_tasks"])):
+            changed()
+        if rid in derived and actual["source_refs"] != [_id("SCOPE-", citation) for citation in expected["citations"]]:
+            changed()
+    for row in rows:
+        rid = row["requirement_id"]
+        item = expected_rows.get((rid, row["review_id"]))
+        section = sections.get(row.get("section_id"))
+        if (not item or not section or row.get("source_proof_sha256") != item["source_proof_sha256"] or
+                row.get("response_status") != "pending_manual" or row.get("satisfaction_status") != "not_determined" or
+                row.get("values_inferred") is not False or row.get("writing_unit_ids") != [] or row.get("adopted_fact_ids") != [] or
+                type(row.get("literal_zero_reference_count")) is not int or
+                row.get("literal_zero_reference_count") != item["literal_zero_reference_count"] or
+                rid not in section["requirement_refs"] or rid not in section["nonwriting_requirement_refs"] or
+                section["render_body"] is not True or section["fact_refs"]):
+            changed()
+        citation = item["citation"]
+        ref = _id("SCOPE-", citation)
+        source = sources.get(ref)
+        parent = next((source for source in n1["manifest"]["sources"] if source["source_id"] == citation["source_id"]), None)
+        locator = (f"{citation['locator']}; basis={citation['basis']}; chars[{citation['start']}:{citation['end']}]; "
+                   f"quote_sha256={citation['quote_sha256']}; through={citation['end_locator']}; blocks=" + ",".join(citation["block_ids"]))
+        if (not source or not parent or source["sha256"] != parent["sha256"] or source["locator"] != locator or
+                not any(block.get("kind") == "paragraph" and
+                        block.get("text") == "合同条款原文（履约及适用性待核对）：\n" + item["text"] and
+                        block.get("source_refs") == [ref] for block in section["fixed_content"])):
+            changed()
+        issue_ids = row.get("issue_ids", [])
+        title = "合同原文第0条回指待澄清" if item["literal_zero_reference_count"] else "合同条款履约及适用性待核对"
+        if (not issue_ids or any(key not in issues or rid not in issues[key]["requirement_refs"] or
+                issues[key]["source_requirement"] != item["text"] or issues[key]["title"] != title or
+                issues[key]["section_id"] != section["section_id"] or issues[key]["severity"] not in {"missing", "warning"}
+                for key in issue_ids)):
+            changed()
     return copy.deepcopy(list(derived.values()))
 
 

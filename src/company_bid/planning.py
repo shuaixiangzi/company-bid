@@ -31,7 +31,7 @@ from .contract_pending_plan import contract_pending_plan
 from .contract_review_slots import _CONTRACT as _CONTRACT_SOURCE_HEADING
 
 
-PLANNING_VERSION = "bid-plan-v23"
+PLANNING_VERSION = "bid-plan-v24"
 
 
 class _Fill(_Strict):
@@ -78,6 +78,47 @@ def _title_key(title: str) -> str:
 
 def _wire_citation(citation: dict) -> dict:
     return {key: citation[key] for key in ("source_id", "block_id", "locator", "quote", "block_ids", "clause_id", "table_row_id") if key in citation}
+
+
+def _response_writing_control(requirement: dict, blocks: dict) -> str | None:
+    """Recognize complete instructions about a response, not a method to draft."""
+    if requirement["category"] != "technical" or requirement["response_mode"] != "writing":
+        return None
+    patterns = {
+        "single_response_scheme": r"(?:\d+(?:\.\d+)*\s*)?响应人只能提出唯一的响应方案[。.]响应人在响应文件中提出多个响应方案的[，,]其响应文件将被视为无效[。.]",
+        "substantive_response_scope": r"(?:\d+(?:\.\d+)*\s*)?响应文件应当对采购文件有关工期[、,，]质量要求[、,，]技术标准和要求[、,，]采购范围等实质性内容作出响应[。.]",
+    }
+    text = re.sub(r"\s+", "", requirement["text"])
+    rule = next((key for key, pattern in patterns.items() if re.fullmatch(pattern, text)), None)
+    if not rule or len(requirement["citations"]) != 1:
+        return None
+    citation = _citation(_wire_citation(requirement["citations"][0]), blocks, _pdf_footer_skips(blocks))
+    values = [blocks[key] for key in (citation.get("block_ids") or [citation["block_id"]])]
+    if (not _native_source_span(values) or citation["quote"] != requirement["text"] or
+            citation["quote"] != "\n".join(value["text"] for value in values)):
+        return None
+    return rule
+
+
+def _attachment_candidates(detail: dict, attachments: list, blocks: dict) -> tuple[list, dict]:
+    """Separate an explicit alternative credential from its list of search terms.
+
+    A selected credential is an assembly candidate, never proof of eligibility.
+    Other expressions keep conservative matching until their structure is known.
+    """
+    keywords = detail.get("attachment_keywords", [])
+    policy = {"rule": "all_declared_keywords", "keywords": keywords,
+              "eligibility_status": "not_determined"}
+    alternatives = r"(?:[（(]\d+[）)])?企业营业执照或事业单位法人证书等相关资质证明文件[。.]"
+    if re.fullmatch(alternatives, re.sub(r"\s+", "", detail["text"])) and len(detail["citations"]) == 1:
+        citation = _citation(_wire_citation(detail["citations"][0]), blocks, _pdf_footer_skips(blocks))
+        values = [blocks[key] for key in (citation.get("block_ids") or [citation["block_id"]])]
+        if (_native_source_span(values) and citation["quote"] == detail["text"] and
+                citation["quote"] == "\n".join(value["text"] for value in values)):
+            policy.update(rule="explicit_alternative_legal_credential", alternatives=["营业执照", "事业单位法人证书"],
+                          citation=citation, selection_basis="maintained_proof_title_not_qualification_acceptance")
+            return [a for a in attachments if any(term in a["title"] for term in policy["alternatives"])], policy
+    return [a for a in attachments if keywords and all(word in (a["title"] + " " + a["description"]) for word in keywords)], policy
 
 
 def _writing_space(detail: dict, chapter: dict, blocks: dict) -> list:
@@ -472,8 +513,10 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
             "format_status": "not_prescribed", "format_title": None,
             "required_fact_labels": [], "attachment_keywords": [], "reference_keywords": [], "window_ids": []}
         matches = [derived]
-    pure_manual = bool(matches and manual_signing_submission(text) and all(
-        item["category"] == "procedure" and item["response_mode"] == "procedure" and item["text"] == text and
+    pure_manual = bool(matches and manual_signing_submission(text) and
+        any(item["response_mode"] == "procedure" for item in matches) and all(
+        item["category"] == "procedure" and item["response_mode"] in {"procedure", "fixed_text"} and item["text"] == text and
+        (item["response_mode"] == "procedure" or _title_key(item.get("format_title") or "") in {"响应文件", "投标文件"}) and
         all((citation.get("block_ids") or [citation["block_id"]]) == ids for citation in item["citations"])
         for item in matches))
     errors = []
@@ -497,7 +540,12 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
     valid = [item for item in matches if (allowed is None or item["response_mode"] in allowed) and
              (item["response_mode"] != "procedure" or not substantive or rule)]
     if rule:
-        valid = [item for item in valid if item["response_mode"] == "procedure" and item["text"] == text]
+        allowed_rule_modes = {"procedure", "attachment"} if rule == "additional_materials_review" else {"procedure"}
+        valid = [item for item in valid if item["response_mode"] in allowed_rule_modes and item["text"] == text]
+    if pure_manual:
+        # A separately retained fixed-cover candidate does not remove the
+        # identical manual action or prove the preceding conditional scope.
+        valid = [item for item in valid if item["response_mode"] == "procedure"]
     if matches and (not valid or any(not modes & {item["response_mode"] for item in valid} for modes in expected)):
         errors.append("preparation_instruction_response_role_invalid")
     if multiple:
@@ -508,7 +556,7 @@ def _instruction_requirements(role: dict, extracted: dict, blocks: dict) -> tupl
     results = []
     for item in valid:
         result = {"requirement_id": item["requirement_id"], "response_mode": item["response_mode"]}
-        if rule or pure_manual:
+        if rule and item["response_mode"] == "procedure" or pure_manual:
             result.update(source_rule=rule or "manual_signing_submission", source_scope_status=(
                 "unresolved" if role.get("scope_ambiguous") else "not_checked") if role.get("scope_block_ids") else "not_applicable",
                 source_scope_block_ids=list(role.get("scope_block_ids", [])), source_role_proof=copy.deepcopy(role["role_proof"]),
@@ -567,6 +615,80 @@ def _instruction_placements(ledger, sections, attachments, actions, issues):
     return results, errors
 
 
+def _source_format_additions(extracted, blocks, documents, formats):
+    """Recover only source-proven outer sections, never invent a response body.
+
+    A complete N2 requirement must already quote the native source. The two
+    accepted forms are a bounded self-drafting instruction and the existing
+    independently proved qualification-material family. Unknown headings,
+    images, partial reading and arbitrary unextracted forms still fail.
+    """
+    from .material_heading_sources import _family, _PARENT
+    additions = []
+    existing = {f["citation"]["block_id"] for f in formats}
+    skips = _pdf_footer_skips(blocks)
+    for doc in documents:
+        if doc.get("format") != "pdf" or any(
+                u.get("coverage", {}).get("status") not in {"read", "empty"} or
+                u.get("coverage", {}).get("unread_objects") or u.get("coverage", {}).get("unmapped_glyphs") or
+                u.get("coverage", {}).get("error_code") for u in doc["units"]):
+            continue
+        body = sorted((b for b in blocks.values() if b["source_id"] == doc["source_id"] and b["block_id"] not in skips),
+                      key=lambda b: b["ordinal"])
+        units = {u["unit_id"]: u for u in doc["units"]}
+        roles = _format_source_roles(doc, body)
+        for index, heading in enumerate(body):
+            if heading["block_id"] in existing or not _native_source_line(heading):
+                continue
+            ancestors = [b for b in body[:index] if _chapter_boundary(b)]
+            if (not ancestors or not re.search(r"(?:投标|响应|报价).{0,18}(?:格式|组成)", ancestors[-1]["text"]) or
+                    heading["block_id"] in roles or not re.match(r"^[1-9]\d*(?:[.、．]|\s)\s*[^\d]", heading["text"])):
+                continue
+            stop = next((i for i in range(index + 1, len(body)) if _chapter_boundary(body[i]) or
+                         re.match(r"^[1-9]\d*(?:[.、．]|\s)\s*[^\d]", body[i]["text"])), len(body))
+            members, kind, extra = [], None, {}
+            span = body[index:stop]
+            if (len(span) == 2 and _native_source_span(span) and
+                    (_signable_drafting_instruction_only(span[1]["text"]) or
+                     _writing_instruction_only(span[1]["text"]) and re.search(r"技术|服务|施工|实施|设计|方案", heading["text"]))):
+                members, kind = span, "native_self_drafting_section"
+            match = _PARENT.fullmatch(heading["text"])
+            if match and (family := _family(body, index, match, units, doc["source_id"])):
+                first_anchor = next((i for i in range(index + 1, stop) if body[i]["block_id"] in existing), None)
+                if first_anchor is not None:
+                    members, kind = body[index:first_anchor], "native_material_family_prefix"
+                    extra = {"reference_text": family["reference"], "reference_resolution": "not_determined",
+                             "sibling_block_ids": [b["block_id"] for b, _ in family["siblings"]]}
+            if not kind or not _native_source_span(members):
+                continue
+            # Require a complete selected source span, not title similarity.
+            member_ids = {b["block_id"] for b in members}
+            matches = [r for r in extracted["requirements"] if any(
+                set(c.get("block_ids") or [c["block_id"]]) <= member_ids and
+                heading["block_id"] in (c.get("block_ids") or [c["block_id"]]) for c in r["citations"])]
+            if not matches:
+                continue
+            covered = set()
+            for requirement in matches:
+                for citation in requirement["citations"]:
+                    checked = _citation(_wire_citation(citation), blocks, skips)
+                    if checked["quote"] == requirement["text"] and checked["start"] == 0:
+                        covered.update(checked.get("block_ids") or [checked["block_id"]])
+            required = member_ids if kind == "native_self_drafting_section" else {family["parent"]["block_id"], family["note"]["block_id"]}
+            if not required <= covered:
+                continue
+            proof = {"rule": "native_source_format_addition_v1", "kind": kind, "source_id": doc["source_id"],
+                     "source_sha256": doc["sha256"], "region_heading_id": ancestors[-1]["block_id"],
+                     "members": [{k:b[k] for k in ("block_id", "locator", "ordinal", "unit_id")} |
+                                 {"text_sha256": hashlib.sha256(b["text"].encode()).hexdigest()} for b in members], **extra}
+            citation = _citation({k:heading[k] for k in ("source_id", "block_id", "locator")}, blocks, skips)
+            refs = [r["requirement_id"] for r in matches]
+            additions.append({"format_id": _id("FMT-SOURCE-", proof), "title": heading["text"], "level": 1,
+                "status": "prescribed", "citation": citation, "content_block_ids": [b["block_id"] for b in members],
+                "requirement_refs": refs, "source_derivation": proof, "source_derivation_sha256": _hash(proof)})
+    return additions
+
+
 def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, list, list]:
     """Account for whole structural format regions, including window continuations.
 
@@ -575,6 +697,7 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
     boundary; unknown headings and images never disappear into free writing.
     """
     formats = copy.deepcopy(extracted.get("format_chapters", []))
+    formats.extend(_source_format_additions(extracted, blocks, documents, formats))
     footer_skips = _pdf_footer_skips(blocks)
     ledger, errors = list(footer_skips.values()), []
     anchors = {chapter["citation"]["block_id"]: chapter for chapter in formats}
@@ -719,7 +842,7 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
     return formats, ledger, errors
 
 
-def _joint_deviation_formats(requirement, formats, ledger, blocks, units, documents, coverage):
+def _joint_response_formats(requirement, formats, ledger, blocks, units, documents, coverage):
     """Prove one joint obligation's two distinct native response tables.
 
     This recognizes a complete positive source sentence and a unique role pair,
@@ -727,7 +850,7 @@ def _joint_deviation_formats(requirement, formats, ledger, blocks, units, docume
     original N2 requirement and its citation remain unchanged.
     """
     if (requirement["category"] != "commercial" or requirement["response_mode"] != "table" or
-            requirement["format_status"] != "prescribed" or requirement.get("format_title")):
+            requirement["format_status"] not in {"prescribed", "not_prescribed"} or requirement.get("format_title")):
         return None, None
     positive = re.compile(r"^(?:\d+(?:\.\d+)*[、．.]?)?响应文件对采购文件的全部偏差[，,]?"
                           r"均应在响应文件的商务和技术偏差表中列明[。.]")
@@ -747,9 +870,15 @@ def _joint_deviation_formats(requirement, formats, ledger, blocks, units, docume
         first = positive.match(text)
         return first is not None and (first.end() == len(text) or follow_up.fullmatch(text[first.end():]) is not None)
 
-    if not supported_statement(source_text):
+    pricing = re.fullmatch(r"(?:[（(]\d+[）)])?(?:询比|采购|招标)文件要求的各类报价表格[（(]格式见"
+                           r"(?:响应|投标)文件部分格式([1-9]\d*)[、，,]([1-9]\d*)[）)]", source_text)
+    if pricing and pricing[1] == pricing[2]:
         return None, None
-    error = {"reason": "joint_deviation_format_pair_unresolved", "requirement_id": requirement["requirement_id"]}
+    if not pricing and not supported_statement(source_text):
+        return None, None
+    rule = "explicit_numbered_quotation_pair_v1" if pricing else "joint_business_technical_deviation_pair_v1"
+    error = {"reason": "numbered_quotation_format_pair_unresolved" if pricing else "joint_deviation_format_pair_unresolved",
+             "requirement_id": requirement["requirement_id"]}
     citations = requirement["citations"]
     source_ids = {citation["source_id"] for citation in citations}
     if len(source_ids) != 1:
@@ -777,10 +906,17 @@ def _joint_deviation_formats(requirement, formats, ledger, blocks, units, docume
     role_titles = {"business": "商务条款偏离表", "technical": "技术规格偏离表"}
     required_headers = {"business": {"询比文件的商务条款", "响应文件的商务条款", "偏离", "说明"},
                         "technical": {"询比规格", "响应文件规格", "偏离", "说明"}}
+    if pricing:
+        role_titles = {"quotation_summary": "报价表", "quotation_breakdown": "分项报价明细表"}
+        required_headers = {"quotation_summary": {"项目名称", "响应人名称", "报价"},
+                            "quotation_breakdown": {"序号", "内容", "不含税报价万元", "备注"}}
     targets = []
     for role, title in role_titles.items():
         candidates = [chapter for chapter in formats if _title_key(chapter["title"]) == title and
                       chapter["citation"]["source_id"] == source_id]
+        if pricing:
+            number = pricing[1] if role == "quotation_summary" else pricing[2]
+            candidates = [chapter for chapter in candidates if re.match(r"^" + re.escape(number) + r"(?:[.、．]|\s)\s*[^\d]", chapter["title"])]
         if len(candidates) != 1:
             return None, {**error, "role": role, "candidate_format_ids": [item["format_id"] for item in candidates]}
         chapter = candidates[0]
@@ -797,7 +933,7 @@ def _joint_deviation_formats(requirement, formats, ledger, blocks, units, docume
             return None, {**error, "role": role, "format_id": chapter["format_id"], "table_count": len(table_blocks)}
         table = table_blocks[0]
         rows, merges, _ = _raw_grid(table)
-        headers = {_normal(cell) for cell in rows[0]}
+        headers = {_normal(row[0]) for row in rows} if role == "quotation_summary" else {_normal(cell) for cell in rows[0]}
         if len(rows) < 2 or not required_headers[role] <= headers:
             return None, {**error, "role": role, "format_id": chapter["format_id"], "detail": "native_role_columns_unproven"}
         grid = {"rows": rows, "merges": merges, "column_widths": table.get("column_widths", [])}
@@ -828,7 +964,7 @@ def _joint_deviation_formats(requirement, formats, ledger, blocks, units, docume
     start, end = regions[0]
     region_members = [{"block_id": block["block_id"], "locator": block["locator"],
                        "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()} for block in body[start:end]]
-    proof = {"rule": "joint_business_technical_deviation_pair_v1", "requirement_id": requirement["requirement_id"],
+    proof = {"rule": rule, "requirement_id": requirement["requirement_id"],
         "source_id": source_id, "source_sha256": document["sha256"], "requirement_citations": copy.deepcopy(citations),
         "format_region": {"anchor_block_id": body[start]["block_id"], "members": region_members,
             "end_block_id": body[end]["block_id"] if end < len(body) else None,
@@ -839,6 +975,36 @@ def _joint_deviation_formats(requirement, formats, ledger, blocks, units, docume
         "satisfaction_status": "not_determined", "n2_candidate_mutation": False}
     proof["proof_sha256"] = _hash(proof)
     return proof, None
+
+
+def _format_region_instruction(requirement, ledger, blocks):
+    """Bind a complete procedural chapter reference, not a bidder response form."""
+    if requirement["category"] != "procedure" or requirement["response_mode"] != "procedure":
+        return None
+    statement = re.sub(r"\s+", "", requirement["text"])
+    match = re.fullmatch(r"(?:\d+(?:\.\d+)*[、．.]?)?(响应|投标)文件应按(第[零一二三四五六七八九十百\d]+章)"
+        r"[“\"]\1文件格式[”\"]进行编写[，,]如有必要[，,]可以增加附页[，,]作为\1文件的组成部分[。.]", statement)
+    if not match or len(requirement["citations"]) != 1:
+        return None
+    citation = requirement["citations"][0]
+    ids = citation.get("block_ids") or [citation["block_id"]]
+    if any(not _native_source_line(blocks[key]) for key in ids):
+        return None
+    checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks))
+    if checked["quote"] != "\n".join(blocks[key]["text"] for key in ids):
+        return None
+    candidates = [row for row in ledger if row.get("source_role") == "format_region_boundary" and
+        row["source_id"] == citation["source_id"] and re.fullmatch(re.escape(match[2] + match[1]) +
+        r"文件(?:要求及)?格式", re.sub(r"\s+", "", blocks[row["block_id"]]["text"]))]
+    if len(candidates) != 1:
+        return None
+    row = candidates[0]
+    proof = {"rule": "native_format_region_instruction_v1", "requirement_id": requirement["requirement_id"],
+        "requirement_citations": copy.deepcopy(requirement["citations"]), "source_role_proof": copy.deepcopy(row["role_proof"]),
+        "source_role_proof_sha256": row["role_proof_sha256"], "status": "source_proven_pending_manual",
+        "n2_candidate_mutation": False, "satisfaction_status": "not_determined"}
+    proof["proof_sha256"] = _hash(proof)
+    return proof
 
 
 def _remote_format_resolution(requirement, chapter, ledger, blocks, windows, documents, coverage):
@@ -936,6 +1102,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
 
     def assemble():
         planned_formats, format_ledger, format_errors = _format_plan(extracted, blocks, documents)
+        source_format_derivations = [{"format_id": f["format_id"], "source_proof": f["source_derivation"],
+            "source_proof_sha256": f["source_derivation_sha256"], "requirement_refs": f["requirement_refs"]}
+            for f in planned_formats if f.get("source_derivation")]
+        _capture(ctx, "n3-source-format-derivations", {"items": source_format_derivations,
+            "n2_candidate_mutation": False, "n2_formats_sha256": _hash(extracted["format_chapters"])})
         source_rules = {}
         for row in format_ledger:
             for handler in row.get("instruction_requirements", []):
@@ -961,6 +1132,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _capture(ctx, "n3-contract-pending-plan", contract_pending)
         _fail(bool(contract_pending["errors"]), "CONTRACT_PENDING_REQUIRES_SOURCE_REVIEW")
         planned_requirements.extend(contract_pending["derived_requirements"])
+        contract_source_review = contract_pending.get("source_review", {})
+        planned_requirements.extend(contract_source_review.get("derived_requirements", []))
+        contract_review_bindings = contract_source_review.get("bindings", {})
+        contract_source_review_handling = []
         contract_bindings = contract_pending["bindings"]
         contract_pending_handling = []
         source_controls = collect_plan_controls(planned_requirements, blocks, units, documents, _native_source_span)
@@ -979,6 +1154,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         format_links = []
         remote_format_resolutions = []
         format_associations = []
+        format_region_resolutions = []
         joint_formats = {}
         for result in extracted["window_results"]:
             if result["validated"]["format_status"] in {"unread", "conflict"}:
@@ -988,7 +1164,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 format_errors.append({"reason": "format_chapter_unresolved", "format_id": chapter["format_id"], "citation": chapter["citation"]})
         if not format_errors:
             for requirement in planned_requirements:
-                proof, error = _joint_deviation_formats(requirement, planned_formats, format_ledger, blocks, units,
+                proof, error = _joint_response_formats(requirement, planned_formats, format_ledger, blocks, units,
                                                        documents, extracted["coverage"])
                 if error:
                     format_errors.append(error)
@@ -1002,6 +1178,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 chapter for chapter in planned_formats if title and _title_key(title) == _title_key(chapter["title"])]
             if not matches and not title:
                 matches = [chapter for chapter in planned_formats if len(_title_key(chapter["title"])) >= 4 and
+                           chapter.get("source_role") != "prescribed_cover" and
                            _title_key(chapter["title"]) in _normal(requirement["text"])]
             if len(matches) > 1 and not joint_ids:
                 format_errors.append({"reason": "ambiguous_grounded_format_title", "requirement_id": requirement["requirement_id"],
@@ -1011,7 +1188,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     if requirement["requirement_id"] not in chapter["requirement_refs"]:
                         chapter["requirement_refs"].append(requirement["requirement_id"])
                     format_links.append({"requirement_id": requirement["requirement_id"], "format_id": chapter["format_id"],
-                        "basis": "joint_business_technical_deviation_pair_v1" if joint_ids else
+                        "basis": next(p["rule"] for p in format_associations if p["requirement_id"] == requirement["requirement_id"]) if joint_ids else
                                  "exact_source_title_after_number_prefix_normalization", "title": chapter["title"]})
         format_sources_complete = not format_errors
         for requirement in planned_requirements:
@@ -1021,6 +1198,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             unresolved = requirement["format_status"] in {"unread", "conflict"}
             needs_format = (requirement["format_status"] == "prescribed" or requirement["response_mode"] in {"table", "fixed_text"} or
                             requirement["response_mode"] == "factual_response" and bool(requirement.get("format_title")))
+            region_resolution = _format_region_instruction(requirement, format_ledger, blocks) if format_sources_complete else None
+            if region_resolution is not None:
+                format_region_resolutions.append(region_resolution)
+                needs_format = unresolved = False
             matching_formats = [chapter for chapter in planned_formats if requirement["requirement_id"] in chapter["requirement_refs"] or
                                 _title_key(requirement.get("format_title") or "") == _title_key(chapter["title"])]
             located = bool(matching_formats)
@@ -1072,6 +1253,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             "status": "failed" if format_errors else "source_proven" if format_associations else "not_needed"})
         _capture(ctx, "n3-format-coverage", {"producer_version": PLANNING_VERSION, "blocks": format_ledger,
                                              "format_associations": format_associations,
+                                             "format_region_resolutions": format_region_resolutions,
                                              "remote_format_resolutions": remote_format_resolutions,
                                              "errors": format_errors, "status": "failed" if format_errors else "complete"})
         _fail(bool(format_errors), "REQUIRED_FORMAT_UNRESOLVED")
@@ -1318,14 +1500,49 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 else:
                     issue(section, refs, "指定格式图片待处理", "图片格式不能冒充可编辑文字或表格。", "补充可读取原格式或明确允许采用的图片页。")
 
+        outline_groups, writing_control_handling = [], []
+        writing_controls = {r["requirement_id"]: rule for r in planned_requirements
+                            if (rule := _response_writing_control(r, blocks))}
+        contract_sections = {}
         for requirement in planned_requirements:
             rid = requirement["requirement_id"]
             if rid in assigned:
                 continue
-            section = new_section(rid, requirement["text"].strip().replace("\n", " ")[:70], [rid],
-                                  source_refs=next(r["source_refs"] for r in requirements if r["requirement_id"] == rid))
+            refs = next(r["source_refs"] for r in requirements if r["requirement_id"] == rid)
+            guarded = contract_bindings.get(rid, []) + contract_review_bindings.get(rid, [])
+            scope_keys = {_hash([item["source_proof"]["source_id"], item["scope"]]) for item in guarded}
+            section, grouping = None, None
+            if len(scope_keys) == 1:
+                key = next(iter(scope_keys))
+                section = contract_sections.get(key)
+                if section is None:
+                    section = new_section(["contract-review-group", key],
+                        guarded[0]["scope"]["title"] + "：原文与待核事项", [])
+                    contract_sections[key] = section
+                grouping = {"rule": "same_proven_contract_scope", "scope": guarded[0]["scope"],
+                            "source_proof_sha256s": sorted({item["source_proof_sha256"] for item in guarded})}
+            elif (not guarded and rid not in writing_controls and rid not in global_control_ids and
+                    requirement["category"] == "technical" and requirement["response_mode"] == "writing" and
+                    requirement["format_status"] == "not_prescribed" and not requirement.get("format_title")):
+                candidates = [(chapter, evidence) for chapter in planned_formats
+                    if {c["source_id"] for c in requirement["citations"]} == {chapter["citation"]["source_id"]}
+                    and _title_key(chapter["title"]) in {"技术服务方案", "技术方案", "施工方案", "实施方案"}
+                    and (evidence := _writing_space(requirement, chapter, blocks))]
+                if len(candidates) == 1:
+                    chapter, evidence = candidates[0]
+                    section = next(item for item in sections if item["section_id"] == _id("SEC-", chapter["format_id"]))
+                    writing_spaces[(chapter["format_id"], rid)] = evidence
+                    grouping = {"rule": "unique_open_technical_chapter", "format_id": chapter["format_id"],
+                                "permission_citations": evidence}
+            if section is None:
+                section = new_section(rid, requirement["text"].strip().replace("\n", " ")[:70], [rid], source_refs=refs)
+            else:
+                section["requirement_refs"].append(rid)
+                section["source_refs"] = list(dict.fromkeys([*section["source_refs"], *refs]))
+                outline_groups.append({"requirement_id": rid, "section_id": section["section_id"], **grouping,
+                    "n2_candidate_mutation": False, "satisfaction_status": "not_determined"})
             assigned.add(rid)
-            if requirement["response_mode"] == "procedure":
+            if requirement["response_mode"] == "procedure" and not guarded:
                 section["render_body"] = False
 
         for section in sections:
@@ -1333,6 +1550,27 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 detail = details[rid]
                 placements.append({"requirement_id": rid, "section_id": section["section_id"],
                                    "response_mode": detail["response_mode"], "render_body": section["render_body"]})
+                if rid in contract_review_bindings:
+                    section["render_body"] = placements[-1]["render_body"] = True
+                    section["kind"] = "facts"
+                    section["nonwriting_requirement_refs"] = list(dict.fromkeys([*section["nonwriting_requirement_refs"], rid]))
+                    for item in contract_review_bindings[rid]:
+                        source_ref = scoped_source(item["citation"])
+                        section["fixed_content"].append({"kind": "paragraph",
+                            "text": "合同条款原文（履约及适用性待核对）：\n" + item["text"], "source_refs": [source_ref]})
+                        section["source_refs"] = list(dict.fromkeys([*section["source_refs"], source_ref]))
+                        title = "合同原文第0条回指待澄清" if item["literal_zero_reference_count"] else "合同条款履约及适用性待核对"
+                        marker = issue(section, [rid], title,
+                            "完整合同条款及其否定、例外和原文异常均保留为本次响应待核项；尚未核对履约适用性或判定满足，不将合同条款扩写为技术方案。",
+                            "按完整合同原文核对履约条件并澄清异常引用；不猜填、不解释第0条、不代为承诺或认定已满足。")
+                        next(value for value in issues if value["issue_id"] == marker)["source_requirement"] = item["text"]
+                        contract_source_review_handling.append({"requirement_id": rid, "section_id": section["section_id"],
+                            "review_id": item["review_id"], "source_proof_sha256": item["source_proof_sha256"],
+                            "issue_ids": [marker], "response_status": "pending_manual", "satisfaction_status": "not_determined",
+                            "writing_unit_ids": [], "adopted_fact_ids": [], "values_inferred": False,
+                            "literal_zero_reference_count": item["literal_zero_reference_count"]})
+                    if rid not in contract_bindings:
+                        continue
                 if rid in contract_bindings:
                     pending_items = contract_bindings[rid]
                     requirement = next(item for item in requirements if item["requirement_id"] == rid)
@@ -1395,6 +1633,20 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                         "writing_unit_ids": [], "n2_candidate_mutation": False,
                         "satisfaction_status": "not_determined"})
                     continue
+                if rid in writing_controls:
+                    original = next(item for item in requirements if item["requirement_id"] == rid)
+                    section["fixed_content"].append({"kind": "paragraph",
+                        "text": "响应编写规则（招标原文，待核对）：\n" + detail["text"],
+                        "source_refs": original["source_refs"]})
+                    section["nonwriting_requirement_refs"].append(rid)
+                    marker = issue(section, [rid], "响应编写规则待核对",
+                        "本条约束整份响应，不提供可以扩写的具体技术方法；保留原文并等待最终内容核对。",
+                        "核对最终响应是否符合本规则，不能用一段通用承诺代替逐项检查。")
+                    next(item for item in issues if item["issue_id"] == marker)["severity"] = "warning"
+                    writing_control_handling.append({"requirement_id": rid, "section_id": section["section_id"],
+                        "rule": writing_controls[rid], "issue_id": marker, "writing_unit_ids": [],
+                        "source_refs": original["source_refs"], "satisfaction_status": "not_determined"})
+                    continue
                 if rid.startswith("R-FORM-") or detail["response_mode"] == "procedure":
                     continue
                 if section_formats.get(section["section_id"]) in {"unread", "conflict"}:
@@ -1442,13 +1694,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                                      "source_refs": requirement["source_refs"]})
                     adopt_facts_or_mark_missing(section, rid, detail)
                 elif mode == "attachment":
-                    keywords = detail.get("attachment_keywords", [])
-                    matches = [item for item in manifest.get("attachments", []) if keywords and
-                               all(word in (item["title"] + " " + item["description"]) for word in keywords)]
+                    matches, matching_policy = _attachment_candidates(detail, manifest.get("attachments", []), blocks)
                     def proof_group(item):
                         return ("bundle", item["bundle_id"]) if item.get("bundle_id") else ("single", item["attachment_id"])
                     bundle_keys = {proof_group(item) for item in matches}
                     attachment_reports.append({"requirement_id": rid, "status": "matched" if len(bundle_keys) == 1 else "ambiguous" if matches else "no_match",
+                                               "matching_policy": matching_policy,
                                                "candidate_ids": [item["attachment_id"] for item in matches],
                                                "candidate_bundle_ids": [identity for _, identity in sorted(bundle_keys)],
                                                "candidate_groups": [{"kind": kind, "identity": identity} for kind, identity in sorted(bundle_keys)],
@@ -1457,6 +1708,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                         bundle = next(iter(bundle_keys))
                         selected_pages = sorted([item for item in manifest["attachments"]
                             if proof_group(item) == bundle], key=lambda item: item.get("page_index", 1))
+                        if matching_policy["rule"] == "explicit_alternative_legal_credential":
+                            marker = issue(section, [rid], "证明材料适用性待核对",
+                                "按维护的证明类别装配了原件页；尚未据此判断证照状态或本次资格已满足。",
+                                "结合原件和本次招标条件核对适用性，不以附件存在代替资格结论。")
+                            next(item for item in issues if item["issue_id"] == marker)["severity"] = "warning"
                         if re.search(r"有效|未过期|等级|级资质|到期|不少于|至少", detail["text"]):
                             issue(section, [rid], "证明适用条件仍需明确资料", "已定位证明，但当前快照没有可核验的有效期、等级或数量条件字段。", "补充条件字段及原件定位；不能仅凭关键词判定满足资格。")
                         cross_referenced = set()
@@ -1620,6 +1876,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _fail(bool(association_errors), "JOINT_FORMAT_ASSOCIATION_INCOMPLETE")
         project_constraints = plan_project_constraints(parsed, planned_requirements, manifest, sections)
         _capture(ctx, "n3-project-constraints", project_constraints)
+        _capture(ctx, "n3-outline-grouping", {"producer_version": PLANNING_VERSION,
+            "placements": outline_groups, "writing_controls": writing_control_handling,
+            "n2_candidate_mutation": False, "satisfaction_status": "not_determined"})
         output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
                     "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
                     "requirements": requirements, "attachments": attachments, "issues": issues,
@@ -1629,12 +1888,15 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
                     "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
+                  "outline_grouping": outline_groups, "response_writing_controls": writing_control_handling,
+                  "source_format_derivations": source_format_derivations,
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,
                   "format_block_coverage": format_ledger,
                   "instruction_handling": instruction_handling,
                   "preparation_source_rules": list(source_rules.values()),
                   "source_context_proofs": list(source_context_proofs.values()),
                   "format_links": format_links, "format_associations": format_associations,
+                  "format_region_resolutions": format_region_resolutions,
                   "format_association_placements": association_placements, "writing_space_decisions": writing_space_reports,
                   "remote_format_resolutions": remote_format_resolutions,
                   "prescribed_cover": {"section_id": prescribed_cover_section_id,
@@ -1645,6 +1907,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "factual_responses": factual_response_reports,
                   "contract_pending_plan": contract_pending,
                   "contract_pending_handling": contract_pending_handling,
+                  "contract_source_review_handling": contract_source_review_handling,
                   "review_actions": review_actions,
                   "component_dispositions": component_matrix, "component_number_conflicts": conflict_handling,
                   "global_critical_controls": global_control_handling,

@@ -7,7 +7,7 @@ from company_bid import pipeline
 from company_bid.diagnostics import inspect_diagnostics
 from company_bid.extraction import PlanningError, extract_requirements
 from company_bid.models import file_sha256
-from company_bid.planning import plan_bid, _index, _citation, _pdf_footer_skips, _format_plan, _joint_deviation_formats
+from company_bid.planning import plan_bid, _index, _citation, _pdf_footer_skips, _format_plan, _joint_response_formats
 from company_bid.provider import ChatProposalProvider, PreparedProposalProvider
 from company_bid.runtime import Executor, NodeSpec
 from test_n3_source_roles import line
@@ -267,7 +267,7 @@ def test_positive_substring_cannot_hide_unknown_native_source_suffix(tmp_path):
     requirement["text"] = JOINT
     requirement["citations"] = [_citation({"source_id": source["source_id"], "block_id": source["block_id"],
         "locator": source["locator"], "quote": JOINT}, blocks, _pdf_footer_skips(blocks))]
-    proof, error = _joint_deviation_formats(requirement, formats, ledger, blocks, units, documents, extracted["coverage"])
+    proof, error = _joint_response_formats(requirement, formats, ledger, blocks, units, documents, extracted["coverage"])
     assert proof is None and error["reason"] == "joint_deviation_format_pair_unresolved"
 
 
