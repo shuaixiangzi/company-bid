@@ -45,6 +45,8 @@ def intake_nodes(root: Path, version, settings: dict):
                 item["path"] = str(root / ref["path"])
         if data["evidence_selections"]:
             from .evidence import prepare_evidence
+            from .intake import verify_derived_proof_scopes
+            verify_derived_proof_scopes(ctx, data)
             evidence = prepare_evidence(ctx, data["sources"], data["evidence_selections"], root)
             existing_sources = {item["source_id"] for item in data["sources"]}
             for source in evidence["sources"]:
@@ -111,7 +113,11 @@ def intake_nodes(root: Path, version, settings: dict):
                 "chain_diagnostics": {"parser_coverage": value["parsed"].get("coverage", {}),
                                       "library_preparation_note": value["manifest"]["preparation_note"],
                                       "material_candidates": material_candidate_report(
-                                          result["requirements"], value["manifest"].get("material_records", [])),
+                                          result["requirements"], value["manifest"].get("material_records", []),
+                                          attachments=value["manifest"].get("attachments", []),
+                                          sources=value["manifest"]["sources"], parsed=value["parsed"],
+                                          evidence_selections=value["manifest"].get("evidence_selections", []),
+                                          proof_derivations=value["manifest"].get("proof_derivations", [])),
                                       "extraction_coverage": value["extracted"].get("coverage", {}),
                                       "generation_mode": "recorded" if gateway(ctx, value, mapping=True).options.get("mode") == "recorded" else "model_candidates",
                                       "semantic_review": "requires_source_review"}}

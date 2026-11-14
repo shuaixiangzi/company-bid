@@ -248,7 +248,7 @@ def test_prescribed_cover_first_once_original_order_and_same_id_checklist(tmp_pa
     issues_text = "\n".join(paragraph.text for paragraph in Document(output["issues_docx"]["path"]).paragraphs)
     for issue in package.issues:
         assert text.count(f"【待补 {issue.issue_id}】") == 1
-        assert issue.marker in issues_text
+        assert f"{issue.issue_id} {issue.title}" in issues_text
         assert issue.action in issues_text
     assert "详见待补清单同编号。" in text
     assert package.model_dump(mode="json") == frozen

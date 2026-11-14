@@ -408,6 +408,7 @@ class PrescribedBlock(Contract):
 class SectionPlan(Contract):
     section_id: Text
     title: Text
+    document_role: Literal["response", "review"] = "response"
     kind: Literal["facts", "technical", "commercial", "attachments"]
     requirement_refs: list[Text] = Field(min_length=1)
     fact_refs: list[Text] = Field(default_factory=list)
@@ -531,6 +532,7 @@ Block = Annotated[
 class Section(Contract):
     section_id: Text
     title: Text
+    document_role: Literal["response", "review"] = "response"
     requirement_refs: list[Text] = Field(min_length=1)
     blocks: list[Block] = Field(default_factory=list)
     level: int = Field(default=1, ge=1, le=3)
@@ -567,7 +569,7 @@ def _cover_source(source: SourceRef, text: str) -> tuple[Path, str]:
 
 def _prescribed_cover(snapshot, section, paragraphs) -> set[str]:
     """Check the whole source template as well as each original body paragraph."""
-    if not section.render_body or not paragraphs:
+    if section.document_role != "response" or not section.render_body or not paragraphs:
         raise ValueError("prescribed cover must be visible and contain original paragraphs")
     requirements = {item.requirement_id: item for item in snapshot.requirements}
     sources = {item.source_id: item for item in snapshot.sources}
@@ -589,6 +591,28 @@ def _prescribed_cover(snapshot, section, paragraphs) -> set[str]:
                     or issue.source_requirement != "；".join(requirements[ref].text for ref in issue.requirement_refs)):
                 raise ValueError("prescribed cover issue must retain its source requirements")
     return {requirement.requirement_id for requirement in matches}
+
+
+def _validate_document_roles(snapshot) -> None:
+    """Review content keeps its sources and cannot replace a required response.
+
+    A review section is visible in the companion document. A non-procedural
+    requirement assigned there still needs its own visible pending marker in
+    the response, rather than obtaining response coverage from quoted rules.
+    """
+    response_sections = {item.section_id: item for item in snapshot.sections
+                         if item.document_role == "response" and item.render_body}
+    response_refs = {ref for item in response_sections.values() for ref in item.requirement_refs}
+    required_refs = {item.requirement_id for item in snapshot.requirements
+                     if item.response_mode != "procedure"}
+    if required_refs - response_refs:
+        raise ValueError("review content cannot replace a required response section")
+    review_refs = {ref for item in snapshot.sections if item.document_role == "review"
+                   for ref in item.requirement_refs} & required_refs
+    pending_refs = {ref for issue in snapshot.issues if issue.section_id in response_sections
+                    for ref in issue.requirement_refs if ref in response_sections[issue.section_id].requirement_refs}
+    if review_refs - pending_refs:
+        raise ValueError("review requirements need their own pending issue in the response")
 
 
 class Snapshot(Contract):
@@ -770,11 +794,18 @@ class PreparedBid(Snapshot):
                 if task.source_context_refs != expected_contexts:
                     raise ValueError("writing task must retain exactly its child source contexts")
             for item in self.requirements:
-                if (item.requirement_id in section.requirement_refs and item.source_contexts and item.response_mode == "writing"
+                if (section.document_role == "response" and item.requirement_id in section.requirement_refs
+                        and item.source_contexts and item.response_mode == "writing"
                         and not any(item.requirement_id in task.requirement_refs for task in section.writing_tasks)):
                     raise ValueError("context-bound technical writing requires an actual writing task")
         if requirement_ids - covered:
             raise ValueError("every requirement must have a planned section")
+        _validate_document_roles(self)
+        for item in self.requirements:
+            if item.source_contexts and item.response_mode == "writing" and not any(
+                    section.document_role == "response" and item.requirement_id in task.requirement_refs
+                    for section in self.sections for task in section.writing_tasks):
+                raise ValueError("source context technical writing requires a response writing task")
         for item in [*self.tables, *self.attachments, *self.issues]:
             _known([item.section_id], section_ids, "section")
         for table in self.tables:
@@ -862,10 +893,12 @@ class DocumentPackage(Snapshot):
                             issues_seen.update(cell.issue_refs)
         if requirements_seen != requirement_ids:
             raise ValueError("every requirement must have a document section")
+        _validate_document_roles(self)
         for requirement in self.requirements:
             if requirement.source_contexts and requirement.response_mode == "writing" and not any(
                     isinstance(block, (ParagraphBlock, ListBlock)) and block.content_role == "proposal" and
-                    requirement.requirement_id in block.requirement_refs for section in self.sections for block in section.blocks):
+                    requirement.requirement_id in block.requirement_refs for section in self.sections
+                    if section.document_role == "response" for block in section.blocks):
                 raise ValueError("source context warning cannot replace technical proposal content")
         if set(attachments_seen) != attachment_ids or len(attachments_seen) != len(attachment_ids):
             raise ValueError("each attachment must be embedded exactly once")

@@ -31,7 +31,9 @@ from .contract_pending_plan import contract_pending_plan
 from .contract_review_slots import _CONTRACT as _CONTRACT_SOURCE_HEADING
 
 
-PLANNING_VERSION = "bid-plan-v24"
+PLANNING_VERSION = "bid-plan-v25"
+# Preserve the unchanged, independently checkpointed field-mapping request.
+MAPPING_VERSION = "bid-plan-v24"
 
 
 class _Fill(_Strict):
@@ -243,7 +245,7 @@ def _table_mapping(ctx, block: dict, facts: list, sources: dict, source_roles: d
                                 any(_canonical(label) == _canonical(f["label"]) for f in allowed.values())
                                 for _, _, label in _adjacent_labels(rows, r, c))]
     if candidate_targets and allowed and config.get("map_table_fields", True):
-        payload = {"producer_version": PLANNING_VERSION, "grid_sha256": grid_hash, "rows": rows,
+        payload = {"producer_version": MAPPING_VERSION, "grid_sha256": grid_hash, "rows": rows,
                    "merges": merges, "allowed_targets": [list(value) for value in candidate_targets],
                    "allowed_facts": [{"fact_id": key, "label": fact["label"]} for key, fact in allowed.items()],
                    "output_contract": _GridMapping.model_json_schema(),
@@ -1846,6 +1848,19 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                            "逐项核对实际证明页和招标另行指定的统计表；缺件补原件，空表字段补有来源事实。")
             next(value for value in issues if value["issue_id"] == marker)["severity"] = "warning"
 
+        writing_refinement = {}
+        if config.get("refine_writing_tasks", False):
+            from .writing_plan import refine_writing_plan
+            writing_refinement = refine_writing_plan(sections, details, blocks, units, source_map, references)
+            for control in writing_refinement.get("controls", []):
+                section = next(s for s in sections if s["section_id"] == control["section_id"])
+                rid = control["requirement_id"]
+                marker = issue(section, [rid], "技术编制及覆盖范围待核对",
+                    "该要求控制本章的编写范围；具体内容由所列技术单元响应，仍需核对正文而非以编写说明代替响应。",
+                    "对照本条原文核对各技术单元、适用条件及评分内容；当前未认定已满足。")
+                next(i for i in issues if i["issue_id"] == marker)["severity"] = "warning"
+                control["issue_id"] = marker
+            _capture(ctx, "n3-writing-refinement", writing_refinement)
         instruction_handling, instruction_errors = _instruction_placements(
             format_ledger, sections, attachments, review_actions, issues)
         _capture(ctx, "n3-instruction-handling", {"items": instruction_handling, "errors": instruction_errors,
@@ -1874,6 +1889,23 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _capture(ctx, "n3-format-association-placement", {"items": association_placements, "errors": association_errors,
             "status": "failed" if association_errors else "mapped" if association_placements else "not_needed"})
         _fail(bool(association_errors), "JOINT_FORMAT_ASSOCIATION_INCOMPLETE")
+        response_organization = {}
+        material_report = {}
+        if config.get("organize_response", False):
+            from .material_matching import material_candidate_report
+            from .response_organization import organize_response
+            material_report = material_candidate_report(planned_requirements, manifest.get("material_records", []),
+                attachments=manifest.get("attachments", []), sources=manifest["sources"], parsed=parsed,
+                evidence_selections=manifest.get("evidence_selections", []),
+                proof_derivations=manifest.get("proof_derivations", []))
+            _capture(ctx, "n3-material-matching", material_report)
+            response_organization = organize_response(sections, requirements, details, planned_formats, blocks,
+                issues, attachments, manifest, material_report)
+            placements = [{"requirement_id": rid, "section_id": section["section_id"],
+                "response_mode": details[rid]["response_mode"], "render_body": section["render_body"],
+                "document_role": section.get("document_role", "response")}
+                for section in sections for rid in section["requirement_refs"]]
+            _capture(ctx, "n3-response-organization", response_organization)
         project_constraints = plan_project_constraints(parsed, planned_requirements, manifest, sections)
         _capture(ctx, "n3-project-constraints", project_constraints)
         _capture(ctx, "n3-outline-grouping", {"producer_version": PLANNING_VERSION,
@@ -1888,6 +1920,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
                     "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
+                  "writing_refinement": writing_refinement, "response_organization": response_organization,
+                  "material_matching": material_report,
                   "outline_grouping": outline_groups, "response_writing_controls": writing_control_handling,
                   "source_format_derivations": source_format_derivations,
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,

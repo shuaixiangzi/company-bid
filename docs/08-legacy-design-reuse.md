@@ -66,3 +66,26 @@
 - 恢复与成本：成功单元复用、失败单元单独续跑、模板变化只影响有效依赖、捕获失败/用量未知可见、取消与迟到提交、原结果 hash 不变。
 
 以上是新项目后续实施的门槛，不表示这些场景本轮已经全部运行。设计复核阶段没有改动代码或成品；其后的 M1 质量升级已落实写作单元、参考来源、固定表集合校验、拟用记录表和样式参数，并验证同章失败单元续跑、格式未明请求前拒绝及 N6 单独重跑。OCR、全量要求提取、权限、取消竞争与容量门禁仍属后续阶段。
+
+## 2026-11-14 响应格式保真专项复核
+
+用户检查真实授权书 Word 后指出未完整遵循招标响应格式。本次将原 PDF 第 33、34 页与实际诊断 Word、N1/N3/N5 冻结产物及旧已提交源码对照；旧库仍只读，不连接数据库。结论是**沿用旧系统已存在的窄处理合同，在新链路补齐实现与校验**，不能把此问题只当普通字体调整，也不需要从零重设计整个格式处理流程。
+
+以下源码证据固定于旧基线 `53f20a3afac42e07069d58ee53398457ea8b5aed`，均为 `apps/api/src/ai_bid_api/` 下路径：
+
+| 可沿用的旧实现经验 | 已核对的源码 | 新系统实际缺口 |
+|---|---|---|
+| 识别 PDF 细横线，恢复填写位置；保留段落对齐及签章角色；合并视觉换行 | `composition/tender_format_layout.py` 的 `LayoutLine`、`_horizontal_rules`、`_insert_underlines`、`unwrap_layout_lines`、`layout_lines_to_blocks` | `reading.py` 按物理行创建 paragraph，未保留对齐/字体/绘制横线；N3 与 `PrescribedBlock` 继续只传文字 |
+| 只在明确的名称槽位预填已知事实，保持固定文字，未知授权人/日期/金额不擅填 | `composition/form_chapters.py:1898` 的 `prefill_form_template` | 当前 `planning.py` 对段落直接复制原字并增加泛化缺项，只对表格做字段映射；冻结公司名、项目名没有进入授权书 |
+| 保护身份证明标签及实际粘贴位置；有可用证明则按限定目标绑定，缺项在原位标记 | `composition/form_chapters.py` 的 `_identity_paste_cell`、`annotate_identity_attachments`、`ensure_identity_attachment_slots` | 授权书身份证区域仅剩 1×2 文字格，未表达粘贴区几何与具体目标槽位 |
+| 传递并消费列宽、行高、合并与对齐，行高用最小高度允许内容扩展 | `exports/renderer.py` 的 `_grid_table_with_geometry`，消费 `row_heights_cm` 并写 `AT_LEAST` | `_pdf_table` 虽计算了纵向边界，却只导出列宽/合并/bbox；`TableSpec` 无行高，规划又丢弃 bbox，renderer 因此压缩大留白格 |
+
+旧实现仍有需重审的通用正则、样式固定值、静默异常处理和多代 fallback；本次不搬 `form_chapters.py` 大包、旧运行路径或 ORM/Harness 依赖，也不将这些代码的存在称为旧端到端质量已通过。此前“旧 renderer 忽略通用 format_style”的结论仍成立，但不应误扩大为它完全没有表格几何或格式填充能力；这些局部路径本次已单独核实。
+
+调用链核对：`exports/service.py` 的 `render_snapshot → _snapshot_data_with_review_index → with_form_grid_hints / restore_tender_format_nodes → render_docx_bytes`；`composition/outline_skeleton.py` 进一步调用 `extract_format_item_layout / layout_lines_to_blocks / extract_table_geometry`，最终由 renderer 的 quote/geometry 分支消费。这证明特定 snapshot 路径有接线；`simplification/document.py` 的纯 section.body 投影仍绕过该恢复流程，不能将能力推广到所有旧下载路径。只读测试证据 `test_tender_table_geometry_unit.py` 含 8.3cm 行高及对应 Word 高度断言，`test_tender_format_layout_unit.py` 含下划线、授权书内标题、恢复几何与间距案例；没有运行旧测试或将其作为新项目通过依据。
+
+本次实际几何：源第 33 页身份证区域高 235pt（8.29cm）、表宽 544.55pt（19.21cm）；第 34 页基本情况表宽 458.75pt（16.18cm），16 个原始行高可读。当前通用模板仅有 16cm 内容宽度，表格还统一使用 10.5pt，而这两页源表为 12pt。仅增加 row height 仍不足以解决全部保真问题；需将原格式页面/表格的适用宽度、行高、对齐及可扩展规则一起传递，并实际检查填值后的溢出，不以缩字号掩盖。受控证据在 `.local/evidence/v57-native-format-loss.private.local.json`。
+
+后续修订以招标原格式为优先：保留来源页/块/坐标/hash，将段落保护区、可填槽位及表格几何带到装配层；用来源事实绑定填值，验证替换之外的文字不变。未知值在具体填写位置标注，完整原因在清单中；原页大留白、签章区和“后附材料”的相对顺序均进入真实样本核对。普通技术正文才使用人工标书的通用排版风格。输入、布局、绑定、输出及差异均保存独立 checkpoint/诊断证据，布局失败不能等同于缺公司资料。
+
+当前初版没有通过这项验收。不得通过手工修改成品掩盖生产链缺口；修改执行版本创建子 run，历史成功窗口和正文只在输入/来源/执行依赖仍有效并完成认证时复用，不为修版式重复购买整份提取。

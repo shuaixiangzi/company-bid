@@ -90,7 +90,8 @@ def test_diagnostic_provenance_survives_planning_with_normal_mapping_provider(tm
     monkeypatch.setattr(planning, "plan_bid", lambda *args, **kwargs: deepcopy(prepared))
     nodes = {n.key: n for n in build_executor(tmp_path / "runtime", settings).nodes}
     ctx = SimpleNamespace(execution_config=settings)
-    value = {"parsed": {}, "manifest": {"preparation_note": "synthetic diagnostic propagation only"},
+    value = {"parsed": {}, "manifest": {"preparation_note": "synthetic diagnostic propagation only",
+                                       "sources": deepcopy(prepared["sources"])},
              "source_artifacts": [], "proposals": {}}
     n2 = nodes["N2"].handler(ctx, value)
     assert "diagnostic_replay" not in value

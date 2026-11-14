@@ -12,7 +12,9 @@ from company_bid.pipeline import build_executor
     ("plan_component_controls.py", {"N3"}),
     ("project_constraints.py", {"N3", "N4", "N5", "N6"}),
     ("project_constraint_runtime.py", {"N3", "N4", "N5", "N6"}),
-    ("diagnostic_replay.py", {"N2"}),
+    # N4/N5 also authenticate historical writing via its shared origin reader.
+    ("diagnostic_replay.py", {"N2", "N4", "N5"}),
+    ("writing_replay.py", {"N4", "N5"}),
     ("material_heading_sources.py", {"N2", "N3"}),
     ("format_continuation_sources.py", {"N2", "N3"}),
     ("contract_blank_sources.py", {"N2", "N3"}),

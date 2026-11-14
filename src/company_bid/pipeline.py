@@ -25,7 +25,7 @@ def _version(*names: str) -> str:
     # Node-owned helpers are explicit transitive inputs. Extending an N3 helper
     # must invalidate N3 without relabeling unchanged N0/N1/N2 implementations.
     dependencies = {"runtime.py": ("unit_concurrency.py",),
-                    "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py"),
+                    "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py"),
                     "pipeline.py": ("project_constraint_runtime.py",),
                     "project_constraint_runtime.py": ("project_constraints.py", "contract_pending_plan.py"),
                     "contract_pending_plan.py": ("contract_review_slots.py", "extraction.py"),
@@ -95,11 +95,21 @@ def build_executor(root: Path, config: dict) -> Executor:
         elif provider_options["mode"] == "chat_completions":
             options = {k: v for k, v in provider_options.items() if k != "mode"}
             provider = ChatProposalProvider(ChatConfig(**options))
+        elif provider_options["mode"] == "diagnostic_writing_mixed":
+            from .writing_replay import DiagnosticWritingProvider
+            provider = DiagnosticWritingProvider(provider_options, ctx.execution_config.get("writing_replay"))
         else:
             raise PipelineFailure("PROVIDER_MODE_INVALID")
         facts = {item.fact_id: item for item in prepared.facts}
         tables = {item.table_id: item for item in prepared.tables}
         excerpts = {item.reference_id: item for item in prepared.reference_excerpts}
+        writing_diagnostic = provider_options["mode"] == "diagnostic_writing_mixed"
+        if writing_diagnostic:
+            from .writing_replay import build_writing_unit_input
+            base_inputs = {task.unit_id: build_writing_unit_input(prepared, plan, task, provider_options,
+                           project_constraints, value["proposals"])
+                           for plan in prepared.sections for task in plan.writing_tasks}
+            provider.preflight(ctx, prepared.model_dump(mode="json"), base_inputs)
         sections = []
         writing_review = []
         for plan in prepared.sections:
@@ -135,16 +145,22 @@ def build_executor(root: Path, config: dict) -> Executor:
                 if project_constraints is not None:
                     task_input["project_constraint_artifact_refs"] = project_constraints["artifact_refs"]
                     task_input["project_constraint_plan_sha256"] = project_constraints["plan_sha256"]
+                if writing_diagnostic:
+                    task_input = provider.unit_input(task.unit_id, task_input)
+                correction_scope = task_input.get("writing_correction", {}).get("source_scope")
 
                 def write_task(task=task, context=context, task_requirements=task_requirements,
                                plan=plan, references=references, source_contexts=source_contexts,
-                               context_proof_hashes=context_proof_hashes, project_source_refs=project_source_refs):
+                               context_proof_hashes=context_proof_hashes, project_source_refs=project_source_refs,
+                               correction_scope=correction_scope):
                     project_constraint_checks = validate_project_constraint_context(task.model_dump(mode="json"), context,
                                                                                    project_constraints)
                     proposal = provider.generate(ctx, context, task_requirements)
                     source_refs = list(dict.fromkeys([*(item["source_id"] for item in references),
                         *(ref for requirement in task_requirements for ref in requirement["source_refs"]),
                         *(ref for item in source_contexts for ref in item["source_refs"]), *project_source_refs]))
+                    correction_refs = [item["source_id"] for item in correction_scope["sources"]] if correction_scope else []
+                    source_refs = list(dict.fromkeys([*source_refs, *correction_refs]))
                     blocks = [HeadingBlock(text=task.title, level=plan.level + 1,
                                            requirement_refs=task.requirement_refs, source_refs=source_refs)]
                     for paragraph in proposal.paragraphs:
@@ -154,9 +170,11 @@ def build_executor(root: Path, config: dict) -> Executor:
                         blocks.append(ListBlock(items=proposal.steps, content_role="proposal",
                                                 requirement_refs=task.requirement_refs, source_refs=source_refs))
                     for table_id in task.table_refs:
-                        blocks.append(TableBlock(table=tables[table_id], requirement_refs=task.requirement_refs))
-                    return {"blocks": [block.model_dump(mode="json") for block in blocks],
+                        blocks.append(TableBlock(table=tables[table_id], requirement_refs=task.requirement_refs,
+                                                 source_refs=correction_refs))
+                    result = {"blocks": [block.model_dump(mode="json") for block in blocks],
                             "review": {"unit_id": task.unit_id, "section_id": plan.section_id,
+                                       "document_role": plan.document_role,
                                        "title": task.title, "operation": task.operation,
                                        "requirement_refs": task.requirement_refs, "reference_refs": task.reference_refs,
                                        "must_cover": task.must_cover, "completion_criteria": task.completion_criteria,
@@ -167,6 +185,11 @@ def build_executor(root: Path, config: dict) -> Executor:
                                        "project_constraint_source_refs": project_source_refs,
                                        "context_review_status": "not_checked" if source_contexts else "not_applicable",
                                        "semantic_status": "requires_source_review"}}
+                    if correction_scope is not None:
+                        result["review"].update(correction_context_requirement_refs=[item["requirement_id"]
+                            for item in correction_scope["requirements"]],
+                            correction_source_scope_sha256=digest(correction_scope), correction_source_refs=correction_refs)
+                    return result
 
                 task_output = ctx.run_unit(task.unit_id, task_input, write_task)
                 task_outputs.append(task_output)
@@ -212,16 +235,21 @@ def build_executor(root: Path, config: dict) -> Executor:
                 if not blocks and plan.render_body:
                     raise PipelineFailure("EMPTY_SECTION")
                 return Section(section_id=plan.section_id, title=plan.title, requirement_refs=plan.requirement_refs,
+                               document_role=plan.document_role,
                                level=plan.level, start_on_new_page=plan.start_on_new_page,
                                render_body=plan.render_body, blocks=blocks).model_dump(mode="json")
 
             sections.append(ctx.run_unit(plan.section_id, unit_input, write_section))
         package = DocumentPackage(**prepared.model_dump(exclude={"sections", "tables", "input_kind"}),
                                   title=f"{prepared.project.name} 投标文件", sections=sections)
+        diagnostics = dict(value.get("chain_diagnostics", {}))
+        if writing_diagnostic:
+            diagnostics.update(writing_replay=provider.summary(), publication_status="diagnostic_only")
         return {"package": package.model_dump(mode="json"), "source_artifacts": value["source_artifacts"],
                 "input_kind": prepared.input_kind,
-                "chain_diagnostics": value.get("chain_diagnostics", {}),
+                "chain_diagnostics": diagnostics,
                 "writing_review": writing_review, "expected_table_ids": list(tables),
+                "expected_section_document_roles": {item.section_id: item.document_role for item in prepared.sections},
                 "expected_project_constraint_bindings": project_constraint_trace_bindings(project_constraints),
                 "expected_table_links": {table_id: {"section_id": table.section_id,
                     "requirement_refs": list(table.requirement_refs)} for table_id, table in tables.items()},
@@ -229,6 +257,13 @@ def build_executor(root: Path, config: dict) -> Executor:
 
     def check(ctx, value):
         package = DocumentPackage.model_validate(value["package"])
+        from .writing_replay import validate_correction_links
+        correction_links = validate_correction_links(ctx, value, package)
+        section_roles = {item.section_id: item.document_role for item in package.sections}
+        expected_roles = value.get("expected_section_document_roles")
+        if ((expected_roles is not None and expected_roles != section_roles) or
+                expected_roles is None and "review" in section_roles.values()):
+            raise PipelineFailure("SECTION_DOCUMENT_ROLE_MISMATCH")
         from .project_constraint_runtime import load_project_constraints, project_constraint_trace_bindings
         project_constraints = load_project_constraints(ctx)
         expected_project_constraints = project_constraint_trace_bindings(project_constraints)
@@ -267,13 +302,25 @@ def build_executor(root: Path, config: dict) -> Executor:
                             set(table.requirement_refs) - set(section.requirement_refs)):
                         raise PipelineFailure("TABLE_REQUIREMENT_LINK_MISMATCH")
                     table_links.append({"table_id": table.table_id, **actual,
+                                        "document_role": section.document_role,
                                         "assembly_status": "checked", "satisfaction_status": "not_determined"})
         checks = {"schema": "passed", "source_hashes": "passed",
                   "semantic_fact_support": "requires_source_review",
+                  "writing_correction_contexts": correction_links,
                   "model_fact_invention": "requires_source_review",
                   "requirement_count": len(package.requirements), "section_count": len(package.sections),
+                  "response_section_count": sum(item.document_role == "response" for item in package.sections),
+                  "review_section_count": sum(item.document_role == "review" for item in package.sections),
                   "attachment_count": len(package.attachments), "issue_count": len(package.issues),
+                  "response_attachment_count": sum(section_roles[item.section_id] == "response" for item in package.attachments),
+                  "review_attachment_count": sum(section_roles[item.section_id] == "review" for item in package.attachments),
+                  "response_issue_count": sum(section_roles[item.section_id] == "response" for item in package.issues),
+                  "review_issue_count": sum(section_roles[item.section_id] == "review" for item in package.issues),
                   "table_count": len(table_ids), "writing_units": value.get("writing_review", []),
+                  "response_table_count": sum(isinstance(block, TableBlock) for section in package.sections
+                      if section.document_role == "response" for block in section.blocks),
+                  "review_table_count": sum(isinstance(block, TableBlock) for section in package.sections
+                      if section.document_role == "review" for block in section.blocks),
                   "table_requirement_links": table_links,
                   "table_requirement_links_status": "checked" if expected_links is not None else "not_recorded",
                   "review_actions": [item.model_dump(mode="json") for item in package.review_actions],
@@ -290,7 +337,8 @@ def build_executor(root: Path, config: dict) -> Executor:
         reviews = value.get("writing_review", [])
         for review in reviews:
             refs = review["requirement_refs"]
-            if set(refs) - set(by_requirement):
+            if (set(refs) - set(by_requirement) or review.get("section_id") not in section_roles or
+                    review.get("document_role", "response") != section_roles[review["section_id"]]):
                 raise PipelineFailure("SOURCE_CONTEXT_WRITING_REVIEW_MISMATCH")
             expected_contexts = [context for requirement in package.requirements if requirement.requirement_id in refs
                                  for context in requirement.source_contexts]
@@ -300,10 +348,20 @@ def build_executor(root: Path, config: dict) -> Executor:
                     expected_contexts and review.get("context_review_status") != "not_checked"):
                 raise PipelineFailure("SOURCE_CONTEXT_WRITING_REVIEW_MISMATCH")
         for requirement in package.requirements:
+            response_sections = [section.section_id for section in package.sections
+                if section.document_role == "response" and section.render_body and
+                requirement.requirement_id in section.requirement_refs]
+            review_sections = [section.section_id for section in package.sections
+                if section.document_role == "review" and section.render_body and
+                requirement.requirement_id in section.requirement_refs]
             issues = [i.issue_id for i in package.issues if requirement.requirement_id in i.requirement_refs]
+            response_issues = [i.issue_id for i in package.issues
+                if i.section_id in response_sections and requirement.requirement_id in i.requirement_refs]
             coverage = {"requirement_id": requirement.requirement_id,
                         "status": "pending_manual" if issues else "no_body_required" if requirement.response_mode == "procedure" else "drafted_for_review",
-                        "issue_ids": issues}
+                        "issue_ids": issues, "response_issue_ids": response_issues,
+                        "response_section_ids": response_sections, "review_section_ids": review_sections,
+                        "satisfaction_status": "not_determined"}
             if requirement.response_mode == "procedure":
                 action = actions_by_requirement.get(requirement.requirement_id)
                 coverage.update(body_status="not_required", review_status=action.status if action else "not_recorded",
@@ -313,7 +371,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                                     source_scope_refs=[item.source_ref for item in action.source_scope_contexts])
             if requirement.source_contexts:
                 if requirement.response_mode == "writing" and not any(
-                        requirement.requirement_id in review["requirement_refs"] for review in reviews):
+                        requirement.requirement_id in review["requirement_refs"] and
+                        section_roles.get(review.get("section_id")) == "response" for review in reviews):
                     raise PipelineFailure("SOURCE_CONTEXT_WRITING_REVIEW_MISSING")
                 coverage.update(body_status="drafted_for_review" if requirement.response_mode == "writing" else
                     "pending_manual" if issues else "assembled_for_review", applicability_status="not_checked" if any(
@@ -325,6 +384,11 @@ def build_executor(root: Path, config: dict) -> Executor:
                         "provenance_status": "checked", "review_status": "not_checked",
                         "assembly_placement_status": "checked_for_known_components" if context.operator == "exclude_commercial_quotation" else "not_applicable",
                         "semantic_compliance": "requires_source_review", "satisfaction_status": "not_determined"})
+            if review_sections and requirement.response_mode != "procedure":
+                # The quoted rule and its review table are not a drafted answer.
+                # The response-side issue is independently required by the model.
+                coverage.update(status="pending_manual", body_status="pending_manual",
+                                review_status="not_checked", review_content_status="retained_for_review")
             checks["requirement_coverage"].append(coverage)
         checks["pending_context_review_count"] = len(checks["source_context_review"])
         ctx.capture("validation", checks)
@@ -354,9 +418,13 @@ def build_executor(root: Path, config: dict) -> Executor:
     # Actual source hashes prevent continuing a partially completed run after code
     # changes. A repair/fork is explicit and keeps the original record untouched.
     shared = ("pipeline.py", "models.py", "preparation_rules.py", "runtime.py", "storage.py", "observability.py")
+    writing_replay_keys = (("writing_replay", "run_purpose", "debug_capture")
+                           if config.get("provider", {}).get("mode") == "diagnostic_writing_mixed" else ())
     nodes = [NodeSpec("N0", _version(*shared), freeze, config_keys=()),
-             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py"), draft, config_keys=("provider",)),
-             NodeSpec("N5", _version(*shared), check, config_keys=()),
+             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py", "writing_replay.py", "diagnostic_replay.py", "diagnostics.py"),
+                      draft, config_keys=("provider",) + writing_replay_keys),
+             NodeSpec("N5", _version(*shared, "writing_replay.py", "diagnostic_replay.py", "diagnostics.py"), check,
+                      config_keys=(("provider",) + writing_replay_keys) if writing_replay_keys else ()),
              NodeSpec("N6", _version(*shared, "rendering.py"), render, config_keys=("document_style",))]
     if config.get("pipeline", "prepared") == "automatic":
         from .chain import intake_nodes

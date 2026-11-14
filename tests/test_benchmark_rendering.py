@@ -113,7 +113,7 @@ def test_existing_markers_are_canonical_once_and_repeated_cells_use_short_id(tmp
     rows[1][1].update(text="【待补 M-001】", issue_refs=["M-001"])
     result = render_package(DocumentPackage.model_validate(data), tmp_path / "out")
     table = Document(result["bid_docx"]["path"]).tables[1]
-    assert table.cell(1, 1).text == "【待补 M-001：服务总价】"
+    assert table.cell(1, 1).text == "【待补 M-001】"
     assert table.cell(2, 1).text == "【待补 M-001】"
 
 

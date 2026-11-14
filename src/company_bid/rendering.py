@@ -322,7 +322,6 @@ def _render_table(document, spec, issues, style, *, show_title=True):
     if spec.header_from_columns:
         for cell, label in zip(table.rows[0].cells, spec.columns):
             cell.text = label
-    seen_issues = set()
     for values in spec.rows:
         row = table.add_row()
         for cell, value in zip(row.cells, values):
@@ -331,8 +330,7 @@ def _render_table(document, spec, issues, style, *, show_title=True):
                 text = re.sub(r"【待补\s+" + re.escape(issue_id) + r"(?:\s*[:：][^】]*)?】", "", text)
             cell.text = text.strip()
             for issue_id in value.issue_refs:
-                _issue_text(cell.paragraphs[0], issues[issue_id], style, compact=issue_id in seen_issues)
-                seen_issues.add(issue_id)
+                _issue_text(cell.paragraphs[0], issues[issue_id], style, compact=True)
     weights = spec.column_widths or ([1, 2.4] if len(spec.columns) == 2 else [1] * len(spec.columns))
     _format_table(document, table, weights, style, spec.repeat_header_rows)
     for merge in spec.merges:
@@ -373,6 +371,65 @@ def _validate_files(package):
             raise RenderingError(f"attachment unreadable: {attachment.attachment_id}") from exc
 
 
+def _render_section_content(document, package, section, *, seen_attachment_groups=None):
+    """Render the same editable content in its declared destination document."""
+    style = package.style
+    issues = {issue.issue_id: issue for issue in package.issues}
+    attachments = {item.attachment_id: item for item in package.attachments}
+    if seen_attachment_groups is None:
+        seen_attachment_groups = set()
+    table_issue_ids = {ref for block in section.blocks if isinstance(block, TableBlock)
+                       for row in block.table.rows for cell in row for ref in cell.issue_refs}
+    for block in section.blocks:
+        if isinstance(block, HeadingBlock):
+            document.add_paragraph(block.text, f"Heading {block.level}")
+        elif isinstance(block, ParagraphBlock):
+            if block.content_role == "proposal":
+                document.add_paragraph(block.text)
+            else:
+                _plain(document, block.text, style)
+        elif isinstance(block, ListBlock):
+            for index, item in enumerate(block.items, 1):
+                _plain(document, f"（{index}）{item}" if block.ordered else f"• {item}", style)
+        elif isinstance(block, TableBlock):
+            _render_table(document, block.table, issues, style, show_title=block.table.title != section.title)
+        elif isinstance(block, IssueBlock):
+            if block.issue_id not in table_issue_ids:
+                paragraph = _plain(document, "", style)
+                issue = issues[block.issue_id]
+                _issue_text(paragraph, issue, style)
+                destination = "本清单" if section.document_role == "review" else "待补清单"
+                _font(paragraph.add_run(f" {issue.action} 详见{destination}同编号。"), name=style.font_family, size=style.body_pt)
+        elif isinstance(block, AttachmentBlock):
+            attachment = attachments[block.attachment_id]
+            group = (("bundle", attachment.bundle_id) if attachment.bundle_id else
+                     ("single", attachment.attachment_id))
+            continuation = group in seen_attachment_groups
+            if not continuation:
+                seen_attachment_groups.add(group)
+                if attachment.title != section.title:
+                    document.add_paragraph(attachment.title, f"Heading {min(section.level + 1, 3)}")
+            else:
+                _plain(document, f"{attachment.title}（第{attachment.page_index}/{attachment.page_count}页）",
+                       style, bold=True, keep_next=True)
+            if attachment.synthetic:
+                paragraph = _plain(document, "以下图片为合成测试用途，不是实际公司证明或证照。", style, bold=True, keep_next=True)
+                _font(paragraph.runs[0], name=style.font_family, color="A80000")
+            with Image.open(attachment.path) as image:
+                image_width, image_height = image.size
+            page = document.sections[-1]
+            max_width = page.page_width.cm - 2 * style.margin_cm
+            max_height = page.page_height.cm - 2 * style.margin_cm - (2 if continuation else 5)
+            scale = min(max_width / image_width, max_height / image_height)
+            paragraph = _plain(document, "", style, align=WD_ALIGN_PARAGRAPH.CENTER)
+            picture = paragraph.add_run().add_picture(str(attachment.path), width=Cm(image_width * scale), height=Cm(image_height * scale))
+            picture._inline.docPr.set("descr", attachment.description)
+        for issue_id in block.issue_refs:
+            if isinstance(block, IssueBlock) and issue_id == block.issue_id:
+                continue  # The explicit issue block already includes its marker and action.
+            _issue_text(_plain(document, "", style), issues[issue_id], style)
+
+
 def _render_bid(package):
     document = _base_document(package, package.title)
     style = package.style
@@ -389,59 +446,47 @@ def _render_bid(package):
     body_page = document.add_section(WD_SECTION_START.NEW_PAGE)
     _geometry(body_page, style)
     _page_furniture(body_page, style, numbered=True)
-    issues = {issue.issue_id: issue for issue in package.issues}
-    attachments = {item.attachment_id: item for item in package.attachments}
     body_sections_seen = 0
-    for section_index, section in enumerate(package.sections):
-        if not section.render_body or section.section_id == cover_id:
+    seen_attachment_groups = set()
+    for section in package.sections:
+        if section.document_role != "response" or not section.render_body or section.section_id == cover_id:
             continue
-        preceding = section_index if cover_id is None else body_sections_seen
-        if preceding and section.start_on_new_page:
+        if body_sections_seen and (section.level == 1 or section.start_on_new_page):
             document.add_page_break()
         body_sections_seen += 1
         document.add_paragraph(section.title, f"Heading {section.level}")
-        for block in section.blocks:
-            if isinstance(block, HeadingBlock):
-                document.add_paragraph(block.text, f"Heading {block.level}")
-            elif isinstance(block, ParagraphBlock):
-                if block.content_role == "proposal":
-                    document.add_paragraph(block.text)
-                else:
-                    _plain(document, block.text, style)
-            elif isinstance(block, ListBlock):
-                for index, item in enumerate(block.items, 1):
-                    _plain(document, f"（{index}）{item}" if block.ordered else f"• {item}", style)
-            elif isinstance(block, TableBlock):
-                _render_table(document, block.table, issues, style, show_title=block.table.title != section.title)
-            elif isinstance(block, IssueBlock):
-                paragraph = _plain(document, "", style)
-                issue = issues[block.issue_id]
-                _issue_text(paragraph, issue, style)
-                _font(paragraph.add_run(f" {issue.action} 详见待补清单同编号。"), name=style.font_family, size=style.body_pt)
-            elif isinstance(block, AttachmentBlock):
-                attachment = attachments[block.attachment_id]
-                if attachment.title != section.title:
-                    document.add_paragraph(attachment.title, f"Heading {min(section.level + 1, 3)}")
-                if attachment.synthetic:
-                    paragraph = _plain(document, "以下图片为合成测试用途，不是实际公司证明或证照。", style, bold=True, keep_next=True)
-                    _font(paragraph.runs[0], name=style.font_family, color="A80000")
-                with Image.open(attachment.path) as image:
-                    image_width, image_height = image.size
-                page = document.sections[-1]
-                max_width = page.page_width.cm - 2 * style.margin_cm
-                max_height = page.page_height.cm - 2 * style.margin_cm - 5
-                scale = min(max_width / image_width, max_height / image_height)
-                paragraph = _plain(document, "", style, align=WD_ALIGN_PARAGRAPH.CENTER)
-                picture = paragraph.add_run().add_picture(str(attachment.path), width=Cm(image_width * scale), height=Cm(image_height * scale))
-                picture._inline.docPr.set("descr", attachment.description)
-            for issue_id in block.issue_refs:
-                if isinstance(block, IssueBlock) and issue_id == block.issue_id:
-                    continue  # The explicit issue block already includes this marker and its action.
-                _issue_text(_plain(document, "", style), issues[issue_id], style)
+        _render_section_content(document, package, section, seen_attachment_groups=seen_attachment_groups)
     return document
 
 
-def _trace_appendix(document, package):
+def _source_quote_catalog(package):
+    """Point repeated source text to its verbatim appendix, retaining extras."""
+    requirements = {item.requirement_id: item.text for item in package.requirements}
+    links, supplemental = {}, {}
+    quotes = [(item.source_requirement, item.requirement_refs)
+              for item in [*package.issues, *package.review_actions]]
+    quotes.extend((context.text, []) for action in package.review_actions for context in action.source_scope_contexts)
+    for text, refs in quotes:
+        if text not in links:
+            matching = [rid for rid, original in requirements.items() if text == original]
+            if not matching:
+                matching = [rid for rid, original in requirements.items() if text in original]
+            if not matching and any(text == separator.join(requirements[ref] for ref in refs)
+                                    for separator in ("\n", "；", "\n\n")):
+                matching = list(refs)
+            if matching:
+                links[text] = f"见“响应要求”原文附录：{'、'.join(matching)}。"
+            else:
+                identity = f"SRCQ-{len(supplemental) + 1:03d}"
+                supplemental[text] = {"quote_id": identity, "text": text, "requirement_refs": []}
+                links[text] = f"见“补充来源原文”附录：{identity}。"
+        if text in supplemental:
+            supplemental[text]["requirement_refs"] = list(dict.fromkeys(
+                [*supplemental[text]["requirement_refs"], *refs]))
+    return {"links": links, "supplemental": list(supplemental.values())}
+
+
+def _trace_appendix(document, package, source_quote_catalog=None):
     style = package.style
     document.add_page_break()
     document.add_paragraph("制作范围与来源追溯", "Heading 1")
@@ -455,9 +500,12 @@ def _trace_appendix(document, package):
         paragraph.paragraph_format.line_spacing = 1.2
         return paragraph
 
-    trace("正文位置与要求映射", bold=True, keep_next=True)
+    trace("文档位置与要求映射", bold=True, keep_next=True)
     for section in package.sections:
-        trace(f"{section.section_id} {section.title}；要求 {'、'.join(section.requirement_refs)}。")
+        destination = "投标正文" if section.document_role == "response" else "配套核对清单"
+        trace(f"{section.section_id} {section.title}；位置 {destination}；要求 {'、'.join(section.requirement_refs)}。")
+        if section.document_role == "review":
+            trace("保留来源原文及待核事项，不计为已完成投标响应，也未认定满足。")
         if not section.render_body:
             trace("该项无需单独投标正文；办理或约束核对状态保留于清单，不代表已经满足。")
         for block in section.blocks:
@@ -482,7 +530,7 @@ def _trace_appendix(document, package):
         if fact.fact_id in used_fact_ids:
             trace(f"{fact.fact_id} {fact.label}：{fact.value}；来源 {'、'.join(fact.source_refs)}。")
     if not used_fact_ids:
-        trace("本次正文和表格没有采用来源事实值；未采用的资料保留在受控输入中。")
+        trace("本次文档和表格没有采用来源事实值；未采用的资料保留在受控输入中。")
     groups = {}
     for source in package.sources:
         groups.setdefault(source.sha256, []).append(source)
@@ -494,9 +542,15 @@ def _trace_appendix(document, package):
     trace("响应要求", bold=True, keep_next=True)
     for requirement in package.requirements:
         trace(f"{requirement.requirement_id} {requirement.text} 来源 {'、'.join(requirement.source_refs)}。")
+    source_quote_catalog = source_quote_catalog or _source_quote_catalog(package)
+    if source_quote_catalog["supplemental"]:
+        trace("补充来源原文", bold=True, keep_next=True)
+        for quote in source_quote_catalog["supplemental"]:
+            trace(f"{quote['quote_id']} 对应要求 {'、'.join(quote['requirement_refs']) or '见事项来源定位'}：{quote['text']}")
     trace("实际装配附件", bold=True, keep_next=True)
     for attachment in package.attachments:
-        trace(f"{attachment.attachment_id} {attachment.title}；正文位置 {attachment.section_id}；来源 {'、'.join(attachment.source_refs)}。")
+        destination = next(item.document_role for item in package.sections if item.section_id == attachment.section_id)
+        trace(f"{attachment.attachment_id} {attachment.title}；{'正文' if destination == 'response' else '配套清单'}位置 {attachment.section_id}；来源 {'、'.join(attachment.source_refs)}。")
         trace(attachment.description)
         trace(f"装配图像 SHA-256：{attachment.sha256}", size=8)
 
@@ -515,18 +569,25 @@ def _render_issues(package):
     _plain(document, f"项目名称：{package.project.name}", style)
     _plain(document, f"投标人：{package.company.name}", style)
     if package.issues:
-        _plain(document, "需线下补充的事项如下。正文和清单使用同一待补编号。", style, bold=True)
-    elif not package.review_actions:
+        location_note = ("各待补编号按下列投标正文或配套清单位置查找。" if
+                         any(section.document_role == "review" for section in package.sections) else
+                         "正文和清单使用同一待补编号。")
+        _plain(document, f"需线下补充的事项如下。{location_note}", style, bold=True)
+    elif not package.review_actions and not any(section.document_role == "review" for section in package.sections):
         _plain(document, "本次未自动检出待补项。提交前仍须线下核对原件、报价及签字盖章。", style)
     titles = {section.section_id: section.title for section in package.sections}
+    roles = {section.section_id: section.document_role for section in package.sections}
+    source_quotes = _source_quote_catalog(package)
     for issue in package.issues:
         heading = document.add_paragraph(f"{issue.issue_id} {issue.title}", "Heading 2")
         heading.paragraph_format.space_before = Pt(12)
-        _issue_text(_plain(document, "", style), issue, style)
-        _plain(document, f"正文位置：{titles[issue.section_id]}（{issue.section_id}）。在投标文件中搜索同编号即可定位。", style)
+        if roles[issue.section_id] == "review":
+            _plain(document, f"配套清单位置：{titles[issue.section_id]}（{issue.section_id}）。在本清单中搜索同编号即可定位。", style)
+        else:
+            _plain(document, f"正文位置：{titles[issue.section_id]}（{issue.section_id}）。在投标文件中搜索同编号即可定位。", style)
         _plain(document, f"对应要求：{'、'.join(issue.requirement_refs)}", style)
         _plain(document, f"缺项原因：{issue.reason}", style)
-        _plain(document, f"来源要求：{issue.source_requirement}", style)
+        _plain(document, f"来源要求：{source_quotes['links'][issue.source_requirement]}", style)
         _plain(document, f"补充动作：{issue.action}", style)
     if package.review_actions:
         document.add_paragraph("待办理事项与待核验商业约束", "Heading 1")
@@ -538,18 +599,31 @@ def _render_issues(package):
             document.add_paragraph(f"{action.action_id} {label}", "Heading 2")
             _plain(document, f"状态：{status}；尚未认定满足。", style)
             _plain(document, f"对应要求：{'、'.join(action.requirement_refs)}", style)
-            _plain(document, f"来源要求：{action.source_requirement}", style)
+            _plain(document, f"来源要求：{source_quotes['links'][action.source_requirement]}", style)
             _plain(document, f"办理或核对动作：{action.instruction}", style)
             if action.source_scope_status != "not_applicable":
                 _plain(document, "适用范围尚未确定；该事项仅待线下核对，未据此判定正文、报价或资格。", style)
                 for context in action.source_scope_contexts:
-                    _plain(document, f"候选上层原文：{context.text}", style)
+                    _plain(document, f"候选上层原文：{source_quotes['links'][context.text]}", style)
                     source = sources[context.source_ref]
                     _plain(document, f"上层来源定位：{context.source_ref}；{source.title}；{source.locator}", style)
             for ref in action.source_refs:
                 source = sources[ref]
                 _plain(document, f"来源定位：{ref}；{source.title}；{source.locator}", style)
-    _trace_appendix(document, package)
+    review_sections = [section for section in package.sections
+                       if section.document_role == "review" and section.render_body]
+    if review_sections:
+        document.add_page_break()
+        document.add_paragraph("来源原文与待核对内容", "Heading 1")
+        _plain(document, "以下内容保留完整原文、表格和缺项，仅供配套核对；不计为正式投标响应，尚未认定满足。", style)
+        seen_attachment_groups = set()
+        for index, section in enumerate(review_sections):
+            if index and section.start_on_new_page:
+                document.add_page_break()
+            document.add_paragraph(section.title, f"Heading {section.level}")
+            _plain(document, f"核对位置：{section.section_id}；对应要求：{'、'.join(section.requirement_refs)}。", style)
+            _render_section_content(document, package, section, seen_attachment_groups=seen_attachment_groups)
+    _trace_appendix(document, package, source_quotes)
     return document
 
 

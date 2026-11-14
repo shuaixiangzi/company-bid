@@ -47,7 +47,7 @@ def test_editable_text_tables_actual_image_fields_and_two_way_missing_ids(tmp_pa
     bid = Document(output["bid_docx"]["path"])
     assert len(bid.tables) == 2
     assert [cell.text for cell in bid.tables[0].rows[0].cells] == ["字段", "填报内容"]
-    assert "【待补 M-001：服务总价】" in bid.tables[1].cell(1, 1).text
+    assert "【待补 M-001】" in bid.tables[1].cell(1, 1).text
     text = "\n".join(p.text for p in bid.paragraphs)
     assert "拟在现场核对设备边界" in text
     assert "合成测试样本" in text
@@ -56,7 +56,7 @@ def test_editable_text_tables_actual_image_fields_and_two_way_missing_ids(tmp_pa
     assert "F-NAME" not in text
     issues = Document(output["issues_docx"]["path"])
     issues_text = "\n".join(p.text for p in issues.paragraphs)
-    assert "【待补 M-001：服务总价】" in issues_text
+    assert "M-001 服务总价" in issues_text
     assert "三 服务报价（S3）" in issues_text
     assert prepared.preparation_note in issues_text
     assert prepared.sources[0].sha256 in issues_text
