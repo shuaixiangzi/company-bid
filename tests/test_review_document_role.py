@@ -365,3 +365,49 @@ def test_organizing_two_response_requirements_embeds_shared_proof_once():
     assert len(attachments) == 1 and set(attachments[0]["requirement_refs"]) == set(refs)
     assert [aid for section in sections for aid in section["attachment_refs"]] == ["A-SHARED"]
     assert all(any(rid in issue["requirement_refs"] for issue in issues) for rid in refs)
+
+
+@pytest.mark.parametrize("source_caption_matches", [True, False])
+def test_explicit_source_appendix_caption_places_proofs_after_its_table(source_caption_matches):
+    from company_bid.extraction import _id
+    from company_bid.response_organization import organize_response
+    title = "响应人业绩统计表（后附业绩材料）"
+    req = {"requirement_id": "R-PERF", "text": "7.2、业绩材料：", "category": "qualification",
+           "response_mode": "attachment", "source_refs": ["S-TENDER"]}
+    def section(fid, text, level, fixed):
+        return {"section_id": _id("SEC-", fid), "title": text, "kind": "facts", "requirement_refs": ["R-PERF"],
+            "source_refs": ["S-TENDER"], "fact_refs": [], "table_refs": ["T-PERF"] if level == 2 else [],
+            "attachment_refs": [], "writing_tasks": [], "fixed_content": fixed, "nonwriting_requirement_refs": ["R-PERF"],
+            "level": level, "start_on_new_page": False, "render_body": True}
+    family = section("FAMILY", "7 资格审查材料", 1, [])
+    table_section = section("PERF", title, 2, [{"kind": "table_ref", "table_ref": "T-PERF", "source_refs": ["S-TENDER"]}])
+    formats = [{"format_id": "FAMILY", "title": family["title"], "source_derivation": {
+        "kind": "native_material_family_prefix", "sibling_block_ids": ["SUBHEAD"]}},
+        {"format_id": "PERF", "title": title, "content_block_ids": ["CAPTION", "GRID"]}]
+    blocks = {"SUBHEAD": {"text": req["text"]}, "CAPTION": {"text": title if source_caption_matches else "未声明附件顺序"}}
+    originals = [{"attachment_id": f"A-{page}", "source_refs": ["S-PROOF"], "sha256": str(page) * 64} for page in (1, 2)]
+    old_lookup = {"issue_id": "M-001", "section_id": table_section["section_id"], "requirement_refs": ["R-PERF"],
+        "title": "所需证明附件未能唯一匹配", "reason": "未匹配", "action": "补充", "severity": "missing",
+        "source_requirement": req["text"]}
+    unrelated = {**old_lookup, "issue_id": "M-002", "requirement_refs": ["R-UNRELATED"]}
+    sections, issues, attachments = [family, table_section], [old_lookup, unrelated], []
+    report = organize_response(sections, [req], {"R-PERF": req}, formats, blocks, issues, attachments,
+        {"attachments": originals}, {"assembly_candidates": [{"requirement_id": "R-PERF",
+         "attachment_ids": ["A-1", "A-2"], "pending_checks": ["期限及适用性待核对"]}]})
+    subgroup = next(s for s in sections if s["title"] == req["text"])
+    expected_owner = table_section if source_caption_matches else subgroup
+    assert expected_owner["attachment_refs"] == ["A-1", "A-2"]
+    assert all(item["section_id"] == expected_owner["section_id"] for item in attachments)
+    assert [item["sha256"] for item in attachments] == ["1" * 64, "2" * 64]
+    assert report["proof_assembly"][0]["response_section_id"] == expected_owner["section_id"]
+    placement = report["appendix_placements"][0]
+    assert placement["status"] == ("relocated_after_prescribed_table" if source_caption_matches else "not_relocated")
+    if source_caption_matches:
+        assert subgroup["attachment_refs"] == []
+        assert table_section["fixed_content"][0]["table_ref"] == "T-PERF"
+        assert sections.index(subgroup) < sections.index(table_section)
+    assert report["satisfaction_status"] == "not_determined"
+    assert any(item["title"] == "已附证明的适用条件仍待核对" for item in issues)
+    assert old_lookup["severity"] == "warning" and old_lookup["requirement_refs"] == ["R-PERF"]
+    assert unrelated["title"] == "所需证明附件未能唯一匹配" and unrelated["severity"] == "missing"
+    assert [row["issue_id"] for row in report["lookup_issue_reclassifications"]] == ["M-001"]

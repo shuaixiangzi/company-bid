@@ -1906,6 +1906,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 "document_role": section.get("document_role", "response")}
                 for section in sections for rid in section["requirement_refs"]]
             _capture(ctx, "n3-response-organization", response_organization)
+        native_formats = {}
+        if config.get("native_response_formats", False):
+            from .source_format import recover_source_formats
+            native_formats = recover_source_formats(ctx, sections, planned_formats, blocks, source_map, tables, facts, manifest, scoped_source)
         project_constraints = plan_project_constraints(parsed, planned_requirements, manifest, sections)
         _capture(ctx, "n3-project-constraints", project_constraints)
         _capture(ctx, "n3-outline-grouping", {"producer_version": PLANNING_VERSION,
@@ -1921,6 +1925,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
                   "writing_refinement": writing_refinement, "response_organization": response_organization,
+                  "native_response_formats": native_formats,
                   "material_matching": material_report,
                   "outline_grouping": outline_groups, "response_writing_controls": writing_control_handling,
                   "source_format_derivations": source_format_derivations,

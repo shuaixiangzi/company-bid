@@ -25,6 +25,8 @@ def _version(*names: str) -> str:
     # Node-owned helpers are explicit transitive inputs. Extending an N3 helper
     # must invalidate N3 without relabeling unchanged N0/N1/N2 implementations.
     dependencies = {"runtime.py": ("unit_concurrency.py",),
+                    "source_format_contracts.py": ("slots.py",),
+                    "native_layout.py": ("reading.py",),
                     "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py"),
                     "pipeline.py": ("project_constraint_runtime.py",),
                     "project_constraint_runtime.py": ("project_constraints.py", "contract_pending_plan.py"),
@@ -98,14 +100,21 @@ def build_executor(root: Path, config: dict) -> Executor:
         elif provider_options["mode"] == "diagnostic_writing_mixed":
             from .writing_replay import DiagnosticWritingProvider
             provider = DiagnosticWritingProvider(provider_options, ctx.execution_config.get("writing_replay"))
+        elif provider_options["mode"] == "diagnostic_writing_candidate_import":
+            from .writing_candidate_import import DiagnosticWritingCandidateImport
+            provider = DiagnosticWritingCandidateImport(provider_options, ctx.execution_config.get("writing_candidate_import"))
         else:
             raise PipelineFailure("PROVIDER_MODE_INVALID")
         facts = {item.fact_id: item for item in prepared.facts}
         tables = {item.table_id: item for item in prepared.tables}
         excerpts = {item.reference_id: item for item in prepared.reference_excerpts}
-        writing_diagnostic = provider_options["mode"] == "diagnostic_writing_mixed"
+        writing_import = provider_options["mode"] == "diagnostic_writing_candidate_import"
+        writing_diagnostic = writing_import or provider_options["mode"] == "diagnostic_writing_mixed"
         if writing_diagnostic:
-            from .writing_replay import build_writing_unit_input
+            if writing_import:
+                from .writing_candidate_import import build_import_unit_input as build_writing_unit_input
+            else:
+                from .writing_replay import build_writing_unit_input
             base_inputs = {task.unit_id: build_writing_unit_input(prepared, plan, task, provider_options,
                            project_constraints, value["proposals"])
                            for plan in prepared.sections for task in plan.writing_tasks}
@@ -204,6 +213,7 @@ def build_executor(root: Path, config: dict) -> Executor:
                 for prescribed in plan.fixed_content:
                     if prescribed.kind == "paragraph":
                         blocks.append(ParagraphBlock(text=prescribed.text, content_role="neutral",
+                                                     fact_refs=prescribed.fact_refs,
                                                      source_refs=prescribed.source_refs, requirement_refs=plan.requirement_refs))
                     else:
                         blocks.append(TableBlock(table=tables[prescribed.table_ref], requirement_refs=plan.requirement_refs))
@@ -236,6 +246,7 @@ def build_executor(root: Path, config: dict) -> Executor:
                     raise PipelineFailure("EMPTY_SECTION")
                 return Section(section_id=plan.section_id, title=plan.title, requirement_refs=plan.requirement_refs,
                                document_role=plan.document_role,
+                               native_format=plan.native_format,
                                level=plan.level, start_on_new_page=plan.start_on_new_page,
                                render_body=plan.render_body, blocks=blocks).model_dump(mode="json")
 
@@ -244,7 +255,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                                   title=f"{prepared.project.name} 投标文件", sections=sections)
         diagnostics = dict(value.get("chain_diagnostics", {}))
         if writing_diagnostic:
-            diagnostics.update(writing_replay=provider.summary(), publication_status="diagnostic_only")
+            diagnostics["writing_candidate_import" if writing_import else "writing_replay"] = provider.summary()
+            diagnostics["publication_status"] = "diagnostic_only"
         return {"package": package.model_dump(mode="json"), "source_artifacts": value["source_artifacts"],
                 "input_kind": prepared.input_kind,
                 "chain_diagnostics": diagnostics,
@@ -257,8 +269,21 @@ def build_executor(root: Path, config: dict) -> Executor:
 
     def check(ctx, value):
         package = DocumentPackage.model_validate(value["package"])
+        # Layout is an N3 source-derived contract. Re-sealing a modified N4
+        # layout must not make it authoritative over the frozen plan.
+        plan_node = "N3" if any(node["key"] == "N3" for node in ctx._state["nodes"]) else "N0"
+        plan_record = next(node for node in ctx._state["nodes"] if node["key"] == plan_node)
+        frozen_plan = ctx.executor._checkpoint_data(plan_record)["prepared"]
+        expected_native = {section["section_id"]: section["native_format"]
+                           for section in frozen_plan["sections"] if section.get("native_format") is not None}
+        actual_native = {section.section_id: section.native_format.model_dump(mode="json")
+                         for section in package.sections if section.native_format is not None}
+        if actual_native != expected_native:
+            raise PipelineFailure("NATIVE_FORMAT_PLAN_MISMATCH")
         from .writing_replay import validate_correction_links
         correction_links = validate_correction_links(ctx, value, package)
+        from .writing_candidate_import import validate_candidate_import_links
+        correction_links.extend(validate_candidate_import_links(ctx, value, package))
         section_roles = {item.section_id: item.document_role for item in package.sections}
         expected_roles = value.get("expected_section_document_roles")
         if ((expected_roles is not None and expected_roles != section_roles) or
@@ -417,15 +442,17 @@ def build_executor(root: Path, config: dict) -> Executor:
 
     # Actual source hashes prevent continuing a partially completed run after code
     # changes. A repair/fork is explicit and keeps the original record untouched.
-    shared = ("pipeline.py", "models.py", "preparation_rules.py", "runtime.py", "storage.py", "observability.py")
+    shared = ("pipeline.py", "models.py", "source_format_contracts.py", "preparation_rules.py", "runtime.py", "storage.py", "observability.py")
     writing_replay_keys = (("writing_replay", "run_purpose", "debug_capture")
                            if config.get("provider", {}).get("mode") == "diagnostic_writing_mixed" else ())
+    if config.get("provider", {}).get("mode") == "diagnostic_writing_candidate_import":
+        writing_replay_keys = ("writing_candidate_import", "run_purpose", "debug_capture")
     nodes = [NodeSpec("N0", _version(*shared), freeze, config_keys=()),
-             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py", "writing_replay.py", "diagnostic_replay.py", "diagnostics.py"),
+             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py"),
                       draft, config_keys=("provider",) + writing_replay_keys),
-             NodeSpec("N5", _version(*shared, "writing_replay.py", "diagnostic_replay.py", "diagnostics.py"), check,
+             NodeSpec("N5", _version(*shared, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py"), check,
                       config_keys=(("provider",) + writing_replay_keys) if writing_replay_keys else ()),
-             NodeSpec("N6", _version(*shared, "rendering.py"), render, config_keys=("document_style",))]
+             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py"), render, config_keys=("document_style",))]
     if config.get("pipeline", "prepared") == "automatic":
         from .chain import intake_nodes
         nodes = intake_nodes(root, _version, config) + nodes[1:]

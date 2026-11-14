@@ -390,11 +390,15 @@ class DocumentStyle(Contract):
         return self
 
 
+from .source_format_contracts import NativeFormatLayout
+
+
 class PrescribedBlock(Contract):
     kind: Literal["paragraph", "table_ref"]
     text: str = ""
     table_ref: Text | None = None
     source_refs: list[Text] = Field(min_length=1)
+    fact_refs: list[Text] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def exactly_one_content(self):
@@ -421,6 +425,7 @@ class SectionPlan(Contract):
     fixed_content: list[PrescribedBlock] = Field(default_factory=list)
     render_body: bool = True
     nonwriting_requirement_refs: list[Text] = Field(default_factory=list)
+    native_format: NativeFormatLayout | None = None
 
     @model_validator(mode="after")
     def tasks_belong_to_section(self):
@@ -538,6 +543,7 @@ class Section(Contract):
     level: int = Field(default=1, ge=1, le=3)
     start_on_new_page: bool = False
     render_body: bool = True
+    native_format: NativeFormatLayout | None = None
 
     @model_validator(mode="after")
     def visible_content(self):
@@ -779,6 +785,7 @@ class PreparedBid(Snapshot):
             _known(section.source_refs, source_ids, "section source")
             for block in section.fixed_content:
                 _known(block.source_refs, source_ids, "prescribed source")
+                _known(block.fact_refs, fact_ids, "prescribed fact")
             if not section.render_body and any(item.response_mode != "procedure" for item in self.requirements if item.requirement_id in section.requirement_refs):
                 raise ValueError("only procedural requirements may omit body content")
             _known(section.requirement_refs, requirement_ids, "requirement")
@@ -834,6 +841,13 @@ class PreparedBid(Snapshot):
                        if item.requirement_id in requirement_ids):
                 raise ValueError("prescribed cover section must retain its complete template sources")
         validate_context_quote_placement(self, self.tables)
+        from .source_format_contracts import validate_native_format
+        for section in self.sections:
+            if section.native_format is not None:
+                validate_native_format(section.native_format, section.fixed_content,
+                    {table.table_id: table for table in self.tables}, {source.source_id: source for source in self.sources},
+                    {fact.fact_id: fact for fact in self.facts}, title=section.title,
+                    identities={"company_name": self.company.name, "project_name": self.project.name})
         return self
 
 
@@ -931,4 +945,13 @@ class DocumentPackage(Snapshot):
                     raise ValueError("prescribed cover issue block must retain its issue requirements")
         validate_context_quote_placement(self, [block.table for section in self.sections for block in section.blocks
                                               if isinstance(block, TableBlock)])
+        from .source_format_contracts import validate_native_format
+        for section in self.sections:
+            if section.native_format is not None:
+                fixed_count = sum(len(element.fixed_indices) if element.kind == "paragraph" else 1
+                                  for element in section.native_format.elements)
+                validate_native_format(section.native_format, section.blocks[:fixed_count],
+                    {block.table.table_id: block.table for block in section.blocks if isinstance(block, TableBlock)},
+                    {source.source_id: source for source in self.sources}, {fact.fact_id: fact for fact in self.facts},
+                    title=section.title, identities={"company_name": self.company.name, "project_name": self.project.name})
         return self

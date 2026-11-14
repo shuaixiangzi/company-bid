@@ -126,7 +126,7 @@ def intake_nodes(root: Path, version, settings: dict):
             output["chain_diagnostics"]["publication_status"] = "diagnostic_only"
         return output
 
-    core = ("chain.py", "intake.py", "material_records.py", "models.py", "runtime.py", "storage.py", "observability.py")
+    core = ("chain.py", "intake.py", "material_records.py", "models.py", "source_format_contracts.py", "runtime.py", "storage.py", "observability.py")
     freeze_version = hashlib.sha256((version(*core, "evidence.py") + "|" + importlib.metadata.version("pypdfium2")).encode()).hexdigest()
     parser_version = hashlib.sha256((version(*core, "reading.py", "ocr.py", "provider.py") + "|" + "|".join(
         importlib.metadata.version(name) for name in ("pdfplumber", "pypdf", "pypdfium2", "python-docx"))).encode()).hexdigest()
@@ -141,9 +141,10 @@ def intake_nodes(root: Path, version, settings: dict):
     mapping_keys = tuple(dict.fromkeys(("mapping_provider", mapping_provider_key, "planning") +
                          (() if settings.get("mapping_provider") else ("structured_provider",))))
     reading_keys = ("reading", "ocr") + (("provider",) if settings.get("ocr") is not None and "provider" not in settings["ocr"] else ())
+    planning_version = hashlib.sha256((version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py", "preparation_rules.py", "material_matching.py", "slots.py", "provider.py", "structured.py", "native_layout.py", "source_format.py", "source_format_contracts.py") + "|" + importlib.metadata.version("pdfplumber")).encode()).hexdigest()
     return [NodeSpec("N0", freeze_version, freeze, config_keys=()),
             NodeSpec("N1", parser_version, read, config_keys=reading_keys),
             NodeSpec("N2", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "provider.py", "structured.py", "diagnostic_replay.py"), extract,
                      config_keys=extraction_keys),
-            NodeSpec("N3", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py", "preparation_rules.py", "material_matching.py", "slots.py", "provider.py", "structured.py"), plan,
+            NodeSpec("N3", planning_version, plan,
                      config_keys=mapping_keys)]

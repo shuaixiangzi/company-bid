@@ -16,7 +16,7 @@ from pathlib import Path
 from docx import Document
 from docx.enum.section import WD_SECTION_START
 from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -262,11 +262,15 @@ def _prescribed_cover(document, package, section):
         _font(paragraph.runs[0], name=style.font_family, color="A80000")
 
 
-def _format_table(document, table, weights, style, header_rows=1):
+def _format_table(document, table, weights, style, header_rows=1, native_layout=None):
     page = document.sections[-1]
     width_twips = round((page.page_width - page.left_margin - page.right_margin) / 635)
     total = sum(weights)
-    widths = [round(width_twips * weight / total) for weight in weights]
+    if native_layout is not None:
+        width_twips = round(sum(native_layout.column_widths_pt) * 20)
+        widths = [round(width * 20) for width in native_layout.column_widths_pt]
+    else:
+        widths = [round(width_twips * weight / total) for weight in weights]
     widths[-1] += width_twips - sum(widths)
     table.autofit = False
     table_pr = table._tbl.tblPr
@@ -288,10 +292,15 @@ def _format_table(document, table, weights, style, header_rows=1):
     margins = OxmlElement("w:tblCellMar")
     for edge in ("top", "left", "bottom", "right"):
         margin = OxmlElement(f"w:{edge}")
-        margin.set(qn("w:w"), "90")
+        margin.set(qn("w:w"), "0" if native_layout is not None else "90")
         margin.set(qn("w:type"), "dxa")
         margins.append(margin)
     table_pr.append(margins)
+    if native_layout is not None:
+        indent = OxmlElement("w:tblInd")
+        indent.set(qn("w:type"), "dxa")
+        indent.set(qn("w:w"), str(round(native_layout.bbox[0] * 20)))
+        table_pr.append(indent)
     for row_index, row in enumerate(table.rows):
         row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
         if row_index < header_rows:
@@ -314,7 +323,7 @@ def _format_table(document, table, weights, style, header_rows=1):
                     _font(run, name=style.font_family, size=style.table_pt, bold=True if row_index < header_rows else None)
 
 
-def _render_table(document, spec, issues, style, *, show_title=True):
+def _render_table(document, spec, issues, style, *, show_title=True, native_layout=None):
     if show_title:
         _plain(document, spec.title, style, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, keep_next=True)
     offset = int(spec.header_from_columns)
@@ -329,10 +338,11 @@ def _render_table(document, spec, issues, style, *, show_title=True):
             for issue_id in value.issue_refs:
                 text = re.sub(r"【待补\s+" + re.escape(issue_id) + r"(?:\s*[:：][^】]*)?】", "", text)
             cell.text = text.strip()
-            for issue_id in value.issue_refs:
-                _issue_text(cell.paragraphs[0], issues[issue_id], style, compact=True)
+            if native_layout is None:
+                for issue_id in value.issue_refs:
+                    _issue_text(cell.paragraphs[0], issues[issue_id], style, compact=True)
     weights = spec.column_widths or ([1, 2.4] if len(spec.columns) == 2 else [1] * len(spec.columns))
-    _format_table(document, table, weights, style, spec.repeat_header_rows)
+    _format_table(document, table, weights, style, spec.repeat_header_rows, native_layout)
     for merge in spec.merges:
         anchor = table.cell(merge.row + offset, merge.column)
         paragraph_count = len(anchor.paragraphs)
@@ -342,9 +352,49 @@ def _render_table(document, spec, issues, style, *, show_title=True):
         for paragraph in merged.paragraphs[paragraph_count:]:
             if not paragraph.text:
                 paragraph._p.getparent().remove(paragraph._p)
-    spacer = _plain(document, "", style)
-    spacer.paragraph_format.space_after = Pt(3)
-    spacer.paragraph_format.line_spacing = 0.3
+    if native_layout is not None:
+        from .source_format_rendering import native_font, _underlined_run
+        for row, height in zip(table.rows, native_layout.row_heights_pt):
+            row.height, row.height_rule = Pt(height), WD_ROW_HEIGHT_RULE.AT_LEAST
+        for cell_spec in native_layout.cells:
+            cell = table.cell(cell_spec.row, cell_spec.column)
+            cell.vertical_alignment = {"top": WD_CELL_VERTICAL_ALIGNMENT.TOP,
+                "center": WD_CELL_VERTICAL_ALIGNMENT.CENTER, "bottom": WD_CELL_VERTICAL_ALIGNMENT.BOTTOM}[cell_spec.vertical_alignment]
+            value = spec.rows[cell_spec.row][cell_spec.column]
+            if cell_spec.underlines:
+                paragraph = cell.paragraphs[0]
+                paragraph.clear()
+                cursor = 0
+                for rule in sorted(cell_spec.underlines, key=lambda r:r.start):
+                    _font(paragraph.add_run(value.text[cursor:rule.start]), name=native_font(cell_spec.font_family),
+                          size=cell_spec.font_size_pt, bold=cell_spec.bold)
+                    _underlined_run(paragraph, value.text[rule.start:rule.end], rule.width_pt,
+                                    native_font(cell_spec.font_family), cell_spec.font_size_pt, cell_spec.bold)
+                    cursor = rule.end
+                _font(paragraph.add_run(value.text[cursor:]), name=native_font(cell_spec.font_family),
+                      size=cell_spec.font_size_pt, bold=cell_spec.bold)
+            for index, paragraph in enumerate(cell.paragraphs):
+                paragraph.alignment = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER,
+                    "right": WD_ALIGN_PARAGRAPH.RIGHT}[cell_spec.alignment]
+                _indent(paragraph._p, 0, cell_spec.font_size_pt)
+                pf = paragraph.paragraph_format
+                pf.line_spacing = Pt(cell_spec.font_size_pt * 1.15)
+                pf.space_before = Pt(cell_spec.top_inset_pt if index == 0 else 0.)
+                pf.space_after = Pt(cell_spec.bottom_inset_pt if index == len(cell.paragraphs)-1 else 0.)
+                pf.left_indent, pf.right_indent = Pt(cell_spec.left_inset_pt), Pt(cell_spec.right_inset_pt)
+                snap = OxmlElement("w:snapToGrid")
+                snap.set(qn("w:val"), "0")
+                paragraph._p.get_or_add_pPr().append(snap)
+                for run in paragraph.runs:
+                    _font(run, name=native_font(cell_spec.font_family), size=cell_spec.font_size_pt, bold=cell_spec.bold)
+            for identity in value.issue_refs:
+                run = cell.paragraphs[0].add_run((" " if cell.paragraphs[0].text else "") + identity)
+                _font(run, name=native_font(cell_spec.font_family), size=9, color="A80000")
+    else:
+        spacer = _plain(document, "", style)
+        spacer.paragraph_format.space_after = Pt(3)
+        spacer.paragraph_format.line_spacing = 0.3
+    return table
 
 
 def _validate_files(package):
@@ -448,10 +498,34 @@ def _render_bid(package):
     _page_furniture(body_page, style, numbered=True)
     body_sections_seen = 0
     seen_attachment_groups = set()
+    native_page = False
     for section in package.sections:
         if section.document_role != "response" or not section.render_body or section.section_id == cover_id:
             continue
-        if body_sections_seen and (section.level == 1 or section.start_on_new_page):
+        if section.native_format is not None:
+            if body_sections_seen:
+                document.add_section(WD_SECTION_START.NEW_PAGE)
+            from .source_format_rendering import render_native_section
+            render_native_section(document, package, section)
+            fixed_count = sum(len(e.fixed_indices) if e.kind == "paragraph" else 1
+                              for e in section.native_format.elements)
+            remaining = [block for block in section.blocks[fixed_count:] if not isinstance(block, IssueBlock)]
+            if remaining:
+                page = document.add_section(WD_SECTION_START.NEW_PAGE)
+                _geometry(page, style)
+                _page_furniture(page, style, numbered=True)
+                continuation = section.model_copy(update={"blocks": remaining, "native_format": None})
+                _render_section_content(document, package, continuation,
+                                        seen_attachment_groups=seen_attachment_groups)
+            body_sections_seen += 1
+            native_page = not bool(remaining)
+            continue
+        if native_page:
+            page = document.add_section(WD_SECTION_START.NEW_PAGE)
+            _geometry(page, style)
+            _page_furniture(page, style, numbered=True)
+            native_page = False
+        elif body_sections_seen and (section.level == 1 or section.start_on_new_page):
             document.add_page_break()
         body_sections_seen += 1
         document.add_paragraph(section.title, f"Heading {section.level}")

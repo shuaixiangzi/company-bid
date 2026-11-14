@@ -1,0 +1,90 @@
+# 要点提取设计复核与可复用边界
+
+复核日期：2026-11-14。当前任务是只读审查旧已提交实现，比较新系统，不实施提取改造，不调用模型/OCR，不连接数据库，不运行旧测试。原格式及 Word 修复继续沿当前主线推进。
+
+结论：继续使用新 N1/N2。旧系统值得借鉴的是来源守卫、明确的未完成账、数字敏感去重和有界纠正的设计；不迁移旧平台。新链已具备更严格的原文选择、来源认证、局部候选保护与持久预算。主要待补是**逐独立义务的来源台账及漏提审查**。37 窗完成和引用正确，均不能证明全部要求已提取。
+
+## 版本与证据边界
+
+- **L**：旧仓库已提交 HEAD `b5bb87842f932bf72fad941e6ffbb324328508d8`。旧工作区存在他人修改；仅使用 `git show/git grep <SHA>` 读取源码，未读取 dirty 实现作为输入。
+- **S**：既有已审基线 `53f20a3afac42e07069d58ee53398457ea8b5aed`。仅做已提交文件比较，不推定两个 external references 的祖先关系或接受状态。
+- **N**：新仓库审查快照 `c131ded424f529c522471757a764416f86174c26`；下表新文件默认为 `src/company_bid/`。私有证据另存文件 hash，以区别后续原格式改造。
+- 下表旧 requirements 文件省略前缀 `apps/api/src/ai_bid_api/requirements/`；`workflow/`、`retrieval/`、`agent_runtime/` 则位于 `apps/api/src/ai_bid_api/`。
+- 源锚修复接受对象 `e9c0c1a5`、精确引文接受对象 `a21d825e`、元素顺序接受对象 `14f6819b`，均只接受各自代码/合同及隔离验证，**没有接受真实 H7 查漏质量或旧业务产物**。精确引文源码 blob 在 S、L 和实施 `f788c012` 相同。
+- L 包含 PF001 的 20k chunk_context 实现，但 current 仍保留 rejected/R1 revision self_checked，不能将 HEAD 视为全面 accepted。旧完整回归也存在已登记失败/skip，不称全套通过。
+
+## 实际调用链
+
+旧正式 `workflow/handler.py:1162` 按配置选择 H7（:1175）或 direct compatibility（:1210）。H7 使用章窗、二次容量限制、来源锚、受限 RuntimeRequest、引用/读取覆盖门、exact 汇聚及可选付费 semantic 去重。direct 的 `lift_known_clauses → refine_extract_items → apply_unit_conflicts` 是另一条路径，不能因仓库中有这些函数就认定 H7 同样执行。
+
+新 N2 走 `extract_requirements:1502 → _windows:453 → run_extraction_window:1413 → JsonTaskGateway:1338 → generate_json:283 → validate_live_window:1202 → _validate_window:1035 → _close_deferred_context:1266 → _merge_results:1543`。逐窗单元及正式/调试恢复共享执行器；N3 重新核验冻结输入、原候选和标准化来源。
+
+## 对照矩阵
+
+| 环节 | 旧有且实际接线 | 新已有 | 缺口或适用边界 | 建议沿用 / 不采用 |
+|---|---|---|---|---|
+| 输入、读取与顺序 | L retrieval/service.py:204/:522/:709/:785 将元素按阅读序、heading栈、table family构块并校验；parser/pdf.py:978入口包含字形来源、表/行/cell。chunk修复有接受记录；当前HEAD parser的后续PF002实现不能按代码存在升级为已接受效果。 | reading.py:522/:793 按物理单元读取，read/empty/needs_ocr/failed分开；extraction.py:471-479/:1506在分窗前拒绝未完成读取。 | 原文件缺读与已读取但无法理解要持续分账；旧parser后续候选不宜直接作为可靠事实。 | 沿用：来源顺序、元素覆盖、表父子去重及负例思想。保留新Reading契约，不搬旧parser包/ORM。 |
+| 分窗与目标归属 | L windows.py:20/:66/:89 按顶层章；harness_extraction.py:2196/:2223/:2319再做8k/10k预算、页/标题优先切口、有限重叠和12引用上限；:2414真实调用。 | extraction.py:453-508先原生章界再容量；表题与表同窗；:477保留分母；目标块有唯一owner。 | 两套分窗不可混用；改窗/请求投影会改变已付费候选的精确输入合同。 | 已具备关键设计；仅用旧密集/稀疏窗口经验做离线容量测试，不为提速重买当前37窗。 |
+| 邻窗、跨章与上下文 | L h7_context_pack.py:56 build_h7_context_pack按22k预算优先表，3500/5000软截断显式truncated；harness_extraction.py:1123接入，:1294-1319用完整供给∪工具读取核算。邻章仅标题，工具须受scope限制。 | extraction.py:331-391提供完整原章只读reference_context，超限登记unavailable不截半章；:539-583邻窗、续表、source目录和context hash；:1266唯一owner交接闭合。 | 额外上下文不可冒充citation或覆盖；现在也不是任意远章工具阅读器。 | 沿用显式缺上下文/预算不足账；保留新只读上下文和owner边界。不要迁移完整Harness工具循环或metadata-only pack hash。 |
+| 复合要求、独立义务拆分 | L extraction.py:314-331提示评分按行/子细则不乱拆，同资格门槛合并；clause_lift.py:147和postprocess.py:589属于direct规则链，未见通用独立义务清单。H7 :884只是material包可拆提示。 | extraction.py:1370-1374要求独立义务拆分；source_clauses.py:225仅证明同页原生编号列表，:1045仅technical/writing可选；table行目录另行保留完整列。 | 未形成跨类别的义务原子、共同条件、子项与原候选的显式一对多账；一条完整引用仍可能承载多个不同响应义务。 | 建议后续独立实现source obligation ledger：义务ID、父层条件/例外、原文位置、候选映射、未处理原因。不能按标点盲拆或从历史标书补门槛。 |
+| 否定、数字、条件与勾选 | L extraction.py:314-331要求保留否决、单位和勾选；harness_extraction.py:1562/:1592/:1804按数字单位集合拒绝合并不同数值。未见等价强度的通用否定/主体/例外确定性守卫。 | extraction.py:837复制冻结整块/完整行，:1369/:1385要求保留条件、否定、勾选；source_clauses.py:30拒绝把约束父标题当纯scope；完整引用测试保护共同条件。 | 引用未改并不证明未选条款已提取；同段的金额/主体/条件是否正确路由还需逐义务审查。 | 借数字敏感负例；新增检查须比较值、单位、比较符、否定、责任主体和条件作用域，先标审查而不自动改写事实。 |
+| 跨页表和表行 | L retrieval/service.py:410/:522保留table family连续；source_span.py:178只在单chunk中定位最小连续元素并保留页集，不代表所有跨页表被自动关联。 | table_continuations.py:309/:610有原生前附表、评分表的两表续行证明/行目录；extraction.py:992/:1049拒绝已知未证尾表或半选续表。 | 续表证明限定已支持表型和连续两表，不是任意表型/三页以上表的通用理解。 | 保留保守证明；为未来新表型补来源正负例及显式unknown，不宽松按相同表头全书合并。 |
+| 目录、正文与响应格式区别 | L windows.py:40区分前置/合同模式；harness_extraction.py:1435/:1468排除纯目录/封面关键窗误报；direct _PREFACE_EXTRA限制本窗。 | extraction.py:84/:88明确格式标题/正文归属；:519-530原题catalog仅上下文，:1071拒绝邻窗格式锚；:1373/:1387区分评分依据和响应模板。 | 格式语义判断与原格式再现仍需原件核验，不能把目录文字、catalog或引用成功当完整格式发现。 | 沿用目录不是义务/格式完成证据的原则，保留新要求与格式分源；原格式修复由当前主线独立处理。 |
+| 结构化、引用与语义门 | L handler.py:1175接H7、:1210接direct；H7 source_span.py:90唯一去空白命中、:178连续最小元素、拒绝多成员整chunk；候选确认另有scoped来源守卫。 | extraction.py:113输出selector-only schema；:1202校验实际wire；:1035统一schema/来源/类别/labels/格式边界；N3重新校验。 | 来源/类型校验不是通用业务语义正确性证明。旧direct _bind_quote有不足证据时取前240字回退。 | 建议沿用精确来源、歧义拒绝和守卫负例；继续新selector复制契约，不引入旧direct回退或以粗锚代替精确引用。 |
+| 覆盖、未提取项与读取失败 | L extraction.py:785按窗口保存PENDING/FAILED/SUCCESS；H7 :1294拒漏读，:1320对有要求信号但零候选发NO_CANDIDATES。旧机制也不能识别有一条候选时的部分遗漏。 | extraction.py:1093明确supplied/ignored/safe_footer及自报未决；:1223拒critical unresolved；:1537固定requires_source_review。test_window_confirmation_protocol.py:167明确空候选也仅结构记账。 | 缺独立源义务的完整未提取账；当前自报unresolved为空不等于语义无遗漏，global NO_REQUIREMENTS_FOUND只拦全书全空。 | 优先补审计层：每个候选/每个源义务可反查，明确无义务、待校准、原模板留空、读取失败、冲突等原因；不得用关键词直接制造新要求或清空未决。 |
+| 去重与汇聚 | L extraction.py:641保数字标点规范键；H7 :1486跨窗exact汇聚，:1606/:2867可多花一次有界semantic去重；:1804复验数字集合，决策受限canonical IDs。 | extraction.py:1543按完整quote及全部业务字段hash只合并完全相同断言，累加引用/window_ids。 | 相似段落可能重复，且置信度等业务字段不同会保留两条；这比误删资格/例外更保守。 | 本轮保留exact合并。可借旧数字保护做离线相似项审查；不直接采用LLM same判决自动停用候选，尤其无完整否定/主体守卫时。 |
+| 超长输入/输出与截断 | L extraction.py:211-213/:388/:1450采用32768输出、首次截断可升65536重试；_format_chunk_line:856仍有[:20000]；H7上下文截断有工具补读。 | extraction.py:488/:530及reference_context超限明确失败/不可用；provider.py:415-417拒finish!=stop；原raw和usage保留，实际provider上限和预算冻结。 | 尚无针对输出预算不足的自动、来源守恒子窗降解；重试/提高token需另算费用和改变输入版本。 | 借截断明确失败/只补失败范围的设计，不照搬64k升级或静默裁文。先离线估实际wire/预算，必要时创建来源守恒的子任务并保留旧失败。 |
+| 局部校准与成功保护 | L H7 :2481-2561可最多3次窗口retry，反馈区分缺读/全读零候选/提议未落库；属重新运行窗口，不是逐字段保护原候选的严格patch。direct还有领域补提与过滤。 | structured.py:1133冻结反馈构wire；:1172检查历史已安排纠正；:1221仅白名单来源证明；:1266先验首调用四类capture/trace；:1286保护旧库存再完整校验，最多一次repair。 | 当前repair主要处理已知校验失败，不是独立语义漏提审查器。 | 保留新有界校准。后续查漏只追加有来源证明的差量，带原candidate hash、目标义务ID与允许patch；不可重买所有成功窗或让局部错误重写旧合法项。 |
+| 并行、限流与费用 | L H7 :1343上限8 worker，:2352隔离进程/DBsession，:2467阶段wall clock；_run_window:1177仅显式传iterations/duration，protocol.RuntimeBudget无USD字段；后续semantic去重另计调用。 | unit_concurrency.py:13同进程8槽/:81来源序归并、首错停准入并结清在途；provider.py:296-302按wire字节上界预估，runtime.py:384/:470持久预留/结算/未知不清零。 | 单进程不是跨Worker/多用户配额；当前累计跨run保护仍需统一账汇总，不能以本run上限替代历史总额。 | 继续新预算保护；不迁移旧Harness并发栈，也不把4/8窗测速当全书吞吐/容量/质量通过。 |
+| 恢复、trace与定位 | L H7 :1362从coverage artifact读成功index并跳过；:1105 trace_window定位seg；:2901输出coverage/telemetry；provider_request_ids特意为空(:2912)。S direct:1401-1408有call/logical/window/stage/http标识，HEAD同处字段不同。 | runtime.py:517严格input hash+version+artifact后才unit reuse；provider.py:313绑定call/attempt/unit/wire hash，structured.py:1251和diagnostic_replay认证原call/capture/usage/trace；窗口私有capture保留raw/normalized/source identity。 | 技术故障可到窗口/块/实际call，但缺语义义务ID使漏提问题不能直接定位为候选缺口。跨版本复用须重验精确输入。 | 沿用独立日志/trace/artifact分工；补source_obligation_id/候选映射的只读索引即可，不搬旧DB/approval平台。 |
+
+## 真实记录不能越过的结论
+
+[整链记录](09-full-chain-migration.md)保留了不同层级的事实：
+
+- 第 22 窗七个未决块是合同模板留空，已核对 N1 和 PDF 第 49 页；不是读取失败。一次定向校准保留原四条要求、增加四组完整原文待补；没有猜日期、质量值或其他约定。
+- 首次并行历史回放 `9a3c9c7c...` 因来源证明上下文不符而失败、0 HTTP，失败记录仍在。修后 `5bd3922d...` 为 37/37 认证回放、318 条要求、10 个格式、0 新调用；状态 paused_debug。这证明结构处理和历史认证，不能替代语义审查。
+- 后续 N3 的 351 条要求及 271 内部 section / 22 正文可见与上述 N2 数量不属同一统计层；不能用条数上涨证明漏提清零。
+- 四路专门测速为 4 次调用、59.829 秒、3 窗通过/1 窗未决、节点 failed；八路为 8 次调用、68.302 秒、6 窗通过/2 窗失败、节点 failed。在途请求均结清，费用估算分别 0.0627432 / 0.1175724 美元，均非账单。
+- 37 窗首次模型调用 5～6 分钟仅由部分样本外推；不是整份并行首次运行、质量等价、三用户或长期负载验收。停止新增付费测速的既有决定不变。
+
+读取账本、窗口 processed 声明、候选来源可定位、业务语义覆盖、最终 Word 可用性是不同检查。当前 `semantic_review=requires_source_review` 应保留。
+
+## 后续最小改进方向
+
+先在当前格式主线之后做离线逐源审查账，不重跑已成功提取。账中至少保存源 hash、物理页/块/表行/子条款、父层共同条件、独立义务 ID、候选映射和未处理原因。状态区分“无独立义务”“原模板留空待约定”“内容已读但语义未明”“读取失败”“源冲突”“已提出候选待审”；不根据关键词直接补出新资格门槛。
+
+复合要求分解须保留主体、否定、比较符、数值/单位、勾选与条件/例外作用域；共同说明不能只挂到最后子项。对尚未证明边界的跨页或混合条款，保留原文和待审，不按标点盲拆。
+
+定位真实漏项后，仅对该来源差量做有界校准：绑定原 raw/input/hash、明确允许追加/改动的义务、保留旧合法候选，重跑同一来源和 schema 校验；成功历史调用继续按精确输入认证。旧 direct 粗引文回退、合同套话过滤、熟悉条款补提、semantic 自动删除以及 64k 自动升级均不直接引入。
+
+## 独立测试参考
+
+本次只读测试源码，未运行旧测试，也未新增或运行模型请求。可参考：
+
+| 版本 | 测试位置 | 保护目标 |
+|---|---|---|
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:544` | coverage账不把pending当完成 |
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:584` | bounded窗口不丢source chunks |
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:593` | 有要求信号的空输出审查 |
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:613` | resume只跳合法成功窗口 |
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:299` | semantic去重限同类别同数字 |
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:725` | 并行上限 |
+| L | `apps/api/tests/test_h7_extraction_coverage_unit.py:865` | 密集表按字符预算分窗 |
+| L | `apps/api/tests/test_source_span_location_unit.py:67` | 跨chunk拼接拒绝 |
+| L | `apps/api/tests/test_source_span_location_unit.py:75` | 重复短句拒绝而非取首命中 |
+| L | `apps/api/tests/test_source_span_location_unit.py:145` | 数字/勾选逐字来源 |
+| L | `apps/api/tests/test_extract_postprocess_unit.py:34` | 禁用保证金的领域规则案例，仅作风险对照 |
+| N | `tests/test_source_clauses.py:26` | 每项条件/金额/例外保持 |
+| N | `tests/test_source_clauses.py:82` | 共同条件不落到最后子项 |
+| N | `tests/test_source_clauses.py:109` | 否定/时间条件标题不能当纯scope |
+| N | `tests/test_source_selected_citations.py:213` | 不可跨正文/表/图跳引 |
+| N | `tests/test_window_confirmation_protocol.py:167` | 空候选仅结构记账，不称语义通过 |
+| N | `tests/test_targeted_validation_repair.py:202` | 不能换旧业务项或无依据移除未决 |
+| N | `tests/test_targeted_validation_repair.py:384` | 重启后不买第三份响应 |
+| N | `tests/test_contract_source_blanks.py:89` | 真正源故障/实质内容不获空白修复资格 |
+| N | `tests/test_parallel_extraction.py:91` | 失败结清在途、resume只补未完成 |
+| N | `tests/test_parallel_extraction.py:128` | 并发预算不双花 |
+| N | `tests/test_parallel_extraction.py:333` | 独立进程退出保留checkpoint/未知费用 |
+
+私有审计证据：`.local/evidence/v57-extraction-design-review.private.local.json`，包含精确 SHA/blob、上述矩阵、接受边界、现有真实记录摘要及输入文件 hash。该审计不宣布提取语义质量通过，也不要求迁移旧平台。

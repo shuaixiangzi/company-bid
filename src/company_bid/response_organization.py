@@ -188,6 +188,64 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
             assembly.append({**candidate, "response_section_id": target["section_id"], "issue_id": iid,
                              "qualification_result": "not_determined"})
 
+    lookup_reclassifications = []
+    assembled_by_requirement = {}
+    for row in assembly:
+        assembled_by_requirement.setdefault(row["requirement_id"], []).extend(row["attachment_ids"])
+    for item in issues:
+        refs = item["requirement_refs"]
+        if (item["title"] != "所需证明附件未能唯一匹配" or not refs
+                or not all(assembled_by_requirement.get(ref) for ref in refs)):
+            continue
+        ids = list(dict.fromkeys(aid for ref in refs for aid in assembled_by_requirement[ref]))
+        if any(aid not in adopted for aid in ids):
+            continue
+        previous = {key: item[key] for key in ("title", "reason", "action", "severity")}
+        item.update(title="已附证明的适用条件仍待核对", severity="warning",
+            reason="后续资料匹配已按来源装配证明页；此前通用检索未能唯一匹配不再代表当前没有附件。资格、有效期及本次适用性仍未确定。",
+            action="对照正文实际证明包核对招标条件、原件、有效期及人员安排；有缺项时线下补齐，不能仅因已附证明而认定满足。")
+        lookup_reclassifications.append({"issue_id": item["issue_id"], "requirement_refs": list(refs),
+            "previous": previous, "current": {key: item[key] for key in previous}, "attachment_ids": ids,
+            "qualification_result": "not_determined"})
+
+    appendix_placements = []
+    performance = subgroups.get("业绩")
+    if performance and performance["attachment_refs"]:
+        # A source caption explicitly orders the table before its evidence.
+        # Preserve the parent heading and all original requirement identities;
+        # move only the complete ordered proof references to that table's tail.
+        candidates = []
+        for section in main:
+            chapter = format_sections.get(section["section_id"], {})
+            title = chapter.get("title", "")
+            ids = chapter.get("content_block_ids", [])
+            if (re.fullmatch(r"(?:响应人|投标人)业绩统计表[（(]后附业绩材料[）)]", _plain(title))
+                    and ids and blocks.get(ids[0], {}).get("text") == title
+                    and section["title"] == title and not section["writing_tasks"]
+                    and any(item["kind"] == "table_ref" for item in section["fixed_content"])):
+                candidates.append(section)
+        placement = {"from_section_id": performance["section_id"],
+                     "source_instruction": "table_before_appended_performance_proofs",
+                     "status": "not_relocated", "candidate_section_ids": [s["section_id"] for s in candidates]}
+        if len(candidates) == 1:
+            target = candidates[0]
+            ordered = list(performance["attachment_refs"])
+            if target["attachment_refs"] or any(adopted[aid]["section_id"] != performance["section_id"] for aid in ordered):
+                raise ValueError("PERFORMANCE_APPENDIX_OWNER_CONFLICT")
+            for aid in ordered:
+                adopted[aid]["section_id"] = target["section_id"]
+                add_refs(target, adopted[aid]["requirement_refs"])
+            target["attachment_refs"] = ordered
+            performance["attachment_refs"] = []
+            for row in assembly:
+                if row["response_section_id"] == performance["section_id"]:
+                    row["original_response_section_id"] = performance["section_id"]
+                    row["response_section_id"] = target["section_id"]
+            placement.update(status="relocated_after_prescribed_table", to_section_id=target["section_id"],
+                attachment_ids=ordered, source_block_id=format_sections[target["section_id"]]["content_block_ids"][0],
+                qualification_result="not_determined")
+        appendix_placements.append(placement)
+
     for section in review:
         if (section["render_body"] and not any((section["fixed_content"], section["fact_refs"],
                 section["table_refs"], section["attachment_refs"], section["writing_tasks"])) and
@@ -220,5 +278,7 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
     return {"rule": "explicit_response_review_organization_v1", "role_changes": changes,
             "native_heading_relocations": relocations, "response_pending_links": pending_links,
             "proof_assembly": assembly, "section_order": [s["section_id"] for s in sections],
+            "appendix_placements": appendix_placements,
+            "lookup_issue_reclassifications": lookup_reclassifications,
             "source_sections_preserved": all(key in {s["section_id"] for s in sections} for key in before),
             "satisfaction_status": "not_determined"}

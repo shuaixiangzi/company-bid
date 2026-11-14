@@ -571,3 +571,39 @@ N5 和 N6 在禁止网络连接的本地执行中成功，单步到 N6 后状态
 用户随后指出响应格式没有完整遵循，当前优先级调整为原格式保真及内容填写。对照原 PDF 第 33、34 页确认：授权书身份证粘贴区域高度丢失、居中副标题及横线未保留、物理行被拆为 Word 段落；已知公司名/项目名没有填入段落占位。另有已装配材料仍报通用未匹配、业绩证明在“后附业绩材料”的统计表之前等问题。当前 Word 不交付为合格成品，也不据 N6 成功宣称 M1.5 通过。下一步先完成旧已提交实现与新链路缺口复核，补可校验的格式与填写合同，继续保留旧提取/正文证据以避免无效付费重跑。
 
 证据：`.local/evidence/v56-n4-live-result.private.local.json`、`v56-writing-source-review.private.local.json`、`v56-full-suite-result.private.local.json`、`v56-version-scope-fix-result.private.local.json`、`v56-first-word-result.private.local.json`、`v56-word-qa-01/`、`v56-technical-word-visual-review.private.local.json`、`v56-initial-attachment-visual.private.local.json`、`v57-renderer-freeze.private.local.json`、`v57-response-format/tender-page-{32,33,34}.png`。初版图像只完成分工抽查及技术 132～153 页逐页检查，没有将全部 872 页标记为视觉通过。
+
+### 2026-11-14 v57 原格式恢复与旧提取流程复核
+
+按用户追加要求，旧系统的要点提取实际入口及可复用边界已完成 14 项对照，见 [专项复核](10-extraction-design-reuse.md)。保留新 N1/N2，主要后续缺口为逐独立义务/共同条件的来源台账与漏提映射；没有采用旧粗引文回退、熟悉条款补提/过滤或自动语义删除，没有重买已成功窗口。
+
+原格式新增来源绑定的字体、对齐、段落归组、原表绝对宽度/行高/合并及横线合同。N3 使用独立持久读取单元复核原件与冻结 N1 的块/网格，N4 传递，N5 与冻结计划精确比较，N6 消费；只在明确的公司名/项目名槽位填入已维护事实，其余印刷文字受保护。每个格式均有恢复状态，布局未支持与公司缺件分开。
+
+真实首轮 N3 `857350fa00cf4b14bd51d9cc8ab50e96` 成功，117.407 秒。末审补齐 `source_format_contracts → slots`、`native_layout → reading`、N3 PDF 库版本及 N5 写作校验依赖后，按新执行指纹重新冻结子 run `e277d00b704d4c2abf96d8b26fa1a13b`，128.109 秒完成 N0～N3。两次均先确认 37 个请求 hash 与已认证原候选精确相等，再离线复验；0 新 HTTP、原父记录不变。输出仍为 351 要求、271 内部 section、8 表、94 附件、346 缺项/待核，条数不是实际缺件数。
+
+本轮 N3 恢复源 PDF 33、34、35、36、37、38、40 页共 7 个单页格式，6 个受控槽位（5 公司名、1 项目名）。14 个格式账中另 7 项明确未恢复：4 项沿用封面/无完整固定正文路径、2 项同页部分范围、1 项跨页承诺函；`complete=false`。业绩统计表的原文“后附业绩材料”触发有来源的顺序修正，77 页完整证明移至该表之后；已有实际证明却保留的两项“未能唯一匹配”改为适用条件待核，保留原 issue ID、来源、修改前后记录和未确定资格结论。
+
+旧正文 9 个 raw 候选在冻结 `c131ded` 认证器下核对实际 request/response、调用、用量、trace 与 87 份证据快照。新增显式 `diagnostic_writing_candidate_import` 对本次已固定候选包进行当前来源范围重验；它是有范围限制的离线导入，**不是输入未变的自动 replay**，也不是通用历史导入器。旧 `diagnostic_writing_mixed` 精确相等守卫未改。9 个写作任务及所用来源/证明严格比较，只有独立重建验证的项目约束溯源字段允许变化；5 个校准的额外招标来源继续进入正文和 N5 链接。
+
+新 Word run `43cb92aea17645f38ca0a867d5b1bd12` 已完成 N4～N6，N4 35.203 秒，全段 75.703 秒，0 新模型调用、诊断缺口 0、父文件不变。独立审查核验了 74 份关联产物、9 个离线导入 span、5 个校准来源链接。当前保护占用仍为 3.2293530 美元，均非实际账单。
+
+首次新版 Word 为正文 135 页、清单 432 页；WPS 只读导出前后 DOCX hash 不变。实际检查 7 个恢复格式所在的 8 页后，视觉结论仍为 **rejected**：段落缩进被通用辅助函数清零、签章行误合并、表内通用 padding 和待补注记撑高行、单元格矢量横线未显示及尾随空白横线不可见。来源/trace 通过不替代视觉通过。该 Word 和失败图像全部保留，继续局部修复后生成新版本，不手工修改成品掩盖链路缺口。
+
+首次全量回归 3087 passed / 12 failed / 1 skipped（444.83 秒），源代码在测试期间未变；12 失败均为表格关联测试的旧假上下文缺少新 N5 冻结计划读取所需状态。只补测试夹具的 executor/state 后该文件 14 passed，未放宽生产来源守卫。Windows 符号链接权限跳过仍保留；格式视觉修复后另做最终验证。
+
+证据：`.local/v57-format-validation/` 的认证包、逐次 N3/Word 配置及结果；`.local/evidence/v57-native-format-trace-audit.private.local.json`、`v57-writing-candidate-import-check.private.local.json`、`v57-native-format-visual-review-01.private.local.json`、`v56-word-qa-v57-01/`、`v57-full-suite-result.private.local.json`。真实 Word 仍不是格式全面通过或可正式提交的投标文件。
+
+本轮后续修复保留前述失败产物：先重置通用缩进再应用来源坐标，签章/日期分段，恢复四处金额填写横线和表内实测留白，原格式文字保持原字号；新增的待补编号采用短标记。短签章行使用原页可用正文宽度，避免将最后一个字的坐标误当作文本框右边界。两次早期视觉结果均保留为未通过，不以重新生成覆盖。
+
+最终 N3 `34853176721a46f486b492f69f2cddc2` 在 108.688 秒完成 N0～N3，仍为 7 个已支持单页格式，受控填槽从 6 处补至 **9 处**：新增商务偏离表的项目名、段首公司名，以及技术偏离表的项目名。新增三处均有原 PDF 下划线字形或矢量线的范围/坐标证明；未知编号、人员、日期、授权与签章保持空位/待补。未支持的同页部分格式、跨页承诺函等仍逐项登记，未将 14 项全部标记恢复。
+
+Word run `018ea9649c454b29a72ede21a1877251` 已完成 N4～N6，N4 30.828 秒，全段 65.172 秒。9 份旧正文原始候选重新通过当前校验，5 份校准来源继续正确关联；独立审查核对最终布局与冻结 N3 完全相等、9 个离线导入 span 和 5 个来源链接，0 实际 HTTP/provider 调用、0 诊断缺口。两个创建清单涉及的 3,730 个不同父文件逐 SHA 复核不变。本轮不新增模型/OCR 费用，累计保护仍为 3.2293530 / 3.50 美元，非实际账单。
+
+该版只读渲染为正文 135 页、清单 432 页，DOCX 前后 hash 不变。已逐页查看 7 个已恢复格式及其续页（正文第 4～10、109 页）；授权书粘贴大留白、签章和日期、基本表原字号/合并、报价四处填写线等主要缺陷已修复。基本情况表因真实长经营范围扩展，原注释保留在续页；没有截断事实或缩字号强塞一页。仍发现段首新增公司名未连同原规则下划线，定位为 N6 的插入边界映射，进入末次局部修复。另保留两项呈现限制：极窄原表头的末字自然换行，以及无矢量证据的大段普通空格未还原原宽。该检查不等于全部 567 页的视觉验收。
+
+最终完整离线回归 **3124 passed、1 skipped（363.96 秒）**，测试期间源码/测试文件 hash 均未变。跳过仍为 Windows 符号链接权限；此全量对应上述末次下划线局部修复之前的冻结版本，后续局部变更单独记录定向验证，不冒充已重新全量。
+
+补充证据：`.local/evidence/v57-full-suite-result-final.private.local.json`、`v57-native-format-trace-audit-02.private.local.json`、`v57-native-format-trace-audit-final.private.local.json`、`v57-native-format-visual-review-02.private.local.json`、`v57-native-format-visual-review-03.private.local.json`、`v56-word-qa-v57-03/`。来源审查同时确认：自洽 DTO hash 不能独立证明布局来自原件；真正的来源约束由 N3 原件/冻结 N1 复核和 N5 对冻结计划逐项比较共同提供。构造的宽度、locator、内边距重新封 hash 变体均被实际 N5 拒绝。
+
+末次修复只修改 N6 下划线边界映射及两项正反例，格式专项 **50 passed（4.05 秒）**；全量之后的源码/测试变化清单精确限定为这两个文件。N6 子 run `d4b5717f9a0846919ce77cbf54fc6d04` 成功，15.985 秒，复用有效前置产物，0 新模型调用、0 诊断缺口、父文件 hash 不变。最终仍为正文 135 页、清单 432 页；全页 PNG 与前版逐字节比较，只有目标正文第 9 页变化。主代理和独立视觉检查均确认新增公司名已与其原规则横线正确连接，无新截字或分页变化，其余 7 张已审格式页图像完全不变。7 个格式及续页的限定检查收口，前述未支持格式及版式限制不因此消失。
+
+最终证据：`.local/evidence/v57-n6-leading-underline-freeze.private.local.json`、`v57-native-format-visual-review-04.private.local.json`、`v57-root-final-check.private.local.json`、`v56-word-qa-v57-04/`、`.local/v57-format-validation/result-render-04.private.local.json`。后续优先补同页局部表及跨页固定正文，再完善来源义务/漏提审查账；不重买本轮已有的 37 窗或 9 个正文单元。M1.5 仍未整体验收，当前仍为本地 CLI 执行链，未增加数据库、API/Worker、界面、部署或多人并发能力。
