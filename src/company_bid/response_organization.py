@@ -15,6 +15,87 @@ def _plain(text):
     return re.sub(r"\s+", "", text)
 
 
+def _proof_display_labels(attachment_ids, actual, candidate=None):
+    """Name only the exact attached objects, never other same-RID material."""
+    origins = []
+    for aid in attachment_ids:
+        item = actual[aid]
+        title = item.get("title", "").strip()
+        if not title:
+            continue
+        key = (item.get("bundle_id") or aid, title)
+        origin = next((row for row in origins if (row["bundle_id"], row["title"]) == key), None)
+        if origin is None:
+            origin = {"title": title, "bundle_id": key[0], "attachment_ids": [], "source_refs": [],
+                      "label_source": "attachment.title"}
+            origins.append(origin)
+        origin["attachment_ids"].append(aid)
+        origin["source_refs"] = list(dict.fromkeys([*origin["source_refs"], *item.get("source_refs", [])]))
+    if not origins and candidate:
+        field = "title" if candidate.get("title") else "basis.maintained_title"
+        title = candidate.get("title") or candidate.get("basis", {}).get("maintained_title", "")
+        if title.strip():
+            origins.append({"title": title.strip(), "bundle_id": candidate.get("group_id"),
+                "attachment_ids": list(attachment_ids), "source_refs": list(candidate.get("source_refs", [])),
+                "label_source": "assembly_candidate." + field})
+    return list(dict.fromkeys(row["title"] for row in origins)), origins
+
+
+def _proof_label_prefix(labels):
+    return "已附证明：" + "；".join("“" + value + "”" for value in labels) + "。" if labels else ""
+
+
+def _relocate_material_preamble(main, subgroups, format_sections, blocks, known, add_refs):
+    """Keep a proven 'other materials' introduction with its own subheading."""
+    target = subgroups.get("其他")
+    if target is None:
+        return []
+    result = []
+    for section in main:
+        chapter = format_sections.get(section["section_id"], {})
+        ids = chapter.get("content_block_ids", [])
+        anchors = [i for i, bid in enumerate(ids) if blocks[bid]["text"] == target["title"]]
+        if len(anchors) != 1:
+            continue
+        tail = [blocks[bid] for bid in ids[anchors[0] + 1:]]
+        if (not tail or not tail[0]["text"].startswith("其中单位负责人")
+                or not tail[-1]["text"].endswith(("格式如下：", "格式如下:"))):
+            continue
+        anchor = blocks[ids[anchors[0]]]
+        scope = [anchor, *tail]
+        positions = [re.fullmatch(r"pdf/page\[(\d+)\]/line\[(\d+)\]", b["locator"]) for b in scope]
+        if (not all(positions) or len({b["source_id"] for b in scope}) != 1
+                or any(b.get("origin") != "native" or b.get("read_disposition") or b["kind"] != "paragraph" for b in scope)):
+            continue
+        page, start = map(int, positions[0].groups())
+        if any((int(p[1]), int(p[2])) != (page, start + i) for i, p in enumerate(positions)):
+            continue
+        following = [f for f in format_sections.values() if f["title"] == "单位负责人为同一人或存在控股、管理关系的单位情况说明"
+                     and f.get("content_block_ids")]
+        following = [f for f in following if (b := blocks[f["content_block_ids"][0]])["source_id"] == anchor["source_id"]
+                     and b["locator"].startswith(f"pdf/page[{page+1}]/") and b["text"] == f["title"]]
+        if len(following) != 1:
+            continue
+        moved = []
+        for source in tail:
+            matches = [item for item in section["fixed_content"] if item["kind"] == "paragraph" and item["text"] == source["text"]]
+            if len(matches) != 1:
+                raise ValueError("MATERIAL_PREAMBLE_SOURCE_OWNER_AMBIGUOUS")
+            moved.append(matches[0])
+        if target["fixed_content"] or section["fixed_content"][-len(moved):] != moved:
+            raise ValueError("MATERIAL_PREAMBLE_ORDER_CONFLICT")
+        target["fixed_content"] = moved
+        section["fixed_content"] = section["fixed_content"][:-len(moved)]
+        target["source_refs"] = list(dict.fromkeys([*target["source_refs"], *(ref for item in moved for ref in item["source_refs"])]))
+        refs = [rid for rid in section["requirement_refs"] if all(b["text"] in known[rid]["text"] for b in tail)]
+        add_refs(target, refs)
+        result.append({"from_section_id": section["section_id"], "to_section_id": target["section_id"],
+            "source_heading_block_id": anchor["block_id"], "source_block_ids": [b["block_id"] for b in tail],
+            "following_format_id": following[0]["format_id"], "requirement_refs": refs,
+            "before_after_content_sha256": digest(moved), "rule": "contiguous_other_materials_introduction_v1"})
+    return result
+
+
 def organize_response(sections, requirements, details, formats, blocks, issues, attachments,
                       manifest, material_report):
     """Change presentation, never eligibility or the original requirement text.
@@ -102,6 +183,8 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
                                         "source_refs": item["source_refs"], "text_sha256": digest(item["text"])})
             section["fixed_content"] = retained
 
+    preamble_relocations = _relocate_material_preamble(main, subgroups, format_sections, blocks, known, add_refs)
+
     def topic_for(text):
         if re.search(r"业绩|历史项目|项目合同|中标通知|验收文件", text):return "业绩"
         if re.search(r"人员|项目负责人|项目经理|身份证|社会保险|职称|CP[234]", text):return "人员"
@@ -182,10 +265,12 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
             attachments.append(value);adopted[aid] = value
             target["attachment_refs"] = list(dict.fromkeys([*target["attachment_refs"], aid]));placed.append(aid)
         if placed:
+            labels, label_origins = _proof_display_labels(placed, adopted, candidate)
             iid = marker(target, [rid], "已附证明的适用条件仍待核对",
-                "按已维护来源装配完整证明包；没有据此认定资格合格、获得评分或确定本次人员派任。",
+                _proof_label_prefix(labels) + "按已维护来源装配完整证明包；没有据此认定资格合格、获得评分或确定本次人员派任。",
                 "；".join(candidate.get("pending_checks", [])) or "核对原件、日期、等级及本次适用范围。", "warning")
             assembly.append({**candidate, "response_section_id": target["section_id"], "issue_id": iid,
+                             "display_labels": labels, "display_label_provenance": label_origins,
                              "qualification_result": "not_determined"})
 
     lookup_reclassifications = []
@@ -200,12 +285,14 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
         ids = list(dict.fromkeys(aid for ref in refs for aid in assembled_by_requirement[ref]))
         if any(aid not in adopted for aid in ids):
             continue
+        labels, label_origins = _proof_display_labels(ids, adopted)
         previous = {key: item[key] for key in ("title", "reason", "action", "severity")}
         item.update(title="已附证明的适用条件仍待核对", severity="warning",
-            reason="后续资料匹配已按来源装配证明页；此前通用检索未能唯一匹配不再代表当前没有附件。资格、有效期及本次适用性仍未确定。",
+            reason=_proof_label_prefix(labels) + "后续资料匹配已按来源装配证明页；此前通用检索未能唯一匹配不再代表当前没有附件。资格、有效期及本次适用性仍未确定。",
             action="对照正文实际证明包核对招标条件、原件、有效期及人员安排；有缺项时线下补齐，不能仅因已附证明而认定满足。")
         lookup_reclassifications.append({"issue_id": item["issue_id"], "requirement_refs": list(refs),
             "previous": previous, "current": {key: item[key] for key in previous}, "attachment_ids": ids,
+            "display_labels": labels, "display_label_provenance": label_origins,
             "qualification_result": "not_determined"})
 
     appendix_placements = []
@@ -277,6 +364,7 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
     sections[:] = [*arranged, *review]
     return {"rule": "explicit_response_review_organization_v1", "role_changes": changes,
             "native_heading_relocations": relocations, "response_pending_links": pending_links,
+            "native_preamble_relocations": preamble_relocations,
             "proof_assembly": assembly, "section_order": [s["section_id"] for s in sections],
             "appendix_placements": appendix_placements,
             "lookup_issue_reclassifications": lookup_reclassifications,

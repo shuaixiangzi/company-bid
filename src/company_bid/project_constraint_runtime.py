@@ -212,6 +212,44 @@ def plan_project_constraints(parsed, requirements, manifest, sections):
             "review_status": "not_checked", "unknowns_are_not_permissions": True}
 
 
+def _reviewed_action_requirements(report, prepared, n1, config, existing):
+    """Independently rebind the explicit omission review, including its action."""
+    from .extraction import _id, _index
+    from .reviewed_source_actions import reviewed_source_actions
+    blocks, _, documents = _index(n1["parsed"], n1["manifest"])
+    additions, rebuilt = reviewed_source_actions(config.get("reviewed_source_actions"), blocks, documents, existing)
+    recorded = report.get("reviewed_source_actions")
+    # Earlier frozen plans predate this optional review path.
+    if recorded is None and not additions:
+        return []
+    if recorded != rebuilt:
+        raise ProjectConstraintError("PROJECT_CONSTRAINT_SOURCE_REVIEW_CHANGED")
+    known = {item["requirement_id"]: item for item in prepared["requirements"]}
+    sources = {item["source_id"]: item for item in prepared["sources"]}
+    for expected, proof in zip(additions, rebuilt["items"]):
+        rid = expected["requirement_id"]
+        actual = known.get(rid)
+        if not actual or any(actual[key] != expected[key] for key in ("text", "category", "mandatory", "response_mode")):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_SOURCE_REVIEW_CHANGED")
+        citation = expected["citations"][0]
+        ref = _id("SCOPE-", citation)
+        locator = (f"{citation['locator']}; basis={citation['basis']}; chars[{citation['start']}:{citation['end']}]; "
+                   f"quote_sha256={citation['quote_sha256']}; through={citation['end_locator']}; blocks=" + ",".join(citation["block_ids"]))
+        if actual["source_refs"] != [ref] or ref not in sources or sources[ref]["locator"] != locator or (
+                sources[ref]["sha256"] != proof["source_sha256"] or actual.get("source_contexts")):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_SOURCE_REVIEW_CHANGED")
+        actions = [item for item in prepared["review_actions"] if rid in item["requirement_refs"]]
+        commercial = expected["category"] == "commercial"
+        if len(actions) != 1 or actions[0] != {"action_id": _id("RA-", rid),
+                "kind": "commercial_constraint" if commercial else "procedure",
+                "status": "not_checked" if commercial else "pending_manual", "requirement_refs": [rid],
+                "source_refs": [ref], "source_requirement": expected["text"], "instruction": proof["instruction"],
+                "source_scope_status": "not_applicable", "source_scope_contexts": []} or any(
+                rid in task["requirement_refs"] for section in prepared["sections"] for task in section["writing_tasks"]):
+            raise ProjectConstraintError("PROJECT_CONSTRAINT_SOURCE_REVIEW_CHANGED")
+    return additions
+
+
 def load_project_constraints(ctx, prepared=None):
     """Read the completed N3 unit, not an expectation copied from an N4 request.
 
@@ -246,6 +284,7 @@ def load_project_constraints(ctx, prepared=None):
         requirements = copy.deepcopy(n2["extracted"]["requirements"])
         requirements.extend(_derived_requirements(report, prepared, n1["parsed"]))
         requirements.extend(_contract_pending_requirements(report, prepared, n1, requirements))
+        requirements.extend(_reviewed_action_requirements(report, prepared, n1, plan_input["config"], requirements))
         # Rebuild independently from the frozen source and pre-serialization
         # task identities. Never use the actual N4 context as an expectation.
         sections = copy.deepcopy(prepared["sections"])

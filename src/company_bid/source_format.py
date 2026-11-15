@@ -76,6 +76,9 @@ def _line_underlines(line, rules, index):
 
 
 def _identity_fact(facts, label, manifest):
+    if label == "project_number":
+        matches = [f for f in facts if f["label"] == "项目编号" and f["value"].strip()]
+        return matches[0] if matches and len({f["value"] for f in matches}) == 1 else None
     aliases = ({"公司名称", "投标人名称", "响应人名称", "供应商名称"} if label == "company_name" else {"项目名称"})
     expected = manifest["company" if label == "company_name" else "project"]["name"]
     matches = [f for f in facts if f["label"] in aliases and f["value"] == expected]
@@ -96,6 +99,9 @@ def _fill_line(item, original, block_id, index, facts, manifest, *, source_rules
     match = re.fullmatch(r"(?:响应人|投标人|供应商)(?:名称)?[：:](?P<gap>[ \t_＿]*)(?=[（(].*盖.*章[）)]).+", original)
     if match:
         matches[(match.start("gap"), match.end("gap"), "company_name")] = None
+    number = re.fullmatch(r"项目编号[：:](?P<gap>[ \t_＿]*)", original)
+    if number:
+        matches[(number.start("gap"),number.end("gap"),"project_number")] = None
     for rule in source_rules:
         if rule["fixed_index"] != index:
             continue
@@ -103,6 +109,9 @@ def _fill_line(item, original, block_id, index, facts, manifest, *, source_rules
         if (re.fullmatch(r"项目名称[：:]", original[:start]) and start < end and
                 not original[start:end].strip(" \t_＿") and re.match(r"\s*(?:项目编号[：:]|$)",original[end:])):
             matches[(start,end,"project_name")] = rule
+        if (re.search(r"(?:^|\s)项目编号[：:]$",original[:start]) and start <= end and
+                not original[start:end].strip(" \t_＿") and not original[end:].strip()):
+            matches[(start,end,"project_number")] = rule
         placeholder=re.match(r"[（(](?:响应人|投标人|供应商)[）)]", original)
         if (placeholder and re.match(r"\s+已(?:认真)?阅读", original[placeholder.end():]) and
                 start == 0 and end >= placeholder.end() and rule["basis"] == "native_vector_rule"):
@@ -210,139 +219,10 @@ def _cell_insets(cell, fallback):
 
 
 def _recover_one(ctx, section, chapter, blocks, source, tables, facts, manifest, scoped_source):
-    selected = [blocks[key] for key in chapter["content_block_ids"]]
-    pages = {b.get("page") for b in selected}
-    if len(pages) != 1 or None in pages:
-        return None, "unsupported_multiple_physical_pages"
-    if any(b.get("origin") != "native" or b.get("read_disposition") or b["kind"] not in {"paragraph", "table"} for b in selected):
-        return None, "unsupported_non_native_or_omitted_block"
-    page_number = next(iter(pages))
-    unit_input = {"source_id": source["source_id"], "source_sha256": source["sha256"],
-                  "physical_page": page_number, "frozen_blocks": selected, "version": SOURCE_FORMAT_VERSION}
-    def read():
-        value = read_native_format_layout(source["path"], source["sha256"], [page_number])
-        ctx.capture("n3-native-source-layout", value)
-        return value
-    native = ctx.run_unit("native-format-" + format_digest(unit_input)[:20], unit_input, read)
-    page = native["pages"][0]
-    measured = {b["locator"]: b for b in [*page["lines"], *page["tables"]]}
-    for block in selected:
-        item = measured.get(block["locator"])
-        if item is None or block["text"] != item["text"] or any(abs(a-b) > .01 for a,b in zip(block["bbox"],item["bbox"])):
-            raise ValueError("NATIVE_FORMAT_FROZEN_BLOCK_MISMATCH")
-        if block["kind"] == "table" and (block["rows"] != item["rows"] or block.get("merges", []) != item["merges"] or
-                block.get("column_widths", []) != item["column_widths_pt"]):
-            raise ValueError("NATIVE_FORMAT_FROZEN_GRID_MISMATCH")
-    selected_locators = {b["locator"] for b in selected}
-    if any(b["locator"] not in selected_locators for b in [*page["lines"], *page["tables"]]
-           if not b.get("page_furniture_candidate")):
-        return None, "unsupported_partial_native_page"
-    heading = selected[0]
-    if heading["kind"] != "paragraph" or heading["text"] != chapter["title"]:
-        return None, "unsupported_heading_scope"
-    content = selected[1:]
-    fixed = copy.deepcopy(section["fixed_content"])
-    if len(content) != len(fixed):
-        return None, "unsupported_transformed_or_instruction_only_body"
-    elements, bindings, pending_lines = [], [], []
-    def flush():
-        if pending_lines:
-            elements.append(_paragraph([x[0] for x in pending_lines], [x[1]["text"] for x in pending_lines],
-                [x[1]["block_id"] for x in pending_lines], [measured[x[1]["locator"]] for x in pending_lines],
-                fixed, page["horizontal_rules"], page["width_pt"]))
-            pending_lines.clear()
-    for index, (block, item) in enumerate(zip(content, fixed)):
-        # Existing generic references need not name a singleton block. Native
-        # proof adds an explicit member scope without changing global citation
-        # IDs or the unrelated writing inputs.
-        native_ref = scoped_source({"source_id": source["source_id"], "block_id": block["block_id"],
-            "block_ids": [block["block_id"]], "locator": block["locator"], "quote": block["text"]})
-        item["source_refs"] = list(dict.fromkeys([*item["source_refs"], native_ref]))
-        if block["kind"] == "paragraph":
-            if item["kind"] != "paragraph" or item["text"] != block["text"]:
-                return None, "unsupported_transformed_fixed_paragraph"
-            line = measured[block["locator"]]
-            if pending_lines and not _can_join(measured[pending_lines[-1][1]["locator"]], line):
-                flush()
-            bindings.extend(_fill_line(item, block["text"], block["block_id"], index, facts, manifest,
-                                      source_rules=_line_underlines(line, page["horizontal_rules"], index)))
-            pending_lines.append((index, block))
-        else:
-            flush()
-            table = next((t for t in tables if t["table_id"] == item.get("table_ref")), None)
-            if item["kind"] != "table_ref" or table is None or table["section_id"] != section["section_id"]:
-                return None, "unsupported_table_owner"
-            table["source_refs"] = list(dict.fromkeys([*table["source_refs"], native_ref]))
-            raw = measured[block["locator"]]
-            cells = []
-            small_insets = [c["alignment_evidence"]["left_gap_pt"] for c in raw["cells"] if c["runs"] and
-                            1 <= c["alignment_evidence"]["left_gap_pt"] <= 10]
-            fallback = min(small_insets, default=0.)
-            for cell in raw["cells"]:
-                font = _font(cell["runs"])
-                if not cell["runs"]:
-                    font = _font(next((c["runs"] for c in raw["cells"] if c["runs"]), []))
-                cells.append({"row": cell["row"], "column": cell["column"], **font,
-                    "alignment": "center" if cell["alignment_evidence"]["horizontal"] == "center" else "left",
-                    "vertical_alignment": cell["alignment_evidence"]["vertical"] if cell["runs"] else "center",
-                    **_cell_insets(cell, fallback), "underlines":_cell_underlines(cell, page["horizontal_rules"])})
-            elements.append({"kind": "table", "fixed_index": index, "source_block_id": block["block_id"],
-                "source_locator": block["locator"],
-                "table_id": table["table_id"], "bbox": raw["bbox"], "column_widths_pt": raw["column_widths_pt"],
-                "row_heights_pt": raw["row_heights_pt"], "cells": cells,
-                "source_rows": block["rows"], "source_merges": block.get("merges", []),
-                "source_grid_sha256": format_digest(block["rows"]), "output_grid_sha256": format_digest(table["rows"])})
-    flush()
-    head = measured[heading["locator"]]
-    result = {"schema_version": SOURCE_FORMAT_VERSION, "source_id": source["source_id"], "source_sha256": source["sha256"],
-        "physical_page": page_number, "page_width_pt": page["width_pt"], "page_height_pt": page["height_pt"],
-        "heading_text": heading["text"], "heading_bbox": heading["bbox"],
-        "heading_alignment": "center" if _centered(head) else ("right" if head["bbox"][0] > page["width_pt"]/2 else "left"),
-        "heading_source_ref": scoped_source({"source_id": source["source_id"], "block_id": heading["block_id"],
-            "block_ids": [heading["block_id"]], "locator": heading["locator"], "quote": heading["text"]}),
-        "heading_source_block_id": heading["block_id"], "heading_source_locator": heading["locator"],
-        **{"heading_" + k: v for k,v in _font(head["runs"]).items()}, "elements": elements, "bindings": bindings,
-        "native_read_sha256": format_digest(native), "frozen_blocks_sha256": format_digest(selected)}
-    result["proof_sha256"] = format_digest(result)
-    spec = NativeFormatLayout.model_validate(result)
-    section["fixed_content"], section["native_format"] = fixed, spec.model_dump(mode="json")
-    return spec, None
+    from .source_format_scope import recover_one
+    return recover_one(ctx, section, chapter, blocks, source, tables, facts, manifest, scoped_source)
 
 
 def recover_source_formats(ctx, sections, formats, blocks, source_map, tables, facts, manifest, scoped_source):
-    """N3-only opt-in: explicit per-format recovery status, no hidden fallback."""
-    from .extraction import _id, PlanningError
-    results = []
-    for chapter in formats:
-        sid = _id("SEC-", chapter["format_id"])
-        section = next((s for s in sections if s["section_id"] == sid), None)
-        row = {"format_id": chapter["format_id"], "section_id": sid, "title": chapter["title"],
-               "status": "not_recovered", "satisfaction_status": "not_determined"}
-        results.append(row)
-        source = source_map.get(chapter["citation"]["source_id"])
-        if section is None or not section["fixed_content"] or section["writing_tasks"] or chapter.get("source_role") == "prescribed_cover":
-            row["reason"] = "cover_existing_path_or_no_complete_fixed_body"
-            continue
-        if source is None or not all(re.fullmatch(r"pdf/page\[\d+\]/(?:line|table)\[\d+\]", blocks[b]["locator"])
-                                     for b in chapter["content_block_ids"]):
-            row["reason"] = "unsupported_non_pdf_native_scope"
-            continue
-        try:
-            spec, reason = _recover_one(ctx, section, chapter, blocks, source, tables, facts, manifest, scoped_source)
-        except NativeLayoutError as exc:
-            if "UNSUPPORTED" not in exc.code and exc.code != "NATIVE_LAYOUT_UNRESOLVED_GLYPH":
-                raise PlanningError(exc.code) from exc
-            row["reason"] = exc.code
-            continue
-        except ValueError as exc:
-            raise PlanningError("NATIVE_SOURCE_FORMAT_INVALID") from exc
-        if spec is None:
-            row["reason"] = reason
-        else:
-            row.update(status="source_layout_recovered", physical_page=spec.physical_page,
-                       proof_sha256=spec.proof_sha256, binding_count=len(spec.bindings))
-    report = {"schema_version": SOURCE_FORMAT_VERSION, "formats": results,
-              "complete": all(row["status"] == "source_layout_recovered" for row in results),
-              "unrecovered_is_implementation_gap_not_company_material_absence": True}
-    ctx.capture("n3-native-format-plan", report)
-    return report
+    from .source_format_scope import recover_all
+    return recover_all(ctx, sections, formats, blocks, source_map, tables, facts, manifest, scoped_source)

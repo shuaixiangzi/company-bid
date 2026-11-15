@@ -42,7 +42,7 @@ class NativeSlotBinding(_FormatModel):
     end: int = Field(ge=0)
     original: str
     replacement: str
-    label: Literal["company_name", "project_name"]
+    label: Literal["company_name", "project_name", "project_number"]
     fact_id: str
     fact_source_refs: list[str] = Field(min_length=1)
     before_text: str
@@ -165,16 +165,21 @@ def validate_native_format(spec, fixed, tables, sources, facts, *, title=None, i
                for index, block in zip(e.fixed_indices, e.source_block_ids)}
     member_rules = {index:[rule for rule in e.underlines if rule.fixed_index == index]
                     for e in spec.elements if isinstance(e, NativeParagraphLayout) for index in e.fixed_indices}
+    is_v2 = spec.schema_version == "source-response-format-v2"
     bindings = {}
     for binding in spec.bindings:
         fact = facts.get(binding.fact_id)
-        aliases = {"公司名称", "投标人名称", "响应人名称", "供应商名称"} if binding.label == "company_name" else {"项目名称"}
+        aliases = ({"公司名称", "投标人名称", "响应人名称", "供应商名称"} if binding.label == "company_name" else
+                   {"项目编号"} if binding.label == "project_number" else {"项目名称"})
         if (binding.fixed_index not in members or members[binding.fixed_index] != binding.source_block_id or
                 negative_fill_instruction(binding.before_text) or
                 fact is None or fact.label not in aliases or fact.value != binding.replacement or
-                identities is not None and fact.value != identities[binding.label] or
+                identities is not None and binding.label != "project_number" and fact.value != identities[binding.label] or
                 fact.source_refs != binding.fact_source_refs):
             raise ValueError("native fill must retain its exact permitted identity fact")
+        if binding.label == "project_number" and (not is_v2 or not fact.value.strip() or
+                len({item.value for item in facts.values() if item.label == "项目编号"}) != 1):
+            raise ValueError("native project number needs one explicit fact value in v2")
         tail = binding.before_text[binding.end:]
         company_slot = (not binding.original.strip(" _＿\t") and
             (re.match(r"[（(](?:响应人|投标人|供应商)(?:名称|全称)[）)]", tail) or
@@ -193,28 +198,32 @@ def validate_native_format(spec, fixed, tables, sources, facts, *, title=None, i
             rule.end >= len(re.match(r"[（(](?:响应人|投标人|供应商)[）)]", binding.before_text)[0]))
         company_slot = company_slot or company_rule_slot
         project_slot = project_slot or project_rule_slot
-        if not (company_slot if binding.label == "company_name" else project_slot):
+        allowed_slot = (company_slot if binding.label == "company_name" else
+                        project_number_source_slot(binding) if binding.label == "project_number" else project_slot)
+        if not allowed_slot:
             raise ValueError("native identity fill is not an explicit source slot")
         bindings.setdefault(binding.fixed_index, []).append(binding)
-    def quoted(text, refs, locator, block_id):
+    def quoted(text, refs, locator, block_id, physical_page):
         wanted = hashlib.sha256(text.encode()).hexdigest()
         return any(ref in sources and sources[ref].sha256 == source.sha256 and
                    sources[ref].path == source.path and
                    sources[ref].locator.split(";", 1)[0] == locator and
-                   locator.startswith(f"pdf/page[{spec.physical_page}]/") and
+                   locator.startswith(f"pdf/page[{physical_page}]/") and
                    re.findall(r"(?:^|;\s*)blocks=([^;]*)", sources[ref].locator) == [block_id] and
                    re.findall(r"(?:^|;\s*)quote_sha256=([^;]*)", sources[ref].locator) == [wanted]
                    for ref in refs)
     if (title is not None and spec.heading_text != title or
-            not quoted(spec.heading_text, [spec.heading_source_ref], spec.heading_source_locator, spec.heading_source_block_id)):
+            not quoted(spec.heading_text, [spec.heading_source_ref], spec.heading_source_locator,
+                       spec.heading_source_block_id, spec.physical_page)):
         raise ValueError("native heading must retain its exact original source")
     for element in spec.elements:
+        physical_page = element.physical_page if is_v2 else spec.physical_page
         if isinstance(element, NativeParagraphLayout):
             texts = []
             for index, original, locator, block_id in zip(element.fixed_indices, element.source_texts,
                                                          element.source_locators, element.source_block_ids):
                 item = fixed[index]
-                if item.kind != "paragraph" or not quoted(original, item.source_refs, locator, block_id):
+                if item.kind != "paragraph" or not quoted(original, item.source_refs, locator, block_id, physical_page):
                     raise ValueError("native paragraph must retain its exact scoped original quote")
                 current = original
                 for binding in bindings.get(index, []):
@@ -230,7 +239,7 @@ def validate_native_format(spec, fixed, tables, sources, facts, *, title=None, i
                             rule.locator != f"{locator}; chars[{rule.start}:{rule.end}]" or rule.bbox is None):
                         raise ValueError("native glyph rule must match its exact printed underscores")
                     if rule.basis == "native_vector_rule" and not re.fullmatch(
-                            re.escape(f"pdf/page[{spec.physical_page}]/") + r"rule\[\d+\]", rule.locator):
+                            re.escape(f"pdf/page[{physical_page}]/") + r"rule\[\d+\]", rule.locator):
                         raise ValueError("native vector rule must retain its source page")
             if format_digest(texts) != element.output_texts_sha256:
                 raise ValueError("native paragraph output hash mismatch")
@@ -263,7 +272,7 @@ def validate_native_format(spec, fixed, tables, sources, facts, *, title=None, i
                     format_digest(element.source_rows) != element.source_grid_sha256 or
                     [m.model_dump() for m in table.merges] != element.source_merges or
                     not quoted("\n".join("\t".join(row) for row in element.source_rows), table.source_refs,
-                               element.source_locator, element.source_block_id)):
+                               element.source_locator, element.source_block_id, physical_page)):
                 raise ValueError("native table grid or source quote changed")
             for source_row, row in zip(element.source_rows, table.rows):
                 for original, cell in zip(source_row, row):
@@ -284,7 +293,7 @@ def validate_native_format(spec, fixed, tables, sources, facts, *, title=None, i
                     if (not 0 <= rule.start <= rule.end <= len(text) or
                             text[rule.start:rule.end].strip(" \t_＿") or
                             rule.width_pt > width or
-                            not re.fullmatch(re.escape(f"pdf/page[{spec.physical_page}]/") + r"rule\[\d+\]", rule.locator) or
+                            not re.fullmatch(re.escape(f"pdf/page[{physical_page}]/") + r"rule\[\d+\]", rule.locator) or
                             table.rows[cell.row][cell.column].text != text):
                         raise ValueError("native cell underline must retain its exact blank source slot")
 
@@ -313,6 +322,8 @@ class NativeFormatLayout(_FormatModel):
 
     @model_validator(mode="after")
     def sealed_layout(self):
+        if any(binding.label == "project_number" for binding in self.bindings):
+            raise ValueError("native project number is not part of the v1 format contract")
         if format_digest(self.model_dump(mode="json", exclude={"proof_sha256"})) != self.proof_sha256:
             raise ValueError("native source-format proof hash mismatch")
         indices = [i for e in self.elements for i in
@@ -331,3 +342,168 @@ class NativeFormatLayout(_FormatModel):
                         abs(box[2]-box[0]-rule.width_pt) > .01):
                     raise ValueError("native source rule geometry changed")
         return self
+
+
+def project_number_source_slot(binding):
+    """An explicit numbered-project blank, never a name/date or existing value."""
+    if (negative_fill_instruction(binding.before_text) or
+            not re.search(r"(?:^|\s)项目编号[：:]$", binding.before_text[:binding.start]) or
+            binding.original.strip(" \t_＿")):
+        return False
+    rule = binding.source_rule
+    if rule is not None:
+        return rule.start == binding.start and rule.end == binding.end
+    return not binding.before_text[binding.end:].strip() and binding.end == len(binding.before_text)
+
+
+def _inside_page(box, width, height, *, stroke=False):
+    return (0 <= box[0] < box[2] <= width + .01 and
+            0 <= box[1] <= box[3] <= height + .01 and (stroke or box[1] < box[3]))
+
+
+def _same_box(left, right):
+    return all(abs(a-b) <= .01 for a, b in zip(left, right))
+
+
+def _union_boxes(boxes):
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+class NativeScopeMember(_FormatModel):
+    block_id: str = Field(min_length=1)
+    locator: str
+    ordinal: int = Field(ge=0)
+    kind: Literal["paragraph", "table"]
+    physical_page: int = Field(ge=1)
+    text_sha256: Sha
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    role: Literal["selected", "excluded", "page_furniture"]
+
+
+class NativePageScope(_FormatModel):
+    physical_page: int = Field(ge=1)
+    page_width_pt: float = Field(gt=0)
+    page_height_pt: float = Field(gt=0)
+    scope_kind: Literal["whole_page", "partial_page"]
+    scope_bbox: list[float] = Field(min_length=4, max_length=4)
+    members: list[NativeScopeMember] = Field(min_length=1)
+    fixed_indices: list[Annotated[int, Field(ge=0)]]
+    native_page_sha256: Sha
+    frozen_page_sha256: Sha
+
+    @model_validator(mode="after")
+    def exact_page_partition(self):
+        ordinals = [member.ordinal for member in self.members]
+        if (ordinals != sorted(set(ordinals)) or
+                len({member.block_id for member in self.members}) != len(self.members) or
+                len({member.locator for member in self.members}) != len(self.members) or
+                self.fixed_indices != sorted(set(self.fixed_indices))):
+            raise ValueError("native page scope must retain sorted unique members and indices")
+        for member in self.members:
+            expected_kind = "line" if member.kind == "paragraph" else "table"
+            if (member.physical_page != self.physical_page or
+                    not re.fullmatch(re.escape(f"pdf/page[{self.physical_page}]/") +
+                                     expected_kind + r"\[\d+\]", member.locator) or
+                    not _inside_page(member.bbox, self.page_width_pt, self.page_height_pt) or
+                    member.role == "page_furniture" and member.kind != "paragraph"):
+                raise ValueError("native scope member differs from its physical page or source type")
+        body = [member for member in self.members if member.role != "page_furniture"]
+        selected = [i for i, member in enumerate(body) if member.role == "selected"]
+        if not selected or selected != list(range(selected[0], selected[-1]+1)):
+            raise ValueError("native selected members must form one continuous source interval")
+        if self.scope_kind == "whole_page" and any(member.role == "excluded" for member in self.members):
+            raise ValueError("native whole page cannot exclude an original body member")
+        union = _union_boxes([member.bbox for member in self.members if member.role == "selected"])
+        if (not _inside_page(self.scope_bbox, self.page_width_pt, self.page_height_pt) or
+                not _same_box(union, self.scope_bbox)):
+            raise ValueError("native scope bbox must equal its selected source members")
+        return self
+
+
+class NativeParagraphLayoutV2(NativeParagraphLayout):
+    physical_page: int = Field(ge=1)
+
+
+class NativeTableLayoutV2(NativeTableLayout):
+    physical_page: int = Field(ge=1)
+
+
+NativeElementV2 = Annotated[NativeParagraphLayoutV2 | NativeTableLayoutV2, Field(discriminator="kind")]
+
+
+class NativeFormatLayoutV2(NativeFormatLayout):
+    schema_version: Literal["source-response-format-v2"] = "source-response-format-v2"
+    elements: list[NativeElementV2]
+    page_scopes: list[NativePageScope] = Field(min_length=1)
+    form_role: Literal["response", "prescribed_cover"]
+
+    @model_validator(mode="after")
+    def sealed_layout(self):
+        # Override the v1 single-page validator. V1's schema and serialized
+        # fields remain unchanged; each v2 page supplies its own source frame.
+        if format_digest(self.model_dump(mode="json", exclude={"proof_sha256"})) != self.proof_sha256:
+            raise ValueError("native source-format proof hash mismatch")
+        numbers = [page.physical_page for page in self.page_scopes]
+        if numbers != list(range(numbers[0], numbers[0]+len(numbers))):
+            raise ValueError("native format pages must be ordered and consecutive")
+        first = self.page_scopes[0]
+        if (self.physical_page != first.physical_page or
+                abs(self.page_width_pt-first.page_width_pt) > .01 or
+                abs(self.page_height_pt-first.page_height_pt) > .01):
+            raise ValueError("native heading frame must equal the first source page")
+        pages = {page.physical_page: page for page in self.page_scopes}
+        members = [member for page in self.page_scopes for member in page.members]
+        ordinals = [member.ordinal for member in members]
+        if (ordinals != sorted(set(ordinals)) or len({m.block_id for m in members}) != len(members) or
+                len({m.locator for m in members}) != len(members)):
+            raise ValueError("native format source members may occur once in original order")
+        selected = [member for member in members if member.role == "selected"]
+        by_id = {member.block_id: member for member in selected}
+
+        def member(block_id, locator, text, kind, page):
+            item = by_id.get(block_id)
+            if (item is None or item.locator != locator or item.kind != kind or item.physical_page != page or
+                    item.text_sha256 != hashlib.sha256(text.encode()).hexdigest()):
+                raise ValueError("native selected member must match its exact source block")
+            return item
+
+        heading = member(self.heading_source_block_id, self.heading_source_locator,
+                         self.heading_text, "paragraph", first.physical_page)
+        if not _same_box(heading.bbox, self.heading_bbox):
+            raise ValueError("native heading bbox differs from its selected source member")
+        expected_ids = [heading.block_id]
+        indices = []
+        expected_indices = {page: [] for page in pages}
+        for element in self.elements:
+            page = pages.get(element.physical_page)
+            if page is None or not _inside_page(element.bbox, page.page_width_pt, page.page_height_pt):
+                raise ValueError("native element exceeds its own source page")
+            if isinstance(element, NativeParagraphLayoutV2):
+                original = [member(block_id, locator, text, "paragraph", element.physical_page)
+                            for block_id, locator, text in zip(element.source_block_ids,
+                                element.source_locators, element.source_texts)]
+                current_indices = element.fixed_indices
+                for rule in element.underlines:
+                    if (rule.bbox is None or
+                            not _inside_page(rule.bbox, page.page_width_pt, page.page_height_pt, stroke=True) or
+                            abs(rule.bbox[2]-rule.bbox[0]-rule.width_pt) > .01):
+                        raise ValueError("native source rule geometry changed")
+            else:
+                original = [member(element.source_block_id, element.source_locator,
+                                   "\n".join("\t".join(row) for row in element.source_rows),
+                                   "table", element.physical_page)]
+                current_indices = [element.fixed_index]
+            if not _same_box(_union_boxes([item.bbox for item in original]), element.bbox):
+                raise ValueError("native element bbox differs from its selected source members")
+            expected_ids.extend(item.block_id for item in original)
+            indices.extend(current_indices)
+            expected_indices[element.physical_page].extend(current_indices)
+        if (indices != list(range(len(indices))) or
+                expected_ids != [item.block_id for item in selected] or
+                any(page.fixed_indices != expected_indices[page.physical_page] for page in self.page_scopes)):
+            raise ValueError("native selected scope must cover heading and every fixed block exactly once")
+        return self
+
+
+NativeFormatSpec = Annotated[NativeFormatLayout | NativeFormatLayoutV2, Field(discriminator="schema_version")]

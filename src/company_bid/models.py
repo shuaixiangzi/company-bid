@@ -390,7 +390,7 @@ class DocumentStyle(Contract):
         return self
 
 
-from .source_format_contracts import NativeFormatLayout
+from .source_format_contracts import NativeFormatSpec
 
 
 class PrescribedBlock(Contract):
@@ -425,7 +425,7 @@ class SectionPlan(Contract):
     fixed_content: list[PrescribedBlock] = Field(default_factory=list)
     render_body: bool = True
     nonwriting_requirement_refs: list[Text] = Field(default_factory=list)
-    native_format: NativeFormatLayout | None = None
+    native_format: NativeFormatSpec | None = None
 
     @model_validator(mode="after")
     def tasks_belong_to_section(self):
@@ -543,11 +543,13 @@ class Section(Contract):
     level: int = Field(default=1, ge=1, le=3)
     start_on_new_page: bool = False
     render_body: bool = True
-    native_format: NativeFormatLayout | None = None
+    native_format: NativeFormatSpec | None = None
 
     @model_validator(mode="after")
     def visible_content(self):
-        if self.render_body != bool(self.blocks):
+        native_heading = (self.native_format is not None and
+                          self.native_format.schema_version == "source-response-format-v2" and bool(self.native_format.heading_text))
+        if self.render_body != bool(self.blocks or native_heading):
             raise ValueError("visible sections need content; procedure-only sections must be empty")
         return self
 
@@ -579,7 +581,17 @@ def _prescribed_cover(snapshot, section, paragraphs) -> set[str]:
         raise ValueError("prescribed cover must be visible and contain original paragraphs")
     requirements = {item.requirement_id: item for item in snapshot.requirements}
     sources = {item.source_id: item for item in snapshot.sources}
-    text = "\n".join([section.title, *(item.text for item in paragraphs)])
+    native = section.native_format
+    native_cover = native is not None and native.schema_version == "source-response-format-v2" and native.form_role == "prescribed_cover"
+    if native_cover:
+        members = {i:text for element in native.elements if element.kind == "paragraph"
+                   for i,text in zip(element.fixed_indices,element.source_texts)}
+        if sorted(members) != list(range(len(paragraphs))):
+            raise ValueError("native cover must retain every original paragraph")
+        original_texts = [members[i] for i in range(len(paragraphs))]
+    else:
+        original_texts = [item.text for item in paragraphs]
+    text = "\n".join([section.title, *original_texts])
     matches = [requirements[ref] for ref in section.requirement_refs
                if requirements[ref].response_mode == "fixed_text" and requirements[ref].text == text]
     if not matches:
@@ -587,9 +599,12 @@ def _prescribed_cover(snapshot, section, paragraphs) -> set[str]:
     originals = {_cover_source(sources[ref], text) for requirement in matches for ref in requirement.source_refs}
     if len(originals) != 1:
         raise ValueError("prescribed cover must have one original source identity")
-    for paragraph in paragraphs:
-        if not paragraph.source_refs or any(_cover_source(sources[ref], paragraph.text) not in originals
-                                            for ref in paragraph.source_refs):
+    for index, (paragraph, original) in enumerate(zip(paragraphs,original_texts)):
+        bound = [b for b in native.bindings if b.fixed_index == index] if native_cover else []
+        fact_sources = {ref for b in bound for ref in b.fact_source_refs}
+        original_refs = [ref for ref in paragraph.source_refs if ref not in fact_sources]
+        if (not original_refs or any(_cover_source(sources[ref], original) not in originals for ref in original_refs) or
+                native_cover and set(paragraph.fact_refs) != {b.fact_id for b in bound}):
             raise ValueError("prescribed cover paragraph must retain its scoped original source")
     for issue in snapshot.issues:
         if issue.section_id == section.section_id:
@@ -927,7 +942,8 @@ class DocumentPackage(Snapshot):
         if self.prescribed_cover_section_id is not None:
             _known([self.prescribed_cover_section_id], section_ids, "prescribed cover section")
             cover = next(item for item in self.sections if item.section_id == self.prescribed_cover_section_id)
-            if any(not isinstance(block, (ParagraphBlock, IssueBlock)) or block.fact_refs
+            native_cover = cover.native_format is not None and cover.native_format.schema_version == "source-response-format-v2" and cover.native_format.form_role == "prescribed_cover"
+            if any(not isinstance(block, (ParagraphBlock, IssueBlock)) or (block.fact_refs and not native_cover)
                    or (isinstance(block, ParagraphBlock) and block.content_role != "neutral")
                    for block in cover.blocks):
                 raise ValueError("prescribed cover permits only original neutral paragraphs and issues")

@@ -43,7 +43,7 @@ def _capture(ctx, name, data):
 def import_provider_options(options):
     """Normalize only the explicit import mode for the historical comparison."""
     result = copy.deepcopy(options)
-    _require(result.get("mode") in {MODE, "chat_completions"}, "PROVIDER_INVALID")
+    _require(result.get("mode") in {MODE, "chat_completions", "diagnostic_writing_commitment_partition"}, "PROVIDER_INVALID")
     result["mode"] = "chat_completions"
     return result
 
@@ -108,6 +108,9 @@ def expected_import_output(prepared, section, task, base, candidate):
     source_contexts = context.get("source_contexts", [])
     scope = base.get("writing_correction", {}).get("source_scope")
     extra = [item["source_id"] for item in scope["sources"]] if scope else []
+    if "commitment_drafting" in base:
+        from .commitment_drafting import commitment_content_source_refs
+        extra.extend(commitment_content_source_refs(base))
     project_refs = list(dict.fromkeys(item["source_id"] for item in context.get("project_constraints", [])))
     refs = list(dict.fromkeys([*(item["source_id"] for item in references),
         *(ref for item in requirements for ref in item["source_refs"]),
@@ -145,9 +148,11 @@ def expected_import_review(section, task, base, candidate, provenance):
 
 
 class DiagnosticWritingCandidateImport:
-    def __init__(self, provider_options, config):
+    def __init__(self, provider_options, config, *, commitment_partition=None):
         self.options, self.config = copy.deepcopy(provider_options), copy.deepcopy(config)
-        _require(self.options.get("mode") == MODE, "PROVIDER_INVALID")
+        self.commitment_partition = copy.deepcopy(commitment_partition)
+        expected_mode = MODE if commitment_partition is None else "diagnostic_writing_commitment_partition"
+        _require(self.options.get("mode") == expected_mode, "PROVIDER_INVALID")
         _require(isinstance(config, dict) and set(config) == {"schema_version", "packet"}
                  and config["schema_version"] == SCHEMA_VERSION and isinstance(config["packet"], dict)
                  and set(config["packet"]) == {"path", "sha256"}
@@ -218,6 +223,12 @@ class DiagnosticWritingCandidateImport:
                  "FALLBACK_UNSUPPORTED")
         provenance = load_project_constraints(ctx, prepared_dict)
         task_map = {task.unit_id: (section, task) for section in prepared.sections for task in section.writing_tasks}
+        if self.commitment_partition is not None:
+            from .commitment_drafting import checked_commitment_partition
+            _require(ctx.execution_config.get("commitment_drafting") == self.commitment_partition, "CONFIG_CHANGED")
+            extra = checked_commitment_partition(prepared, self.commitment_partition, provenance)
+            # Explicit partition of the actual frozen N3, never a prepared subset.
+            task_map = {uid: item for uid, item in task_map.items() if uid not in extra}
         expected = {uid: build_import_unit_input(prepared, section, task, self.options, provenance, frozen["proposals"])
                     for uid, (section, task) in task_map.items()}
         _require(expected == base_inputs, "CURRENT_INPUT_MISMATCH")
@@ -358,12 +369,16 @@ class DiagnosticWritingCandidateImport:
         return proposal
 
 
-def validate_candidate_import_links(ctx, value, package):
+def validate_candidate_import_links(ctx, value, package, *, partition_provider=None):
     """N5 rebuilds current inputs and corrected source links independently."""
-    if ctx.execution_config.get("provider", {}).get("mode") != MODE:
+    mode = ctx.execution_config.get("provider", {}).get("mode")
+    if mode != MODE and partition_provider is None:
         return []
     try:
-        provider = DiagnosticWritingCandidateImport(ctx.execution_config["provider"], ctx.execution_config["writing_candidate_import"])
+        provider = partition_provider or DiagnosticWritingCandidateImport(ctx.execution_config["provider"], ctx.execution_config["writing_candidate_import"])
+        if partition_provider is not None:
+            _require(mode == "diagnostic_writing_commitment_partition" and provider.commitment_partition is not None,
+                     "PROVIDER_INVALID")
         nodes = {item["key"]: item for item in ctx._state["nodes"]}
         _require(nodes.get("N4", {}).get("status") == "succeeded", "N4_REQUIRED")
         frozen = ctx.executor._checkpoint_data(nodes["N3"])
@@ -371,9 +386,15 @@ def validate_candidate_import_links(ctx, value, package):
         provenance = load_project_constraints(ctx, frozen["prepared"])
         bases = {task.unit_id: build_import_unit_input(prepared, section, task, provider.options, provenance, frozen["proposals"])
                  for section in prepared.sections for task in section.writing_tasks}
+        if provider.commitment_partition is not None:
+            from .commitment_drafting import checked_commitment_partition
+            extra = checked_commitment_partition(prepared, provider.commitment_partition, provenance)
+            bases = {uid: base for uid, base in bases.items() if uid not in extra}
         _, tasks, _, _, _ = provider._prepare(ctx, frozen["prepared"], bases)
         _require(package.requirements == prepared.requirements and package.sources == prepared.sources, "PACKAGE_SOURCES_CHANGED")
         reviews = value.get("writing_review", [])
+        if provider.commitment_partition is not None:
+            reviews = [item for item in reviews if item["unit_id"] in tasks]
         by_uid = {item["unit_id"]: item for item in reviews}
         _require(len(by_uid) == len(reviews) == 9 and set(by_uid) == set(tasks), "REVIEW_CHANGED")
         sections = {item.section_id: item for item in package.sections}

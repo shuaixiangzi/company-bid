@@ -37,14 +37,15 @@ def source_format_fixture(tmp_path):
     doc = SourceDocument(source_id="T", path=path, sha256=sha(path), role="tender", title="Synthetic")
     with pdfplumber.open(path) as pdf:
         unit = _read_pdf_page(doc, pdf.pages[0], 1, ReadingConfig(), None)
-    original = sorted([b.model_dump(mode="json") for b in unit.blocks if not b.text.strip().startswith("- 1 -")],
-                      key=lambda b: b["bbox"][1])
-    for block in original:
+    all_blocks = sorted([b.model_dump(mode="json") for b in unit.blocks],key=lambda b:b["bbox"][1])
+    for ordinal,block in enumerate(all_blocks):
         block["page"] = 1  # read_documents supplies this enclosing-page projection.
         block["unit_id"] = unit.unit_id
+        block["ordinal"] = ordinal
         if block["kind"] == "table":
             block["text"] = "\n".join("\t".join(row) for row in block["rows"])
-    blocks = {b["block_id"]: b for b in original}
+    original = [b for b in all_blocks if not b["text"].strip().startswith("- 1 -")]
+    blocks = {b["block_id"]: b for b in all_blocks}
     sources = {"T": source}
     def scoped(citation):
         # Match production singleton behavior: the blocks suffix exists only
@@ -68,7 +69,7 @@ def source_format_fixture(tmp_path):
                 "column_widths": block["column_widths"], "merges": block["merges"], "header_from_columns": False,
                 "repeat_header_rows": 0, "source_refs": [ref], "requirement_refs": ["R"]})
             section["fixed_content"].append({"kind": "table_ref", "table_ref": "TABLE", "source_refs": [ref]})
-    chapter = {"title": original[0]["text"], "content_block_ids": list(blocks)}
+    chapter = {"title": original[0]["text"], "content_block_ids": [b["block_id"] for b in original]}
     manifest = {"company": {"name": "Synthetic company"}, "project": {"name": "Synthetic project"}}
     ctx = Context()
     spec, reason = _recover_one(ctx, section, chapter, blocks, source, tables, [], manifest, scoped)
@@ -145,22 +146,23 @@ def test_native_form_preserves_additional_fact_and_non_native_table(tmp_path):
     assert table_positions[0] < fact_position < table_positions[1]
 
 
-@pytest.mark.parametrize("kind", ["partial_page", "multiple_pages", "changed_text"])
+@pytest.mark.parametrize("kind", ["noncontiguous", "page_gap", "changed_text"])
 def test_recovery_does_not_silently_invent_partial_cross_page_or_changed_source(tmp_path, kind):
     data, ctx = source_format_fixture(tmp_path)
-    blocks = deepcopy(next(iter(ctx.units.values()))["frozen_blocks"])
-    if kind == "partial_page":blocks = blocks[:-1]
-    elif kind == "multiple_pages":blocks[-1]["page"] = 2
-    else:blocks[1]["text"] += "Altered source"
-    section = deepcopy(data["sections"][0]);chapter = {"title": section["title"], "content_block_ids": [b["block_id"] for b in blocks]}
+    payload=next(iter(ctx.units.values()))
+    blocks=deepcopy(payload["frozen_page_blocks"])
+    ids=[b["block_id"] for b in payload["frozen_blocks"]]
+    section = deepcopy(data["sections"][0])
+    if kind == "noncontiguous":
+        ids.pop(1);section["fixed_content"].pop(0)
+    elif kind == "page_gap":
+        next(b for b in blocks if b["block_id"]==ids[-1])["page"]=3
+    else:next(b for b in blocks if b["block_id"]==ids[1])["text"] += "Altered source"
+    chapter = {"title": section["title"], "content_block_ids": ids}
     source = next(s for s in data["sources"] if s["source_id"] == "T")
     def recover():return _recover_one(Context(), section, chapter, {b['block_id']:b for b in blocks}, source,
         data["tables"], [], {"company":{"name":"Synthetic company"},"project":{"name":"Synthetic project"}}, lambda _: "unused")
-    if kind == "changed_text":
-        with pytest.raises(ValueError, match="FROZEN_BLOCK_MISMATCH"):recover()
-    else:
-        spec, reason = recover()
-        assert spec is None and reason == ("unsupported_partial_native_page" if kind == "partial_page" else "unsupported_multiple_physical_pages")
+    with pytest.raises(ValueError, match={"changed_text":"FROZEN_BLOCK_MISMATCH","noncontiguous":"NOT_CONTIGUOUS","page_gap":"PAGE_GAP"}[kind]):recover()
 
 
 @pytest.mark.parametrize("mutation", ["drop_native", "reseal_geometry"])
@@ -182,6 +184,12 @@ def test_n5_rejects_native_geometry_removed_or_resealed_after_frozen_plan(tmp_pa
                 table = next(e for e in native["elements"] if e["kind"] == "table")
                 table["row_heights_pt"][0] += 10
                 table["bbox"][3] += 10
+                for scope in native.get("page_scopes", []):
+                    for member in scope["members"]:
+                        if member["block_id"] == table["source_block_id"]:
+                            member["bbox"][3] += 10
+                    selected=[m["bbox"] for m in scope["members"] if m["role"]=="selected"]
+                    scope["scope_bbox"]=[min(b[0] for b in selected),min(b[1] for b in selected),max(b[2] for b in selected),max(b[3] for b in selected)]
                 native["proof_sha256"] = format_digest({k:v for k,v in native.items() if k != "proof_sha256"})
             return result
         nodes.append(NodeSpec("N4", "test-native-tamper-v1", changed, node.config_keys))
@@ -451,6 +459,40 @@ def test_zero_length_leading_fill_is_underlined_only_inside_its_exact_source_rul
     assert bool(company_run.underline) is owns_rule
     assert paragraph.text.replace("\u00a0","").startswith("A company（响应人）")
     assert "已认真阅读了文件。" in paragraph.text
+
+
+@pytest.mark.parametrize("mutation", [None, "printed_text", "different_member", "different_source_text", "other_rule"])
+def test_right_edge_insertion_consumes_only_its_exact_blank_source_rule(mutation):
+    from types import SimpleNamespace
+    from company_bid.source_format_rendering import _native_paragraph
+    source = "在 （项目名称）投标中提供资料全部真实。"
+    project = "2026年管道防腐专业巡检"
+    item, bindings = fill_case(source, project=project)
+    assert bindings[0]["start"] == bindings[0]["end"] == 2 and bindings[0]["source_rule"] is None
+    rule = {"fixed_index": 0, "start": 1, "end": 2, "width_pt": 102.,
+            "bbox": [126., 100., 228., 100.], "locator": "pdf/page[1]/rule[0]", "basis": "native_vector_rule"}
+    if mutation == "printed_text":
+        rule["start"] = 0  # A printed neighboring character is not a blank slot.
+    elif mutation == "different_member":
+        bindings[0]["source_block_id"] = "ANOTHER-BLOCK"
+    elif mutation == "other_rule":
+        bindings[0]["source_rule"] = {**rule, "locator": "pdf/page[1]/rule[1]"}
+    element = SimpleNamespace(kind="paragraph", bbox=[90., 90., 528., 102.], left_pt=90., right_pt=84.,
+        first_line_indent_pt=24., line_spacing_pt=23.4, alignment="left", font_family="SimSun", font_size_pt=12.,
+        bold=False, fixed_indices=[0], source_block_ids=["BLOCK"],
+        source_texts=[source if mutation != "different_source_text" else "别处的原字"],
+        underlines=[NativeUnderline.model_validate(rule)])
+    section = SimpleNamespace(native_format=SimpleNamespace(bindings=[NativeSlotBinding.model_validate(b) for b in bindings]),
+                              blocks=[SimpleNamespace(text=item["text"])])
+    paragraph = _native_paragraph(Document(), section, element, 0.)
+    project_run = next(run for run in paragraph.runs if project in run.text)
+    assert bool(project_run.underline) is (mutation is None)
+    assert "".join(paragraph.text.split()) == "".join(item["text"].split())
+    assert all(run.font.size.pt == 12. for run in paragraph.runs)
+    if mutation is None:
+        assert not paragraph._p.xpath('.//w:rPr/w:spacing')
+        assert not any(run.text == "\u00a0" for run in paragraph.runs)
+    assert source == "在 （项目名称）投标中提供资料全部真实。"
 
 
 def test_native_missing_annotations_are_small_ids_with_a_full_explicit_legend(tmp_path):

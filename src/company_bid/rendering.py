@@ -192,6 +192,17 @@ def _base_document(package, title):
     update = OxmlElement("w:updateFields")
     update.set(qn("w:val"), "true")
     document.settings.element.append(update)
+    # Keep explicit soft-break lines readable inside justified editable prose.
+    # This changes layout only; candidate text and paragraph order stay intact.
+    compat = document.settings.element.find(qn("w:compat"))
+    if compat is None:
+        compat = OxmlElement("w:compat")
+        document.settings.element.append(compat)
+    no_expand = compat.find(qn("w:doNotExpandShiftReturn"))
+    if no_expand is None:
+        no_expand = OxmlElement("w:doNotExpandShiftReturn")
+        compat.insert(0, no_expand)
+    no_expand.set(qn("w:val"), "true")
     return document
 
 
@@ -232,6 +243,10 @@ def _issue_text(paragraph, issue, style, *, compact=False):
 
 
 def _prescribed_cover(document, package, section):
+    if section.native_format is not None:
+        from .source_format_rendering import render_native_section
+        render_native_section(document, package, section, cover=True)
+        return
     style = package.style
     _page_furniture(document.sections[0], style, numbered=True, start=1)
     title = document.add_paragraph(section.title, "Title")
@@ -499,14 +514,23 @@ def _render_bid(package):
     body_sections_seen = 0
     seen_attachment_groups = set()
     native_page = False
+    prior_partial = None
     for section in package.sections:
         if section.document_role != "response" or not section.render_body or section.section_id == cover_id:
             continue
         if section.native_format is not None:
-            if body_sections_seen:
+            layout = section.native_format
+            scopes = getattr(layout, "page_scopes", ())
+            partial = scopes[0] if len(scopes) == 1 and scopes[0].scope_kind == "partial_page" else None
+            first = next((m for m in partial.members if m.role == "selected"), None) if partial else None
+            append = bool(prior_partial and partial and first and
+                          prior_partial[0] == layout.source_sha256 and prior_partial[1] == partial.physical_page and
+                          prior_partial[2] + 1 == first.ordinal and section.level > 1 and not section.start_on_new_page)
+            if body_sections_seen and not append:
                 document.add_section(WD_SECTION_START.NEW_PAGE)
             from .source_format_rendering import render_native_section
-            render_native_section(document, package, section)
+            render_native_section(document, package, section, append=append,
+                                  previous_source_bottom=prior_partial[3] if append else None)
             fixed_count = sum(len(e.fixed_indices) if e.kind == "paragraph" else 1
                               for e in section.native_format.elements)
             remaining = [block for block in section.blocks[fixed_count:] if not isinstance(block, IssueBlock)]
@@ -519,7 +543,10 @@ def _render_bid(package):
                                         seen_attachment_groups=seen_attachment_groups)
             body_sections_seen += 1
             native_page = not bool(remaining)
+            last = next((m for m in reversed(partial.members) if m.role == "selected"), None) if partial else None
+            prior_partial = (layout.source_sha256, partial.physical_page, last.ordinal, partial.scope_bbox[3]) if partial and not remaining else None
             continue
+        prior_partial = None
         if native_page:
             page = document.add_section(WD_SECTION_START.NEW_PAGE)
             _geometry(page, style)
@@ -721,13 +748,16 @@ def _mark_diagnostic(document, package):
             _font(paragraph.runs[0], name=package.style.font_family, size=9, bold=True, color="A80000")
 
 
-def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bool = False) -> dict:
+def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bool = False,
+                   review_document_mode: str = "full_trace") -> dict:
     """Assemble both files completely and exclusively; never overwrite results.
 
     Pagination uses real Word fields. The caller must visually verify the
     target Word/WPS render. M1 embeds only verified PNG/JPEG attachment bytes.
     """
     package = DocumentPackage.model_validate(package.model_dump())
+    if review_document_mode not in {"full_trace", "task_list"}:
+        raise ValueError("REVIEW_DOCUMENT_MODE_INVALID")
     output_dir = Path(output_dir)
     prefix = "诊断回放-" if diagnostic else ""
     targets = {"bid_docx": output_dir / (prefix + "投标文件.docx"), "issues_docx": output_dir / (prefix + "待补清单.docx")}
@@ -739,7 +769,13 @@ def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bo
     try:
         with tempfile.TemporaryDirectory(prefix=".render-", dir=output_dir) as staging:
             staged = {key: Path(staging) / path.name for key, path in targets.items()}
-            bid, issues = _render_bid(package), _render_issues(package)
+            bid = _render_bid(package)
+            review_index = None
+            if review_document_mode == "task_list":
+                from .review_document import render_task_list
+                issues, review_index = render_task_list(package)
+            else:
+                issues = _render_issues(package)
             if diagnostic:
                 _mark_diagnostic(bid, package)
                 _mark_diagnostic(issues, package)
@@ -760,4 +796,7 @@ def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bo
     result["warnings"] = ["目录与页码使用 Word 字段。请在 Word/WPS 中更新全部字段并人工检查排版；不提供估算页码。", "来源定位、事实映射及制作范围见待补清单的追溯附录。"]
     result["attachment_count"] = len(package.attachments)
     result["issue_ids"] = [issue.issue_id for issue in package.issues]
+    if review_index is not None:
+        result["review_document_index"] = review_index
+        result["warnings"][1] = "按编号核对待补与办理事项；完整来源原文见清单中的原文附录。"
     return result

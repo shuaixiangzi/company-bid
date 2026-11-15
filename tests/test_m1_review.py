@@ -79,12 +79,14 @@ def test_render_failure_resumes_only_renderer_and_publishes_exact_bytes(tmp_path
         "拟按作业许可核对隔离条件，逐点登记实测值，异常复测后移交编号记录。"))
     actual_render = pipeline.render_package
 
-    def render(package, target, *, diagnostic=False):
+    def render(package, target, *, diagnostic=False, review_document_mode="full_trace"):
         assert diagnostic is False
+        assert review_document_mode == "full_trace"
         render_attempts.append(True)
         if len(render_attempts) == 1:
             raise OSError("offline renderer interruption")
-        return actual_render(package, target, diagnostic=diagnostic)
+        return actual_render(package, target, diagnostic=diagnostic,
+                             review_document_mode=review_document_mode)
 
     monkeypatch.setattr(pipeline, "render_package", render)
     root, config = tmp_path / "runtime", _config()

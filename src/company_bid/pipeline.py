@@ -27,9 +27,11 @@ def _version(*names: str) -> str:
     dependencies = {"runtime.py": ("unit_concurrency.py",),
                     "source_format_contracts.py": ("slots.py",),
                     "native_layout.py": ("reading.py",),
-                    "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py"),
+                    "source_format.py": ("source_format_scope.py",),
+                    "source_response_audit.py": ("extraction.py", "table_continuations.py"),
+                    "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py", "project_identity.py", "commitment_planning.py", "reviewed_source_actions.py"),
                     "pipeline.py": ("project_constraint_runtime.py",),
-                    "project_constraint_runtime.py": ("project_constraints.py", "contract_pending_plan.py"),
+                    "project_constraint_runtime.py": ("project_constraints.py", "contract_pending_plan.py", "reviewed_source_actions.py"),
                     "contract_pending_plan.py": ("contract_review_slots.py", "extraction.py"),
                     "project_constraints.py": ("table_continuations.py",),
                     "structured.py": ("material_heading_sources.py", "format_continuation_sources.py", "contract_blank_sources.py",
@@ -103,15 +105,25 @@ def build_executor(root: Path, config: dict) -> Executor:
         elif provider_options["mode"] == "diagnostic_writing_candidate_import":
             from .writing_candidate_import import DiagnosticWritingCandidateImport
             provider = DiagnosticWritingCandidateImport(provider_options, ctx.execution_config.get("writing_candidate_import"))
+        elif provider_options["mode"] == "diagnostic_writing_commitment_partition":
+            from .commitment_drafting import CommitmentPartitionProvider
+            provider = CommitmentPartitionProvider(provider_options, ctx.execution_config.get("writing_candidate_import"),
+                                                   ctx.execution_config.get("commitment_drafting"))
         else:
             raise PipelineFailure("PROVIDER_MODE_INVALID")
         facts = {item.fact_id: item for item in prepared.facts}
         tables = {item.table_id: item for item in prepared.tables}
         excerpts = {item.reference_id: item for item in prepared.reference_excerpts}
-        writing_import = provider_options["mode"] == "diagnostic_writing_candidate_import"
+        writing_partition = provider_options["mode"] == "diagnostic_writing_commitment_partition"
+        writing_import = writing_partition or provider_options["mode"] == "diagnostic_writing_candidate_import"
         writing_diagnostic = writing_import or provider_options["mode"] == "diagnostic_writing_mixed"
         if writing_diagnostic:
-            if writing_import:
+            if writing_partition:
+                from .commitment_drafting import build_partition_unit_input
+                def build_writing_unit_input(prepared, plan, task, options, constraints, proposals):
+                    return build_partition_unit_input(prepared, plan, task, options, constraints, proposals,
+                                                      ctx.execution_config["commitment_drafting"])
+            elif writing_import:
                 from .writing_candidate_import import build_import_unit_input as build_writing_unit_input
             else:
                 from .writing_replay import build_writing_unit_input
@@ -155,13 +167,16 @@ def build_executor(root: Path, config: dict) -> Executor:
                     task_input["project_constraint_artifact_refs"] = project_constraints["artifact_refs"]
                     task_input["project_constraint_plan_sha256"] = project_constraints["plan_sha256"]
                 if writing_diagnostic:
+                    if writing_partition:
+                        task_input = base_inputs[task.unit_id]
                     task_input = provider.unit_input(task.unit_id, task_input)
                 correction_scope = task_input.get("writing_correction", {}).get("source_scope")
+                commitment_base = task_input if "commitment_drafting" in task_input else None
 
                 def write_task(task=task, context=context, task_requirements=task_requirements,
                                plan=plan, references=references, source_contexts=source_contexts,
                                context_proof_hashes=context_proof_hashes, project_source_refs=project_source_refs,
-                               correction_scope=correction_scope):
+                               correction_scope=correction_scope, commitment_base=commitment_base):
                     project_constraint_checks = validate_project_constraint_context(task.model_dump(mode="json"), context,
                                                                                    project_constraints)
                     proposal = provider.generate(ctx, context, task_requirements)
@@ -170,6 +185,9 @@ def build_executor(root: Path, config: dict) -> Executor:
                         *(ref for item in source_contexts for ref in item["source_refs"]), *project_source_refs]))
                     correction_refs = [item["source_id"] for item in correction_scope["sources"]] if correction_scope else []
                     source_refs = list(dict.fromkeys([*source_refs, *correction_refs]))
+                    if commitment_base is not None:
+                        from .commitment_drafting import commitment_content_source_refs
+                        source_refs = list(dict.fromkeys([*source_refs, *commitment_content_source_refs(commitment_base)]))
                     blocks = [HeadingBlock(text=task.title, level=plan.level + 1,
                                            requirement_refs=task.requirement_refs, source_refs=source_refs)]
                     for paragraph in proposal.paragraphs:
@@ -198,6 +216,9 @@ def build_executor(root: Path, config: dict) -> Executor:
                         result["review"].update(correction_context_requirement_refs=[item["requirement_id"]
                             for item in correction_scope["requirements"]],
                             correction_source_scope_sha256=digest(correction_scope), correction_source_refs=correction_refs)
+                    if commitment_base is not None:
+                        from .commitment_drafting import commitment_review
+                        result["review"]["commitment_drafting"] = commitment_review(commitment_base)
                     return result
 
                 task_output = ctx.run_unit(task.unit_id, task_input, write_task)
@@ -242,7 +263,7 @@ def build_executor(root: Path, config: dict) -> Executor:
                 for issue in prepared.issues:
                     if issue.section_id == plan.section_id:
                         blocks.append(IssueBlock(issue_id=issue.issue_id, requirement_refs=issue.requirement_refs))
-                if not blocks and plan.render_body:
+                if not blocks and plan.render_body and plan.native_format is None:
                     raise PipelineFailure("EMPTY_SECTION")
                 return Section(section_id=plan.section_id, title=plan.title, requirement_refs=plan.requirement_refs,
                                document_role=plan.document_role,
@@ -255,7 +276,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                                   title=f"{prepared.project.name} 投标文件", sections=sections)
         diagnostics = dict(value.get("chain_diagnostics", {}))
         if writing_diagnostic:
-            diagnostics["writing_candidate_import" if writing_import else "writing_replay"] = provider.summary()
+            diagnostics["commitment_partition" if writing_partition else
+                        "writing_candidate_import" if writing_import else "writing_replay"] = provider.summary()
             diagnostics["publication_status"] = "diagnostic_only"
         return {"package": package.model_dump(mode="json"), "source_artifacts": value["source_artifacts"],
                 "input_kind": prepared.input_kind,
@@ -284,6 +306,10 @@ def build_executor(root: Path, config: dict) -> Executor:
         correction_links = validate_correction_links(ctx, value, package)
         from .writing_candidate_import import validate_candidate_import_links
         correction_links.extend(validate_candidate_import_links(ctx, value, package))
+        from .commitment_drafting import validate_commitment_partition_links
+        commitment_links = validate_commitment_partition_links(ctx, value, package)
+        if commitment_links is not None:
+            correction_links.extend(commitment_links["historical_correction_links"])
         section_roles = {item.section_id: item.document_role for item in package.sections}
         expected_roles = value.get("expected_section_document_roles")
         if ((expected_roles is not None and expected_roles != section_roles) or
@@ -354,6 +380,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                   "project_constraint_bindings": expected_project_constraints,
                   "project_constraint_compliance": "requires_source_review" if project_constraints is not None else "not_recorded",
                   "requirement_coverage": []}
+        if commitment_links is not None:
+            checks["commitment_partition"] = commitment_links
         actions_by_requirement = {ref: action for action in package.review_actions for ref in action.requirement_refs}
         nonbody_requirements = {item.requirement_id for item in package.requirements if item.response_mode == "procedure"}
         if value.get("input_kind") == "automatic" and set(actions_by_requirement) != nonbody_requirements:
@@ -416,6 +444,20 @@ def build_executor(root: Path, config: dict) -> Executor:
                                 review_status="not_checked", review_content_status="retained_for_review")
             checks["requirement_coverage"].append(coverage)
         checks["pending_context_review_count"] = len(checks["source_context_review"])
+        if ctx.execution_config.get("source_response_audit", False):
+            if value.get("input_kind") != "automatic":
+                raise PipelineFailure("SOURCE_AUDIT_AUTOMATIC_INPUT_REQUIRED")
+            from .source_response_audit import build_source_response_audit
+            n1 = next(node for node in ctx._state["nodes"] if node["key"] == "N1")
+            frozen_reading = ctx.executor._checkpoint_data(n1)
+            audit = build_source_response_audit(frozen_reading["parsed"], frozen_reading["manifest"],
+                                                package.model_dump(mode="json"))
+            capture = ctx.capture("source-response-audit", audit)
+            checks["source_response_audit"] = {
+                key: audit[key] for key in ("version", "status", "semantic_completeness", "source_unit_count",
+                    "quotation_counts", "requirement_count", "without_destination_count", "audit_sha256",
+                    "reading_unit_count", "reading_counts", "reading_denominator_status")}
+            checks["source_response_audit"].update(capture_status=capture["status"], capture_ref=capture.get("ref"))
         ctx.capture("validation", checks)
         return {**value, "validation": checks}
 
@@ -425,7 +467,19 @@ def build_executor(root: Path, config: dict) -> Executor:
             package_data["style"] = ctx.execution_config["document_style"]
         package = DocumentPackage.model_validate(package_data)
         diagnostic = ctx.artifact_scope == "diagnostic" or diagnostic_artifact(value)
-        rendered = render_package(package, ctx.artifact_dir / "documents", diagnostic=diagnostic)
+        review_mode = ctx.execution_config.get("review_document_mode", "full_trace")
+        rendered = render_package(package, ctx.artifact_dir / "documents", diagnostic=diagnostic,
+                                  review_document_mode=review_mode)
+        review_index = rendered.pop("review_document_index", None)
+        review_capture = review_index_ref = None
+        if review_index is not None:
+            import json
+            # This is the generated checklist's business index, not a prompt or
+            # trace dump. Keep the short-ID mapping even when debug capture is off.
+            review_index_ref = ctx.store_bytes("review-document-index.json",
+                json.dumps(review_index, ensure_ascii=False, sort_keys=True).encode("utf-8"), "application/json")
+            review_capture = ctx.capture("review-document-index", {"index_ref": review_index_ref,
+                                                                   "mode": review_mode})
         files = {}
         for key in ("bid_docx", "issues_docx"):
             path = Path(rendered[key]["path"])
@@ -437,6 +491,9 @@ def build_executor(root: Path, config: dict) -> Executor:
                 "input_kind": value.get("input_kind", "manual_prepared"), "synthetic": package.synthetic,
                 "chain_diagnostics": value.get("chain_diagnostics", {}),
                 "warnings": rendered["warnings"], "issue_ids": rendered["issue_ids"],
+                "review_document_mode": review_mode,
+                "review_document_index": ({"capture_status": review_capture["status"], "ref": review_index_ref}
+                                          if review_capture is not None else None),
                 "review_action_ids": [item.action_id for item in package.review_actions],
                 "source_artifacts": value["source_artifacts"]}
 
@@ -447,12 +504,17 @@ def build_executor(root: Path, config: dict) -> Executor:
                            if config.get("provider", {}).get("mode") == "diagnostic_writing_mixed" else ())
     if config.get("provider", {}).get("mode") == "diagnostic_writing_candidate_import":
         writing_replay_keys = ("writing_candidate_import", "run_purpose", "debug_capture")
+    if config.get("provider", {}).get("mode") == "diagnostic_writing_commitment_partition":
+        writing_replay_keys = ("writing_candidate_import", "commitment_drafting", "run_purpose", "debug_capture")
+    commitment_versions = (("commitment_drafting.py", "commitment_prompt.py", "commitment_planning.py")
+        if config.get("provider", {}).get("mode") == "diagnostic_writing_commitment_partition" else ())
     nodes = [NodeSpec("N0", _version(*shared), freeze, config_keys=()),
-             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py"),
+             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", *commitment_versions),
                       draft, config_keys=("provider",) + writing_replay_keys),
-             NodeSpec("N5", _version(*shared, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py"), check,
-                      config_keys=(("provider",) + writing_replay_keys) if writing_replay_keys else ()),
-             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py"), render, config_keys=("document_style",))]
+             NodeSpec("N5", _version(*shared, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", "source_response_audit.py", *commitment_versions), check,
+                      config_keys=((("provider",) + writing_replay_keys) if writing_replay_keys else ()) + ("source_response_audit",)),
+             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "review_document.py"), render,
+                      config_keys=("document_style", "review_document_mode"))]
     if config.get("pipeline", "prepared") == "automatic":
         from .chain import intake_nodes
         nodes = intake_nodes(root, _version, config) + nodes[1:]

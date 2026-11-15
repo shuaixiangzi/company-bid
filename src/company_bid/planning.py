@@ -31,7 +31,7 @@ from .contract_pending_plan import contract_pending_plan
 from .contract_review_slots import _CONTRACT as _CONTRACT_SOURCE_HEADING
 
 
-PLANNING_VERSION = "bid-plan-v25"
+PLANNING_VERSION = "bid-plan-v26"
 # Preserve the unchanged, independently checkpointed field-mapping request.
 MAPPING_VERSION = "bid-plan-v24"
 
@@ -278,6 +278,47 @@ def _table_mapping(ctx, block: dict, facts: list, sources: dict, source_roles: d
         reasons.append({"unit_id": unit_id, "mapped_cell_count": len(result["fills"])})
     return fills, {"block_id": block["block_id"], "grid_sha256": grid_hash,
                    "blank_anchor_count": len(blank), "filled_count": len(fills), "mapping_units": reasons}
+
+
+def _guard_historical_table_fills(block, blocks, fills, fact_map, manifest):
+    """A generic project identity cannot identify a row of historical work."""
+    rows, _, _ = _raw_grid(block)
+    prior = [b for b in blocks.values() if b["source_id"] == block["source_id"] and
+             b.get("unit_id") == block.get("unit_id") and b.get("page") == block.get("page") and
+             b.get("ordinal", -1) < block.get("ordinal", -1)]
+    caption = max(prior, key=lambda b: b["ordinal"]) if prior else None
+    headers = [_normal(value) for value in rows[0]]
+    columns = [c for c, label in enumerate(rows[0]) if _canonical(label) == _canonical("项目名称")]
+    record_labels = (bool(set(headers) & {"发包人", "建设单位", "业主"}),
+                     bool(set(headers) & {"服务日期", "服务时间", "合同日期"}),
+                     any(re.fullmatch(r"合同(?:额|金额)(?:万元|元)?", value) for value in headers))
+    historical = (caption is not None and caption["kind"] == "paragraph" and
+        caption.get("origin") == block.get("origin") == "native" and
+        re.fullmatch(r"(?:响应人|投标人|供应商|企业)?(?:历史业绩|业绩|已完成项目)(?:统计|一览|汇总|情况)表(?:后附业绩材料)?",
+                     _title_key(caption["text"])) is not None and bool(columns) and sum(record_labels) >= 2)
+    report = {"rule": "source_historical_project_row_v1", "block_id": block["block_id"],
+              "source_id": block["source_id"], "locator": block["locator"],
+              "source_file_sha256": next(s["sha256"] for s in manifest["sources"] if s["source_id"] == block["source_id"]),
+              "source_grid_sha256": _hash(rows), "scope": "historical_performance" if historical else "not_proven_historical",
+              "source_caption": ({**{key: caption[key] for key in
+                  ("block_id", "source_id", "unit_id", "page", "ordinal", "locator", "text")},
+                  "text_sha256": hashlib.sha256(caption["text"].encode()).hexdigest()} if historical else None),
+              "blocked": [], "original_filled_count": len(fills), "retained_filled_count": len(fills)}
+    kept = dict(fills)
+    if historical:
+        for (row, column), fact_id in fills.items():
+            fact = fact_map[fact_id]
+            if row <= 0 or column not in columns or _canonical(fact["label"]) != _canonical("项目名称"):
+                continue
+            # Atomic fact labels have no historical row/tuple binding. Retain
+            # source-printed history, but never turn a current identity (or an
+            # otherwise unbound name) into the first past-performance record.
+            del kept[(row, column)]
+            report["blocked"].append({"row": row, "column": column, "fact": copy.deepcopy(fact),
+                "is_current_project_identity": fact["value"] == manifest["project"]["name"],
+                "reason": "historical_row_requires_explicit_source_bound_record_not_generic_project_identity"})
+    report["retained_filled_count"] = len(kept)
+    return kept, report
 
 
 def _reference(requirement: dict, blocks: dict, units: dict, sources: dict) -> dict | None:
@@ -1140,6 +1181,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         contract_source_review_handling = []
         contract_bindings = contract_pending["bindings"]
         contract_pending_handling = []
+        from .reviewed_source_actions import reviewed_source_actions
+        reviewed_additions, reviewed_source_report = reviewed_source_actions(
+            config.get("reviewed_source_actions"), blocks, documents, planned_requirements)
+        planned_requirements.extend(reviewed_additions)
+        reviewed_actions_by_id = {item["requirement_id"]: item for item in reviewed_source_report["items"]}
+        _capture(ctx, "n3-reviewed-source-actions", reviewed_source_report)
         source_controls = collect_plan_controls(planned_requirements, blocks, units, documents, _native_source_span)
         global_control_ids = {item["requirement_id"] for item in source_controls["global_controls"]}
         global_control_handling = []
@@ -1268,6 +1315,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         prescribed_cover_section_id = None
         table_owners, attachment_owners, section_formats = {}, {}, {}
         placements, table_reports, attachment_reports = [], [], []
+        deferred_table_issues = []
         writing_space_reports = []
         instruction_omissions = []
         factual_response_reports = []
@@ -1355,6 +1403,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             if requirement["requirement_id"] in contract_bindings:
                 action = review_actions[-1]
                 action["instruction"] = "按保留的完整合同原文逐项明确待约定字段及来源回指；甲方信息由甲方确认，未确定值或适用性，不将本记录视为已履行或已满足。"
+            if requirement["requirement_id"] in reviewed_actions_by_id:
+                review_actions[-1]["instruction"] = reviewed_actions_by_id[requirement["requirement_id"]]["instruction"]
 
         def issue(section, refs, title, reason, action):
             value = {"issue_id": f"M-{len(issues) + 1:03d}", "title": title, "section_id": section["section_id"],
@@ -1369,6 +1419,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                               bool(_CURRENT_ELIGIBILITY_STATUS.search(detail["text"])))
             decisions = []
             for label in labels:
+                if (_normal(label) == "乙方名称" and re.search(r"[（(]\s*乙方名称\s*[）)]", detail["text"])):
+                    decisions.append({"label": label, "candidate_fact_ids": [], "adopted_fact_ids": [],
+                        "status": "known_company_pending_manual_entry", "available_company": copy.deepcopy(manifest["company"])})
+                    issue(section, [rid], label + "待补", "原合同字段尚未填写，已有公司名称可供填写。",
+                          "在原合同“（乙方名称）”字段线下填写“" + manifest["company"]["name"] + "”。")
+                    continue
                 matches = _label_facts(label, facts, source_map, manifest.get("source_roles", {}),
                                        require_project_input=current_status)
                 decisions.append({"label": label,
@@ -1473,7 +1529,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                     table_owners[block_id] = section["section_id"]
                     rows, merges, covered = _raw_grid(block)
                     fills, report = _table_mapping(ctx, block, facts, source_map, manifest.get("source_roles", {}), call_json, config)
+                    fills, guard = _guard_historical_table_fills(block, blocks, fills, fact_map, manifest)
+                    report.update(filled_count=len(fills), context_guard=guard)
                     table_reports.append(report)
+                    blocked = {(item["row"], item["column"]): item for item in guard["blocked"]}
                     table_id = _id("TABLE-", [block["source_id"], block_id])
                     cells = [[{"text": text, "fact_refs": [], "issue_refs": []} for text in row] for row in rows]
                     for r, row in enumerate(rows):
@@ -1483,6 +1542,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                             if (r, c) in fills:
                                 fact = fact_map[fills[(r, c)]]
                                 cells[r][c] = {"text": fact["value"], "fact_refs": [fact["fact_id"]], "issue_refs": []}
+                            elif (r, c) in blocked:
+                                deferred_table_issues.append({"table_id": table_id, "row": r, "column": c,
+                                    "requirement_refs": refs, "guard": blocked[(r, c)]})
                             elif whole_cell_slot(text) or has_fill_marker(text):
                                 marker_id = issue(section, refs, f"{chapter['title']}原表第{r + 1}行第{c + 1}列待填写",
                                                   "原表空白格无唯一、允许使用的明确事实值。", "补充本项目明确输入；保持原表标签、单位和行列结构。")
@@ -1906,26 +1968,80 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                 "document_role": section.get("document_role", "response")}
                 for section in sections for rid in section["requirement_refs"]]
             _capture(ctx, "n3-response-organization", response_organization)
+        # Append new context-guard markers after the existing list so retained
+        # M numbers and unrelated review links do not shift in a child run.
+        for pending in deferred_table_issues:
+            table = next(t for t in tables if t["table_id"] == pending["table_id"])
+            section = next(s for s in sections if s["section_id"] == table["section_id"])
+            marker = issue(section, pending["requirement_refs"], "历史业绩项目名称待填写",
+                "原表要求填写历史业绩项目；当前投标项目名称不能作为历史业绩，尚无与本行完整对应的明确历史记录。",
+                "依据本行业绩证明填写对应历史项目名称及其余记录字段；无明确对应资料时保留待补。")
+            table["rows"][pending["row"]][pending["column"]]["issue_refs"] = [marker]
+            pending["guard"]["issue_id"] = marker
+        _capture(ctx, "n3-table-context-guard", {"tables": [report["context_guard"] for report in table_reports],
+            "n2_candidate_mutation": False, "mapping_requests_unchanged": True,
+            "historical_tuple_adoption": "not_supported_by_generic_fact_label_mapping"})
         native_formats = {}
         if config.get("native_response_formats", False):
+            # Paragraph identity fills are separate from the already-frozen
+            # table mapping requests. Do not expand unrelated model inputs.
+            from .project_identity import derive_project_number
+            identity_facts, identity_report = derive_project_number(parsed, manifest, facts, scoped_source)
+            facts.extend(identity_facts)
+            _capture(ctx, "n3-project-identity", identity_report)
             from .source_format import recover_source_formats
             native_formats = recover_source_formats(ctx, sections, planned_formats, blocks, source_map, tables, facts, manifest, scoped_source)
+        output_values = {"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
+                    "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
+                    "requirements": requirements, "attachments": attachments, "issues": issues,
+                    "source_context_proofs": list(source_context_proofs.values()),
+                    "review_actions": review_actions, "prescribed_cover_section_id": prescribed_cover_section_id,
+                    "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
+                    "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}
+        commitment_plan = {"status": "disabled", "tasks": [], "issue_changes": []}
+        if config.get("draft_source_commitments", False):
+            from .commitment_planning import plan_commitment_tasks, commitment_nonwriting_heading_refs
+            tasks = plan_commitment_tasks(output_values)
+            nonwriting_headings = commitment_nonwriting_heading_refs(output_values)
+            commitment_plan["status"] = "planned_pending_company_confirmation" if tasks else "no_matching_source_formats"
+            for section in sections:
+                task = tasks.get(section["section_id"])
+                if task is None:
+                    continue
+                section["kind"] = "technical"
+                section["writing_tasks"] = [task.model_dump(mode="json")]
+                section["requirement_refs"] = list(dict.fromkeys([*section["requirement_refs"], *task.requirement_refs]))
+                section["nonwriting_requirement_refs"] = list(dict.fromkeys([
+                    *section["nonwriting_requirement_refs"], *nonwriting_headings.get(section["section_id"], [])]))
+                section["source_refs"] = list(dict.fromkeys([*section["source_refs"],
+                    *(ref for item in requirements if item["requirement_id"] in task.requirement_refs for ref in item["source_refs"])]))
+                commitment_plan["tasks"].append({"section_id": section["section_id"], "unit_id": task.unit_id,
+                    "task_sha256": _hash(task.model_dump(mode="json")), "requirement_refs": task.requirement_refs,
+                    "company_confirmation": "pending", "satisfaction_status": "not_determined"})
+                for item in issues:
+                    if item["section_id"] != section["section_id"] or item["title"] != "本章节完整响应正文待补":
+                        continue
+                    before = copy.deepcopy(item)
+                    item.update(title="拟承诺待公司确认并签章", severity="warning",
+                        reason="本章已安排依据招标原文起草独立拟承诺；草稿仍不代表公司已经确认或完成签章。",
+                        action="核对本章拟承诺与完整招标条款、原合同留空范围及实际履约安排，确认后填写授权人和日期并签章。")
+                    commitment_plan["issue_changes"].append({"before": before, "after": copy.deepcopy(item)})
         project_constraints = plan_project_constraints(parsed, planned_requirements, manifest, sections)
+        if config.get("draft_source_commitments", False):
+            final_tasks = {task["unit_id"]: task for section in sections for task in section["writing_tasks"]}
+            for row in commitment_plan["tasks"]:
+                row["task_sha256"] = _hash(final_tasks[row["unit_id"]])
+            _capture(ctx, "n3-commitment-writing-plan", commitment_plan)
         _capture(ctx, "n3-project-constraints", project_constraints)
         _capture(ctx, "n3-outline-grouping", {"producer_version": PLANNING_VERSION,
             "placements": outline_groups, "writing_controls": writing_control_handling,
             "n2_candidate_mutation": False, "satisfaction_status": "not_determined"})
-        output = PreparedBid.model_validate({"input_kind": "automatic", "synthetic": manifest.get("synthetic", False),
-                    "project": manifest["project"], "company": manifest["company"], "sources": sources, "facts": facts,
-                    "requirements": requirements, "attachments": attachments, "issues": issues,
-                    "source_context_proofs": list(source_context_proofs.values()),
-                    "review_actions": review_actions,
-                    "prescribed_cover_section_id": prescribed_cover_section_id,
-                    "reference_excerpts": references, "style": manifest.get("style", {}), "sections": sections, "tables": tables,
-                    "preparation_note": manifest.get("preparation_note") or "系统依据冻结招标原文及固定公司资料自动编排；缺项按编号保留。"}).model_dump(mode="json")
+        output = PreparedBid.model_validate(output_values).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
                   "writing_refinement": writing_refinement, "response_organization": response_organization,
                   "native_response_formats": native_formats,
+                  "commitment_writing_plan": commitment_plan,
+                  "reviewed_source_actions": reviewed_source_report,
                   "material_matching": material_report,
                   "outline_grouping": outline_groups, "response_writing_controls": writing_control_handling,
                   "source_format_derivations": source_format_derivations,

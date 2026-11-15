@@ -37,6 +37,20 @@ def _underlined_run(paragraph, text, width, family, size, bold):
         pad._r.get_or_add_rPr().append(spacing)
 
 
+def _fills_blank_rule_right_edge(binding, line, element, index):
+    """An insertion at a proved blank's end belongs inside that source rule."""
+    member = element.fixed_indices.index(index)
+    member_ids = getattr(element, "source_block_ids", ())
+    source_texts = getattr(element, "source_texts", ())
+    return (member < len(member_ids) and member < len(source_texts) and
+            binding.source_block_id == member_ids[member] and
+            binding.before_text == source_texts[member] and
+            getattr(line, "basis", "native_vector_rule") == "native_vector_rule" and
+            (binding.source_rule is None or binding.source_rule == line) and
+            binding.start == binding.end == line.end and line.start < line.end and
+            not binding.before_text[line.start:line.end].strip(" \t"))
+
+
 def _native_paragraph(document, section, element, gap, *, paragraph=None):
     from .rendering import _font, _indent
     if paragraph is None:
@@ -86,6 +100,11 @@ def _native_paragraph(document, section, element, gap, *, paragraph=None):
                     # A leading identity is inserted into its own measured
                     # rule, even when that rule also underlines the caption.
                     end += len(binding.replacement)
+                elif _fills_blank_rule_right_edge(binding, line, element, index):
+                    # PDF glyph extraction can place the insertion just after
+                    # the measured blank. Consume that same editable rule;
+                    # do not print an empty stroke before the known value.
+                    end += len(binding.replacement)
                 elif start == end == binding.start == binding.end:
                     end = start + len(binding.replacement)
                 else:
@@ -118,21 +137,27 @@ def _same_baseline(previous, following):
             min(previous.bbox[3], following.bbox[3]) > max(previous.bbox[1], following.bbox[1]))
 
 
-def render_native_section(document, package, section):
+def render_native_section(document, package, section, *, cover=False, append=False, previous_source_bottom=None):
     from .rendering import _font, _geometry, _indent, _issue_text, _page_furniture, _plain, _render_table
     layout = section.native_format
     page = document.sections[-1]
     page.page_width, page.page_height = Pt(layout.page_width_pt), Pt(layout.page_height_pt)
     page.left_margin = page.right_margin = Pt(0)
-    page.top_margin = Pt(max(0., layout.heading_bbox[1] - 2))
+    scopes = getattr(layout, "page_scopes", ())
+    partial = bool(scopes and scopes[0].scope_kind == "partial_page")
+    if not append:
+        page.top_margin = Pt(70 if partial else max(0., layout.heading_bbox[1] - 2))
     page.bottom_margin = Pt(36)
-    _page_furniture(page, package.style, numbered=True)
-    heading = document.add_paragraph(layout.heading_text, f"Heading {section.level}")
+    if not append:
+        _page_furniture(page, package.style, numbered=True, start=1 if cover else None)
+    heading = document.add_paragraph(layout.heading_text, "Title" if cover else f"Heading {section.level}")
     heading.alignment = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER,
                          "right": WD_ALIGN_PARAGRAPH.RIGHT}[layout.heading_alignment]
     pf = heading.paragraph_format
     _indent(heading._p, 0, layout.heading_font_size_pt)
-    pf.space_before = pf.space_after = Pt(0)
+    pf.space_before = Pt(max(0., layout.heading_bbox[1] - previous_source_bottom)) if append and previous_source_bottom is not None else Pt(0)
+    pf.space_after = Pt(0)
+    pf.keep_with_next = False
     pf.first_line_indent = pf.left_indent = pf.right_indent = Pt(0)
     if layout.heading_alignment == "left":
         pf.left_indent = Pt(layout.heading_bbox[0])
@@ -143,7 +168,19 @@ def render_native_section(document, package, section):
     cursor = layout.heading_bbox[1] + layout.heading_font_size_pt * 1.25
     issues = {i.issue_id: i for i in package.issues}
     previous, paragraph = None, None
+    physical_page = layout.physical_page
     for element in layout.elements:
+        element_page = getattr(element, "physical_page", layout.physical_page)
+        if element_page != physical_page:
+            from docx.enum.section import WD_SECTION_START
+            scope = next(s for s in scopes if s.physical_page == element_page)
+            page = document.add_section(WD_SECTION_START.NEW_PAGE)
+            page.page_width, page.page_height = Pt(scope.page_width_pt), Pt(scope.page_height_pt)
+            page.left_margin = page.right_margin = Pt(0)
+            page.top_margin = Pt(max(0., scope.scope_bbox[1] - 2))
+            page.bottom_margin = Pt(36)
+            _page_furniture(page, package.style, numbered=True)
+            physical_page, cursor, previous, paragraph = element_page, scope.scope_bbox[1], None, None
         gap = max(0., element.bbox[1] - cursor)
         if element.kind == "paragraph":
             inline = _same_baseline(previous, element)
