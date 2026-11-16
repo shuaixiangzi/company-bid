@@ -72,7 +72,10 @@ def main(argv=None):
             target = args.root / "diagnostics" / f"{args.run_id}-{uuid.uuid4().hex}.json"
             atomic_json(target, report)
             print(json.dumps({"diagnostics": str(target.resolve()), "evidence_status": report["evidence_status"],
-                              "gap_count": len(report["gaps"]), "actual_call_attempts": report["actual_call_attempts"]}))
+                              "gap_count": len(report["gaps"]), "actual_call_attempts": report["actual_call_attempts"],
+                              "actual_local_ocr_attempts": report["actual_local_ocr_attempts"],
+                              "local_ocr_completed_attempts": report["local_ocr_completed_attempts"],
+                              "local_ocr_failed_attempts": report["local_ocr_failed_attempts"]}))
             return 0
         if args.credential_file:
             auth_env = config.get("provider", {}).get("auth_env", "COMPANY_BID_API_KEY")

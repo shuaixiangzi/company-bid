@@ -340,7 +340,10 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         gaps.append({"code": "EXECUTION_OPEN_TRACE_MAY_BE_PARTIAL"})
     if state["observability"].get("trace_status") in ("partial", "write_failed"):
         gaps.append({"code": "RUN_TRACE_INCOMPLETE", "status": state["observability"]["trace_status"]})
+    from .material_ocr_diagnostics import index_local_ocr
+    local_ocr = index_local_ocr(state, events, spans, artifact_json=artifact_json, ref=ref, gap=gap)
     return {"schema_version": "chain.diagnostic-index.v1", "run_id": run_id, "run_status": state["status"],
+            **local_ocr,
             "parent_run_id": state.get("parent_run_id"), "fork_from_node": state.get("fork_from_node"),
             "observability": state["observability"], "capture_policy": state["capture_policy"],
             "evidence_status": "incomplete" if gaps else "metadata_only_capture_disabled" if not state["capture_policy"] else

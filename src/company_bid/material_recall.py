@@ -23,6 +23,7 @@ class RecallOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool = False
     read_selected_originals: bool = False
+    original_ocr: dict | None = None
     max_queries: int = Field(default=12, ge=1, le=32)
     requirement_ids: list[str] | None = None
     provider: dict = Field(default_factory=dict)
@@ -51,6 +52,8 @@ def plan_recall_scope(requirements: list, report: dict, settings: dict, handled_
         options = RecallOptions.model_validate(settings)
     except ValidationError:
         raise ProviderFailure("SEMANTIC_PLANNING_CONFIG_INVALID") from None
+    if options.original_ocr is not None and not options.read_selected_originals:
+        raise ProviderFailure("MATERIAL_OCR_SELECTED_ORIGINALS_REQUIRED")
     reqs = {r["requirement_id"]: r for r in requirements}
     if len(reqs) != len(requirements):
         raise ProviderFailure("SEMANTIC_REQUIREMENT_ID_DUPLICATE")
@@ -227,7 +230,13 @@ def annotate_material_issues(issues: list, report: dict) -> list:
             missing_scope = f"，另{unbound}组范围未绑定" if unbound else ""
             empty = coverage["status_counts"].get("empty", 0)
             empty_scope = f"，{empty}项读取后无文字" if empty else ""
-            additions.append(f"原件读取：目录索引内所选{count}页/图，{read}项读取完整，{unread}项未读全或不支持读取{empty_scope}{missing_scope}；正文读取不等于资格核验。")
+            if "ocr_processed_unit_count" in coverage:
+                transcribed = coverage["ocr_transcribed_unverified_count"]
+                pending = coverage["pending_ocr_unit_count"]
+                crops = coverage["ocr_transcribed_crop_count"]
+                additions.append(f"原件读取：目录索引内全部所选{count}页/图，{transcribed}项已有本地OCR转录文字（含{crops}项裁剪区域），{pending}项仍未取得可用识别文字；字段准确性、手写内容和表格关系待核。机器转录不等于原件完整读取或资格核验。")
+            else:
+                additions.append(f"原件读取：目录索引内所选{count}页/图，{read}项读取完整，{unread}项未读全或不支持读取{empty_scope}{missing_scope}；正文读取不等于资格核验。")
             for context in contexts:
                 query = queries.get(context["requirement_id"], {})
                 context["current_content_matching"] = {

@@ -43,6 +43,8 @@
 
 在 2～3 人场景下，业务节点和外部调用按 100% 记录设计，控制单条属性长度与事件数量，不把正文塞进 span。基础环境提供本地持久 span 记录及可重试导出；调试部署提供 Jaeger 单节点查看端，采用持久卷而非内存模式。Badger 是 Jaeger 的嵌入式持久后端，适合单节点、有限数据量，具体版本和保留配置在实现时验证并锁定。[Jaeger Badger 文档](https://www.jaegertracing.io/docs/2.23/storage/badger/)
 
+本地 Windows OCR 另用 `ocr.local.preflight` / `ocr.local.call` span 及 `ocr.local.started/completed/failed` 事件；预检失败单列，不能记为图像识别调用。`diagnose` 的 `local_ocr_calls` 将每次识别的节点/单元/attempt、输入/原始响应/校验输出 hash、选区身份、耗时、错误及确切 trace/span 关联成可检索索引；完整识别文字、坐标、原图路径和进程错误只在受控 capture。损坏引用、hash 不符、缺少终态或 span 要形成诊断缺口。模型 `actual_call_attempts` 和费用账本保持独立，本地无 API 调用费不等于没有机器资源消耗。继承 N3 的后续 run 显示本次本地调用 0，并列出原节点产物及来源 run；不能把复用的 95 个单元重复计成 95 次新调用。
+
 Jaeger 使用 all-in-one 配置，使采集和查询访问同一嵌入式存储；不把两个独立容器分别指向同一个 Badger 目录。
 
 不为首版搭建 Kafka、Elasticsearch 或独立可观测集群。Jaeger 停机不影响 checkpoint 和恢复，诊断页显示 trace 导出缺口；导出恢复后能补传本地已保存记录。持久 span 格式使用明确的标准映射，不另造第二套业务事件模型。

@@ -7,6 +7,7 @@ person to the current project.  The caller still validates source artifacts.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from collections import Counter
@@ -353,7 +354,7 @@ def _proof_groups(attachments: list[dict], records: list[dict], sources: list[di
     return output
 
 
-def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
+def _scope_group_read_text(group: dict, parsed: dict | None, selection_sha256: str | None = None) -> None:
     """Read only the selected original PDF pages or DOCX image/OCR descendants.
 
     A historical bid's nearby paragraphs, tables and other images never become
@@ -401,16 +402,22 @@ def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
                 partial_native = (indexed and origin.get("format") == "pdf_pages" and
                                   unit.get("coverage", {}).get("status") == "needs_ocr" and
                                   unit.get("material_content_native_readable") is True)
+                partial_ocr = (indexed and unit.get("coverage", {}).get("status") == "needs_ocr" and
+                               unit.get("material_content_ocr_candidate_readable") is True and
+                               unit.get("transcription_status") == "ocr_transcribed_unverified" and
+                               selection_sha256 is not None and
+                               parsed.get("group_selection_sha256s", {}).get(group['group_id']) == selection_sha256)
                 if not complete:
                     unread.update(keys)
-                    if not partial_native:
+                    if not partial_native and not partial_ocr:
                         continue
                 else:
                     observed.update(keys)
                 for block in selected:
                     if block.get("source_id") != origin["source_id"]:
                         continue
-                    if partial_native and block.get("origin", "native") != "native":
+                    machine_text = not complete and partial_ocr and block.get('origin') == 'ocr'
+                    if not complete and not (machine_text or partial_native and block.get('origin', 'native') == 'native'):
                         continue
                     text = "\n".join([block.get("text", ""), *[" | ".join(row) for row in block.get("rows", [])]]).strip()
                     if not text:
@@ -422,16 +429,21 @@ def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
                                  "unit_id": unit.get("unit_id"), "block_id": block.get("block_id"),
                                  "locator": block.get("locator"), "page": unit.get("page"),
                                  "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                                 **({"content_coverage": "partial_native_page_needs_ocr"} if partial_native else {}),
+                                 **({"content_coverage": "partial_native_page_needs_ocr"} if partial_native and not machine_text else {}),
+                                 **({"content_coverage": "ocr_transcribed_unverified", "candidate_only": True} if machine_text else {}),
                                  "hits": hits, "role_exclusions": _role_exclusions(text)})
     group["read_text_basis"] = rows
     group["read_scope_status"] = ("not_supplied" if parsed is None else "unbound" if not origin or not group["source_bound"]
                                   else "read" if expected and expected <= observed and not unread else "unread_or_incomplete")
     group["read_scope_unread_count"] = len((expected - observed) | unread)
-    body_exclusions = list(dict.fromkeys(reason for row in rows for reason in row["role_exclusions"]))
+    authoritative_rows = [row for row in rows if not row.get("candidate_only")]
+    machine_rows = [copy.deepcopy(row) for row in rows if row.get("candidate_only")]
+    if machine_rows:
+        group["machine_findings_pending_review"] = machine_rows
+    body_exclusions = list(dict.fromkeys(reason for row in authoritative_rows for reason in row["role_exclusions"]))
     # A maintained label may be assembled as a candidate with unknown fields.
     # Explicit contrary read evidence must still prevent assembly.
-    body_kinds = {hit["proof_kind"] for row in rows for hit in row["hits"]}
+    body_kinds = {hit["proof_kind"] for row in authoritative_rows for hit in row["hits"]}
     if group["proof_kind"] in set(_TERMS.values()) and body_kinds and group["proof_kind"] not in body_kinds:
         body_exclusions.append("conflicting_read_document_type")
     if body_exclusions:
@@ -694,8 +706,14 @@ def material_candidate_report(requirements: list[dict], records: list[dict], *,
     if attachments is None and sources is None and parsed is None and evidence_selections is None and proof_derivations is None:
         return report
     groups = _proof_groups(attachments or [], records, sources, evidence_selections, proof_derivations)
+    selected_hashes = {}
+    if parsed and parsed.get('schema_version') == 'material.content.parsed.v1':
+        from .evidence import EvidenceSelection
+        from .storage import digest
+        selected_hashes = {s['selection_id']: digest(EvidenceSelection.model_validate(s).model_dump(mode='json'))
+                           for s in evidence_selections or []}
     for group in groups:
-        _scope_group_read_text(group, parsed)
+        _scope_group_read_text(group, parsed, selected_hashes.get((group.get('origin') or {}).get('selection_id')))
     reading = _reading_scope(parsed)
     proof_queries = []
     assembly = []

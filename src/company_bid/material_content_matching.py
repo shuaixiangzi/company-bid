@@ -10,10 +10,13 @@ from .storage import digest
 CONTENT_MATCHING_VERSION = "material-content-matching.v1"
 
 
-def integrate_original_content(ctx, requirements, manifest, parsed, catalog_report):
+def integrate_original_content(ctx, requirements, manifest, parsed, catalog_report, ocr_options=None):
     from .material_content_index import build_material_content_index
 
     index = build_material_content_index(ctx, manifest, parsed)
+    if ocr_options is not None:
+        from .material_ocr_index import transcribe_selected_index
+        index = transcribe_selected_index(ctx, manifest, index, ocr_options)
     scope = {"attachments": manifest.get("attachments", []), "sources": manifest["sources"],
              "evidence_selections": manifest.get("evidence_selections"),
              "proof_derivations": manifest.get("proof_derivations", []), "parsed": index["parsed"]}
@@ -75,6 +78,13 @@ def integrate_original_content(ctx, requirements, manifest, parsed, catalog_repo
         semantic["counts"]["blocked_candidates"] = sum(c["decision"] == "blocked_candidate" for r in semantic["queries"] for c in r["candidates"])
         report["semantic_recall"] = semantic
     report["original_content_index"] = {key: value for key, value in index.items() if key != "parsed"}
+    if ocr_options is not None:
+        # Unverified machine text may find candidates, never authorize new attachments.
+        prior = {(a['requirement_id'], a['group_id']) for a in catalog_report['assembly_candidates']}
+        withheld = [a for a in report['assembly_candidates'] if (a['requirement_id'], a['group_id']) not in prior]
+        report['assembly_candidates'] = [a for a in report['assembly_candidates'] if (a['requirement_id'], a['group_id']) in prior]
+        report['ocr_candidate_assembly_guard'] = {'automatic_adoption': False, 'withheld_candidates': withheld,
+                                               'catalog_decision_count': len(prior)}
     report["original_content_index"]["catalog_stage_report_sha256"] = digest(catalog_report)
     report["original_content_index"]["indexed_parsed_sha256"] = digest(index["parsed"])
     report["report_scope"] = "selected_original_text_matching_with_prior_catalog_recall"

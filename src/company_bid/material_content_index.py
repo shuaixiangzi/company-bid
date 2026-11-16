@@ -138,6 +138,8 @@ def build_material_content_index(ctx, manifest: dict, parsed: dict) -> dict:
                            manifest.get("sources"), manifest.get("evidence_selections"),
                            manifest.get("proof_derivations"))
     bindings = [group_content_binding(group) for group in groups]
+    selection_hashes = {group['group_id']: digest(selections[group['origin']['selection_id']])
+                        for group in groups if (group.get('origin') or {}).get('selection_id') in selections}
     tasks, group_rows = {}, []
     for group, binding in zip(groups, bindings, strict=True):
         origin = group.get("origin") or {}
@@ -150,9 +152,11 @@ def build_material_content_index(ctx, manifest: dict, parsed: dict) -> dict:
             continue
         for target in targets:
             key = (origin["source_id"], origin["source_sha256"], origin["format"], target,
-                   digest(selection.get("crop_box_normalized")))
+                   digest(selection.get("crop_box_normalized")), selection.get("rotate_clockwise", 0),
+                   selection.get("render_dpi", 160))
             task = tasks.setdefault(key, {"source_id": key[0], "source_sha256": key[1], "format": key[2],
                                          "target": target, "crop_box_normalized": selection.get("crop_box_normalized"),
+                                         "rotate_clockwise": key[5], "render_dpi": key[6],
                                          "group_bindings": [], "rows": []})
             task["group_bindings"].append(binding)
             task["rows"].append(row)
@@ -186,6 +190,7 @@ def build_material_content_index(ctx, manifest: dict, parsed: dict) -> dict:
         input_data = {"version": MATERIAL_CONTENT_INDEX_VERSION, "reader_version": READER_VERSION,
                       "source": source, "target": target, "format": fmt,
                       "group_bindings": task["group_bindings"], "crop_box_normalized": task["crop_box_normalized"],
+                      "rotate_clockwise": task["rotate_clockwise"], "render_dpi": task["render_dpi"],
                       "existing_selected_unit_sha256": digest(existing) if existing else None,
                       "image_sha256": image_hash, "reading_config": config.model_dump(mode="json"),
                       "ocr_allowed": False}
@@ -229,7 +234,7 @@ def build_material_content_index(ctx, manifest: dict, parsed: dict) -> dict:
             return result
 
         unit_id = "material-content-" + digest([task["source_id"], task["source_sha256"], fmt, target,
-                                               task["crop_box_normalized"]])[:24]
+                                               task["crop_box_normalized"], task["rotate_clockwise"], task["render_dpi"]])[:24]
         result = ctx.run_unit(unit_id, input_data, read_one)
         _require(result.get("input_sha256") == digest(input_data) and
                  result.get("group_bindings") == task["group_bindings"] and
@@ -269,6 +274,7 @@ def build_material_content_index(ctx, manifest: dict, parsed: dict) -> dict:
                 "unbound_group_count": sum(r["status"] == "unbound_or_unsupported_scope" for r in group_rows),
                 "whole_company_search_completed": False, "ocr_calls": 0, "model_calls": 0}
     projection = {"schema_version": MATERIAL_CONTENT_PARSED_SCHEMA, "producer_version": MATERIAL_CONTENT_INDEX_VERSION,
+                  "group_selection_sha256s": selection_hashes,
                   "group_bindings": bindings, "documents": list(documents.values()), "coverage": coverage}
     output = {"schema_version": "material.content.index.v1", "producer_version": MATERIAL_CONTENT_INDEX_VERSION,
               "input_manifest_sha256": digest(manifest), "input_parsed_sha256": digest(parsed),
