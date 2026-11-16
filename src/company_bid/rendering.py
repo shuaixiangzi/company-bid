@@ -170,7 +170,6 @@ def _base_document(package, title):
             paragraph_style.font.bold = True
             if name == "Heading 1":
                 formatting.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            formatting.space_before = formatting.space_after = Pt(6)
         for border in list(paragraph_style._element.xpath("./w:pPr/w:pBdr")):
             border.getparent().remove(border)
     content_width = document.sections[0].page_width.cm - 2 * style.margin_cm
@@ -449,13 +448,12 @@ def _render_section_content(document, package, section, *, seen_attachment_group
         if isinstance(block, HeadingBlock):
             document.add_paragraph(block.text, f"Heading {block.level}")
         elif isinstance(block, ParagraphBlock):
-            if block.content_role == "proposal":
-                document.add_paragraph(block.text)
-            else:
-                _plain(document, block.text, style)
+            # Content provenance does not change the house body indentation.
+            # Prescribed source geometry is rendered separately before this path.
+            document.add_paragraph(block.text)
         elif isinstance(block, ListBlock):
             for index, item in enumerate(block.items, 1):
-                _plain(document, f"（{index}）{item}" if block.ordered else f"• {item}", style)
+                document.add_paragraph(f"（{index}）{item}" if block.ordered else f"• {item}")
         elif isinstance(block, TableBlock):
             _render_table(document, block.table, issues, style, show_title=block.table.title != section.title)
         elif isinstance(block, IssueBlock):

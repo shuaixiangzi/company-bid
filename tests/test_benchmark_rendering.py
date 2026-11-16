@@ -3,7 +3,7 @@ from docx import Document
 from docx.oxml.ns import qn
 from PIL import Image
 
-from company_bid.models import DocumentPackage, HeadingBlock, file_sha256
+from company_bid.models import DocumentPackage, HeadingBlock, ParagraphBlock, file_sha256
 from company_bid.rendering import render_package
 from company_bid.sample import create_synthetic_sample
 from test_rendering import package_for
@@ -55,6 +55,43 @@ def test_style_profile_controls_geometry_typography_and_cjk_defaults(tmp_path):
         assert all(fonts.get(qn(f"w:{tag}")) == "仿宋" for tag in ["ascii", "hAnsi", "eastAsia", "cs"])
         assert not any(fonts.get(qn(f"w:{tag}")) for tag in ["asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"])
         assert r_pr.find(qn("w:szCs")).get(qn("w:val")) == str(size)
+
+
+def test_company_default_typography_applies_to_headings_body_and_tables(tmp_path):
+    data = package(tmp_path).model_dump()
+    for role in ("fact", "neutral"):
+        data["sections"][1]["blocks"].append(
+            ParagraphBlock(text=f"{role} 正文样式检查", content_role=role,
+                           fact_refs=[data["facts"][0]["fact_id"]] if role == "fact" else []).model_dump())
+    result = render_package(DocumentPackage.model_validate(data), tmp_path / "out")
+    doc = Document(result["bid_docx"]["path"])
+    for name, size, chars in (("Heading 1", 16, "0"), ("Heading 2", 15, "0"),
+                              ("Heading 3", 14, "0"), ("Normal", 12, "200")):
+        style = doc.styles[name]
+        assert style.font.size.pt == size
+        assert style._element.get_or_add_rPr().get_or_add_rFonts().get(qn("w:eastAsia")) == "宋体"
+        pf = style.paragraph_format
+        assert pf.space_before.pt == pf.space_after.pt == 0
+        assert pf.line_spacing == 1.5
+        indent = style._element.xpath("./w:pPr/w:ind")[0]
+        assert indent.get(qn("w:firstLineChars")) == chars
+        assert indent.get(qn("w:left")) == indent.get(qn("w:right")) == "0"
+    body = [p for p in doc.paragraphs if p.text.startswith(("拟在现场", "（1）", "fact 正文", "neutral 正文"))]
+    assert len(body) == 4
+    for paragraph in body:
+        assert paragraph.style.name == "Normal"
+        assert not paragraph._p.xpath("./w:pPr/w:ind")  # Inherit the two-character body indent.
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    pf = paragraph.paragraph_format
+                    assert pf.space_before.pt == pf.space_after.pt == 0
+                    assert pf.line_spacing == 1.5
+                    indent = paragraph._p.xpath("./w:pPr/w:ind")[0]
+                    assert indent.get(qn("w:firstLineChars")) == "0"
+                    assert indent.get(qn("w:left")) == indent.get(qn("w:right")) == "0"
+                    assert all(run.font.size.pt == 10.5 and run.font.name == "宋体" for run in paragraph.runs)
 
 
 def test_explicit_heading_levels_and_page_breaks_follow_plan(tmp_path):
