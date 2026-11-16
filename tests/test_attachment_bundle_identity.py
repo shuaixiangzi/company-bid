@@ -23,7 +23,7 @@ class Context:
 
 def prepare(tmp_path, candidates):
     tender = tmp_path / "tender.docx"
-    document = Document(); document.add_paragraph("Provide LICENSE copy."); document.save(tender)
+    document = Document(); document.add_paragraph("须提供营业执照复印件。"); document.save(tender)
     proof = tmp_path / "source-proof.png"; Image.new("RGB", (90, 120), "red").save(proof)
     def source(identity, path, kind):
         return {"source_id": identity, "title": "Synthetic", "path": str(path), "sha256": file_sha256(path),
@@ -37,6 +37,9 @@ def prepare(tmp_path, candidates):
         "sources": [source("T", tender, "tender"), source("P", proof, "company_material")],
         "source_roles": {"T": "tender", "P": "provenance_only"}, "attachments": attachments,
         "synthetic": True, "preparation_note": "Synthetic grouping test, not a real qualification."}).model_dump(mode="json")
+    # These synthetic attachments are directly frozen source images, not
+    # page selections from another original document.
+    manifest.pop("evidence_selections", None)
     ctx = Context()
     parsed = read_documents(ctx, [{**manifest["sources"][0], "role": "tender"}], {})
     def extract(ctx, task_type, unit_id, payload, validate):
@@ -44,7 +47,7 @@ def prepare(tmp_path, candidates):
         return validate({"window_id": payload["window"]["window_id"], "processing_declaration": "processed_not_semantically_accepted", "unresolved_block_ids": [],
             "requirements": [{"citation": {key: block[key] for key in ("source_id", "block_id", "locator")},
                               "category": "qualification", "response_mode": "attachment", "format_status": "not_prescribed",
-                              "attachment_keywords": ["LICENSE"]}], "format_chapters": [], "format_status": "none_verified"})
+                              "attachment_keywords": ["营业执照"]}], "format_chapters": [], "format_status": "none_verified"})
     extracted = extract_requirements(ctx, parsed, manifest, extract, {})
     def no_mapping(*args):
         pytest.fail("Attachment grouping cannot invoke a model")
@@ -52,12 +55,12 @@ def prepare(tmp_path, candidates):
     return output, ctx.captures["n3-planning-report"]["attachments"][0]
 
 
-def bundle(identity="B", title="LICENSE copy"):
+def bundle(identity="B", title="营业执照复印件"):
     return [(f"{identity}-P{page}", title, {"bundle_id": identity, "page_index": page, "page_count": 2}) for page in (2, 1)]
 
 
 def test_single_attachment_identity_equal_to_bundle_identity_is_ambiguous(tmp_path):
-    output, report = prepare(tmp_path, [("B", "LICENSE copy", {}), *bundle()])
+    output, report = prepare(tmp_path, [("B", "营业执照复印件", {}), *bundle()])
     assert output["attachments"] == [] and len(output["issues"]) == 1
     assert report["status"] == "ambiguous"
     assert report["candidate_groups"] == [{"kind": "bundle", "identity": "B"}, {"kind": "single", "identity": "B"}]
@@ -65,10 +68,10 @@ def test_single_attachment_identity_equal_to_bundle_identity_is_ambiguous(tmp_pa
 
 @pytest.mark.parametrize("matched_kind", ["single", "bundle"])
 def test_selected_group_does_not_pull_unmatched_same_string_group(tmp_path, matched_kind):
-    single_title = "LICENSE copy" if matched_kind == "single" else "OTHER proof"
-    bundle_title = "LICENSE copy" if matched_kind == "bundle" else "OTHER proof"
+    single_title = "营业执照复印件" if matched_kind == "single" else "安全生产许可证"
+    bundle_title = "营业执照复印件" if matched_kind == "bundle" else "安全生产许可证"
     output, report = prepare(tmp_path, [("B", single_title, {}), *bundle(title=bundle_title)])
-    assert not output["issues"] and report["status"] == "matched"
+    assert all(item["severity"] == "warning" for item in output["issues"]) and report["status"] == "matched"
     expected = ["B"] if matched_kind == "single" else ["B-P1", "B-P2"]
     assert [item["attachment_id"] for item in output["attachments"]] == expected
     assert report["candidate_groups"] == [{"kind": matched_kind, "identity": "B"}]

@@ -31,7 +31,7 @@ from .contract_pending_plan import contract_pending_plan
 from .contract_review_slots import _CONTRACT as _CONTRACT_SOURCE_HEADING
 
 
-PLANNING_VERSION = "bid-plan-v26"
+PLANNING_VERSION = "bid-plan-v27"
 # Preserve the unchanged, independently checkpointed field-mapping request.
 MAPPING_VERSION = "bid-plan-v24"
 
@@ -102,25 +102,55 @@ def _response_writing_control(requirement: dict, blocks: dict) -> str | None:
     return rule
 
 
-def _attachment_candidates(detail: dict, attachments: list, blocks: dict) -> tuple[list, dict]:
-    """Separate an explicit alternative credential from its list of search terms.
+def _material_match_report(ctx, requirements: list, manifest: dict, parsed: dict) -> dict:
+    """Persist one shared inventory and independently resumable query results.
 
-    A selected credential is an assembly candidate, never proof of eligibility.
-    Other expressions keep conservative matching until their structure is known.
+    Full text stays in controlled inputs/outputs; ordinary unit events contain
+    only identifiers and hashes.  Even an empty result has a checkpoint so a
+    completed search is distinguishable from an interrupted one.
     """
-    keywords = detail.get("attachment_keywords", [])
-    policy = {"rule": "all_declared_keywords", "keywords": keywords,
-              "eligibility_status": "not_determined"}
-    alternatives = r"(?:[（(]\d+[）)])?企业营业执照或事业单位法人证书等相关资质证明文件[。.]"
-    if re.fullmatch(alternatives, re.sub(r"\s+", "", detail["text"])) and len(detail["citations"]) == 1:
-        citation = _citation(_wire_citation(detail["citations"][0]), blocks, _pdf_footer_skips(blocks))
-        values = [blocks[key] for key in (citation.get("block_ids") or [citation["block_id"]])]
-        if (_native_source_span(values) and citation["quote"] == detail["text"] and
-                citation["quote"] == "\n".join(value["text"] for value in values)):
-            policy.update(rule="explicit_alternative_legal_credential", alternatives=["营业执照", "事业单位法人证书"],
-                          citation=citation, selection_basis="maintained_proof_title_not_qualification_acceptance")
-            return [a for a in attachments if any(term in a["title"] for term in policy["alternatives"])], policy
-    return [a for a in attachments if keywords and all(word in (a["title"] + " " + a["description"]) for word in keywords)], policy
+    from .material_matching import material_candidate_report, MATERIAL_MATCHING_VERSION as MATCHING_VERSION
+
+    records = manifest.get("material_records", [])
+    scope = {"attachments": manifest.get("attachments", []), "sources": manifest["sources"],
+             "evidence_selections": manifest.get("evidence_selections"),
+             "proof_derivations": manifest.get("proof_derivations", []), "parsed": parsed}
+    scope_hash = _hash({"records": records, **scope})
+    base = ctx.run_unit("material-index", {"matching_version": MATCHING_VERSION,
+        "scope_sha256": scope_hash, "parsed_sha256": _hash(parsed)},
+        lambda: material_candidate_report([], records, **scope))
+    report = copy.deepcopy(base)
+    query_keys = ("queries", "proof_queries", "assembly_candidates")
+    for key in query_keys:
+        report[key] = []
+    report["checkpoint_units"] = []
+    for requirement in requirements:
+        unit_id = _id("material-query-", requirement["requirement_id"])
+        def evaluate(requirement=requirement):
+            result = material_candidate_report([requirement], records, **scope)
+            return {key: result[key] for key in query_keys}
+        result = ctx.run_unit(unit_id, {"matching_version": MATCHING_VERSION,
+            "scope_sha256": scope_hash, "inventory_sha256": _hash(base), "requirement": requirement}, evaluate)
+        for key in query_keys:
+            report[key].extend(result[key])
+        report["checkpoint_units"].append({"unit_id": unit_id, "requirement_id": requirement["requirement_id"],
+                                           "output_sha256": _hash(result)})
+    report["matching_version"] = MATCHING_VERSION
+    _capture(ctx, "n3-material-matching", report)
+    return report
+
+
+def _attachment_candidates(detail: dict, attachments: list, material_report: dict) -> tuple[list, dict]:
+    """Consume only the shared source-bound matcher's assembly decisions."""
+    rid = detail["requirement_id"]
+    query = next((row for row in material_report["proof_queries"] if row["requirement_id"] == rid), None)
+    allowed = {aid for row in material_report["assembly_candidates"] if row["requirement_id"] == rid
+               for aid in row["attachment_ids"]}
+    policy = {"rule": "unified_source_bound_material_match", "matching_version": material_report["matching_version"],
+              "query_status": query["status"] if query else "not_searched",
+              "request": copy.deepcopy(query["request"]) if query else None,
+              "eligibility_status": "not_determined", "query": copy.deepcopy(query)}
+    return [item for item in attachments if item["attachment_id"] in allowed], policy
 
 
 def _writing_space(detail: dict, chapter: dict, blocks: dict) -> list:
@@ -1306,6 +1336,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                              "remote_format_resolutions": remote_format_resolutions,
                                              "errors": format_errors, "status": "failed" if format_errors else "complete"})
         _fail(bool(format_errors), "REQUIRED_FORMAT_UNRESOLVED")
+        material_report = _material_match_report(ctx, planned_requirements, manifest, parsed)
         sources = copy.deepcopy(manifest["sources"])
         source_map = {item["source_id"]: item for item in sources}
         facts = _fact_index(manifest)
@@ -1758,25 +1789,37 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                                      "source_refs": requirement["source_refs"]})
                     adopt_facts_or_mark_missing(section, rid, detail)
                 elif mode == "attachment":
-                    matches, matching_policy = _attachment_candidates(detail, manifest.get("attachments", []), blocks)
+                    matches, matching_policy = _attachment_candidates(detail, manifest.get("attachments", []), material_report)
                     def proof_group(item):
                         return ("bundle", item["bundle_id"]) if item.get("bundle_id") else ("single", item["attachment_id"])
                     bundle_keys = {proof_group(item) for item in matches}
-                    attachment_reports.append({"requirement_id": rid, "status": "matched" if len(bundle_keys) == 1 else "ambiguous" if matches else "no_match",
+                    query = matching_policy["query"] or {}
+                    related_ids = {aid for group in material_report["proof_groups"]
+                                   if group["group_id"] in query.get("candidate_group_ids", []) for aid in group["attachment_ids"]}
+                    related = [a for a in manifest.get("attachments", []) if a["attachment_id"] in related_ids]
+                    related_groups = {proof_group(item) for item in related}
+                    missing_labels = query.get("missing_required_labels", [])
+                    ambiguous_labels = query.get("ambiguous_required_labels", [])
+                    unavailable = query.get("unavailable_required_details", [])
+                    unavailable_reason = "".join("已找到但暂不能装配的候选：" + item["label"] + "。" +
+                        "".join(item["reasons"]) for item in unavailable)
+                    attachment_reports.append({"requirement_id": rid, "status": "partial" if matches and (missing_labels or ambiguous_labels or unavailable)
+                                               else "matched" if matches else "ambiguous" if ambiguous_labels else "no_match",
                                                "matching_policy": matching_policy,
-                                               "candidate_ids": [item["attachment_id"] for item in matches],
-                                               "candidate_bundle_ids": [identity for _, identity in sorted(bundle_keys)],
-                                               "candidate_groups": [{"kind": kind, "identity": identity} for kind, identity in sorted(bundle_keys)],
+                                               "candidate_ids": [item["attachment_id"] for item in related],
+                                               "selected_ids": [item["attachment_id"] for item in matches],
+                                               "candidate_bundle_ids": [identity for _, identity in sorted(related_groups)],
+                                               "candidate_groups": [{"kind": kind, "identity": identity} for kind, identity in sorted(related_groups)],
                                                "scope": "冻结证明附件匹配；不构成额外资格或公司主体核验"})
-                    if len(bundle_keys) == 1:
-                        bundle = next(iter(bundle_keys))
-                        selected_pages = sorted([item for item in manifest["attachments"]
-                            if proof_group(item) == bundle], key=lambda item: item.get("page_index", 1))
-                        if matching_policy["rule"] == "explicit_alternative_legal_credential":
-                            marker = issue(section, [rid], "证明材料适用性待核对",
-                                "按维护的证明类别装配了原件页；尚未据此判断证照状态或本次资格已满足。",
-                                "结合原件和本次招标条件核对适用性，不以附件存在代替资格结论。")
-                            next(item for item in issues if item["issue_id"] == marker)["severity"] = "warning"
+                    if matches:
+                        # Distinct required proof kinds can each contribute a
+                        # complete package. Competing candidates within one
+                        # kind have already been withheld by the shared matcher.
+                        selected_pages = sorted(matches, key=lambda item: (proof_group(item), item.get("page_index", 1)))
+                        marker = issue(section, [rid], "证明材料适用性待核对",
+                            "按维护的证明类别装配了原件页；尚未据此判断证照状态或本次资格已满足。",
+                            "结合原件和本次招标条件核对适用性，不以附件存在代替资格结论。")
+                        next(item for item in issues if item["issue_id"] == marker)["severity"] = "warning"
                         if re.search(r"有效|未过期|等级|级资质|到期|不少于|至少", detail["text"]):
                             issue(section, [rid], "证明适用条件仍需明确资料", "已定位证明，但当前快照没有可核验的有效期、等级或数量条件字段。", "补充条件字段及原件定位；不能仅凭关键词判定满足资格。")
                         cross_referenced = set()
@@ -1795,8 +1838,35 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                 attachments.append(adopted)
                                 section["attachment_refs"].append(selected["attachment_id"])
                                 attachment_owners[selected["attachment_id"]] = section
+                        if missing_labels or ambiguous_labels or unavailable:
+                            reason = ("尚未找到可装配的证明：" + "、".join(missing_labels) + "。" if missing_labels else "")
+                            reason += ("同一证明类别存在多个候选，尚未确定：" + "、".join(ambiguous_labels) + "。" if ambiguous_labels else "")
+                            reason += unavailable_reason
+                            issue(section, [rid], "本条证明材料尚未配齐", reason,
+                                  "补充缺失证明或明确候选；已附部分材料不代表本条全部要求已满足。")
+                    elif (matching_policy["request"] or {}).get("rule") == "negative_proof_instruction_not_searched":
+                        # The source explicitly says no proof is required. It
+                        # remains traceable, but is not a missing company file.
+                        attachment_reports[-1]["status"] = "not_required"
+                        requirement = next(item for item in requirements if item["requirement_id"] == rid)
+                        section["fixed_content"].append({"kind": "paragraph", "text": "证明提交说明（招标原文）：\n" + detail["text"],
+                                                         "source_refs": requirement["source_refs"]})
                     else:
-                        issue(section, [rid], "所需证明附件未能唯一匹配", "冻结库无匹配证明或存在多个候选，未按文件名猜选。", "补充或明确选择符合本次要求的证明页。")
+                        reason = ("当前表达尚未完成可支持的材料检索，不能据此认定公司没有材料。"
+                                  if matching_policy["query_status"] == "not_searched" else
+                                  "已找到相关材料，但其来源、类别或适用条件不足以支持本条装配。"
+                                  if query.get("candidate_group_ids") and not matches else
+                                  "本条有多个可用候选，尚未确定唯一证明包。" if ambiguous_labels else
+                                  "当前冻结的已检索范围未找到可装配证明；不代表公司不存在相应资料。")
+                        if missing_labels:
+                            reason += "尚缺对应证明：" + "、".join(missing_labels) + "。"
+                        if ambiguous_labels:
+                            reason += "待明确候选类别：" + "、".join(ambiguous_labels) + "。"
+                        reason += unavailable_reason
+                        if query.get("unread_scope_present"):
+                            reason += "仍有资料未完成读取，应先补齐对应读取范围。"
+                        issue(section, [rid], "所需证明附件未能唯一匹配", reason,
+                              "依据匹配记录核对候选、读取状态和本条条件；补充或明确选择对应证明页。")
                 elif mode in {"table", "fixed_text"}:
                     if rid in pending_response_bodies:
                         requirement = next(item for item in requirements if item["requirement_id"] == rid)
@@ -1952,15 +2022,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             "status": "failed" if association_errors else "mapped" if association_placements else "not_needed"})
         _fail(bool(association_errors), "JOINT_FORMAT_ASSOCIATION_INCOMPLETE")
         response_organization = {}
-        material_report = {}
         if config.get("organize_response", False):
-            from .material_matching import material_candidate_report
             from .response_organization import organize_response
-            material_report = material_candidate_report(planned_requirements, manifest.get("material_records", []),
-                attachments=manifest.get("attachments", []), sources=manifest["sources"], parsed=parsed,
-                evidence_selections=manifest.get("evidence_selections", []),
-                proof_derivations=manifest.get("proof_derivations", []))
-            _capture(ctx, "n3-material-matching", material_report)
             response_organization = organize_response(sections, requirements, details, planned_formats, blocks,
                 issues, attachments, manifest, material_report)
             placements = [{"requirement_id": rid, "section_id": section["section_id"],

@@ -266,9 +266,16 @@ def organize_response(sections, requirements, details, formats, blocks, issues, 
             target["attachment_refs"] = list(dict.fromkeys([*target["attachment_refs"], aid]));placed.append(aid)
         if placed:
             labels, label_origins = _proof_display_labels(placed, adopted, candidate)
-            iid = marker(target, [rid], "已附证明的适用条件仍待核对",
-                _proof_label_prefix(labels) + "按已维护来源装配完整证明包；没有据此认定资格合格、获得评分或确定本次人员派任。",
-                "；".join(candidate.get("pending_checks", [])) or "核对原件、日期、等级及本次适用范围。", "warning")
+            title = "已附证明的适用条件仍待核对"
+            reason = _proof_label_prefix(labels) + "按已维护来源装配完整证明包；没有据此认定资格合格、获得评分或确定本次人员派任。"
+            action = "；".join(candidate.get("pending_checks", [])) or "核对原件、日期、等级及本次适用范围。"
+            existing = next((item for item in issues if item["requirement_refs"] == [rid]
+                and item["title"] == "证明材料适用性待核对" and item["severity"] == "warning"), None)
+            if existing:
+                existing.update(section_id=target["section_id"], title=title, reason=reason, action=action)
+                iid = existing["issue_id"]
+            else:
+                iid = marker(target, [rid], title, reason, action, "warning")
             assembly.append({**candidate, "response_section_id": target["section_id"], "issue_id": iid,
                              "display_labels": labels, "display_label_provenance": label_origins,
                              "qualification_result": "not_determined"})

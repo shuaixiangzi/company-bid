@@ -42,6 +42,7 @@ from company_bid.pipeline import build_executor
     ("source_clauses.py", {"N2", "N3"}),
     ("table_continuations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("material_matching.py", {"N3"}),
+    ("response_organization.py", {"N3"}),
     ("preparation_rules.py", {"N3", "N4", "N5", "N6"}),
 ])
 def test_local_code_change_invalidates_only_nodes_that_consume_it(tmp_path, monkeypatch, changed_file, affected):

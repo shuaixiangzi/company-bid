@@ -30,6 +30,7 @@
 | [实施与验收计划](docs/06-delivery-plan.md) | 从真实文档原型到三人并行的实施顺序和门槛 |
 | [旧设计复用与原格式核对](docs/08-legacy-design-reuse.md) | 旧实现的实际接线、可借鉴合同与不能照搬的部分 |
 | [要点提取专项复核](docs/10-extraction-design-reuse.md) | 新旧读取、分窗、引用、查漏、校准、并发与恢复的逐项比较 |
+| [资料匹配与来源核对](docs/11-material-matching.md) | 近义词、候选检索、证明条件、装配入口和逐条恢复的范围 |
 
 ## 核心流程
 

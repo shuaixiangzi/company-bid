@@ -86,16 +86,24 @@ def test_technical_grouping_requires_unique_open_chapter_and_keeps_units(tmp_pat
     assert extracted == frozen
 
 
-@pytest.mark.parametrize("text,expected_rule", [(LICENSE, "explicit_alternative_legal_credential"),
-    (LICENSE.replace("或", "和"), "all_declared_keywords"),
-    (LICENSE + "须同时提供二者。", "all_declared_keywords")])
-def test_alternative_credentials_are_candidates_and_never_eligibility(tmp_path, text, expected_rule):
+@pytest.mark.parametrize("text,boolean_tokens", [(LICENSE, ["或"]),
+    (LICENSE.replace("或", "和"), ["和"]),
+    (LICENSE + "须同时提供二者。", ["或", "同时"])])
+def test_alternative_credentials_are_candidates_and_never_eligibility(tmp_path, text, boolean_tokens):
+    from company_bid.material_matching import material_candidate_report
     manifest, parsed, extracted = case(tmp_path, [text], category="qualification", mode="attachment",
                                       keywords=["企业营业执照", "事业单位法人证书", "相关资质证明文件"])
-    blocks, _, _ = _index(parsed, manifest)
     proofs = [{"attachment_id": "P1", "title": "营业执照复印件", "description": "已维护证明"},
               {"attachment_id": "P2", "title": "事业单位法人证书", "description": "已维护证明"},
               {"attachment_id": "P3", "title": "安全生产许可证", "description": "营业执照样本链接"}]
-    matches, policy = _attachment_candidates(extracted["requirements"][0], proofs, blocks)
-    assert policy["rule"] == expected_rule and policy["eligibility_status"] == "not_determined"
-    assert [item["attachment_id"] for item in matches] == (["P1", "P2"] if expected_rule.startswith("explicit") else [])
+    for item in proofs:
+        item.update(path=str(tmp_path / (item["attachment_id"] + ".png")), sha256="a" * 64, source_refs=["PROOF"])
+    report = material_candidate_report(extracted["requirements"], [], attachments=proofs,
+        sources=[{"source_id": "PROOF", "sha256": "b" * 64, "kind": "company_material"}])
+    matches, policy = _attachment_candidates(extracted["requirements"][0], proofs, report)
+    assert policy["rule"] == "unified_source_bound_material_match" and policy["eligibility_status"] == "not_determined"
+    assert policy["query"]["candidate_group_ids"] == ["P1", "P2"]
+    assert [item["attachment_id"] for item in matches] == (["P1", "P2"] if boolean_tokens == ["和"] else [])
+    if boolean_tokens != ["和"]:
+        assert policy["query"]["ambiguous_required_labels"]
+    assert policy["request"]["conditions"]["boolean_tokens"] == boolean_tokens

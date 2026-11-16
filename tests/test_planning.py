@@ -93,10 +93,13 @@ def test_one_proof_bundle_is_matched_with_all_pages_in_order(tmp_path):
     output = plan_bid(ctx, extracted, parsed, manifest, no_call, {})
     assert [a["page_index"] for a in output["attachments"]] == [1, 2]
     assert len(output["sections"][0]["attachment_refs"]) == 2
-    assert not output["issues"]
+    assert all(item["severity"] == "warning" for item in output["issues"])
     manifest["attachments"] = manifest["attachments"][:1]
-    with pytest.raises(ValueError, match="all ordered pages"):
-        plan_bid(Context(), extracted, parsed, manifest, no_call, {})
+    incomplete = Context()
+    pending = plan_bid(incomplete, extracted, parsed, manifest, no_call, {})
+    assert pending["attachments"] == []
+    assert any(item["severity"] == "missing" for item in pending["issues"])
+    assert incomplete.captures["n3-material-matching"]["proof_groups"][0]["bundle_complete"] is False
 
 
 def test_all_units_in_denominator_empty_unit_no_model_and_bounded_draft(tmp_path):
@@ -261,7 +264,7 @@ def test_reference_bid_method_is_scoped_and_historical_facts_not_imported(tmp_pa
 def test_attachment_exact_scope_selected_once_and_expiry_not_assumed(tmp_path):
     manifest, parsed = fixture(tmp_path)
     block = add_unit(parsed, "U1", "应附营业执照，须在有效期内。")
-    manifest["attachments"] = [{"attachment_id": "A1", "section_id": "old-section", "title": "营业执照测试页", "path": str(tmp_path / "proof.png"),
+    manifest["attachments"] = [{"attachment_id": "A1", "section_id": "old-section", "title": "营业执照", "path": str(tmp_path / "proof.png"),
         "sha256": "c" * 64, "source_refs": ["company"], "requirement_refs": ["old-requirement"], "synthetic": True,
         "description": "测试用途的虚构营业执照图片"}]
     ctx = Context()
