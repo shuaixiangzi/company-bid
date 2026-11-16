@@ -174,3 +174,85 @@ def test_source_appendix_number_and_locator_stay_with_first_source_paragraph(tmp
         assert number.paragraph_format.keep_with_next is True
         assert locator.text=='；'.join(entry['locations']) and locator.paragraph_format.keep_with_next is True
         assert source.text==entry['text'] and source.paragraph_format.keep_with_next is False
+
+
+def test_dictionary_preamble_display_separates_stages_with_exact_trace_mapping(tmp_path):
+    package = review_package(tmp_path); data = package.model_dump(mode="json")
+    original = "当前表达尚未完成可支持的材料检索，不能据此认定公司没有材料。"
+    issue = next(i for i in data["issues"] if i["issue_id"] == "M-002")
+    issue["reason"] = original + "仍有资料未完成读取。\n【R-X】语义目录补查：已补查冻结目录，未找到可用候选。"
+    issue["source_requirement"] = original
+    package = DocumentPackage.model_validate(data); before = deepcopy(package.model_dump(mode="json"))
+    doc, index = render_task_list(package); text = "\n".join(p.text for p in doc.paragraphs)
+    row = next(i for i in index["issues"] if i["issue_id"] == "M-002")
+    assert row["original_issue"] == issue
+    assert row["display_reason"].startswith("词典阶段：当前表达未形成可用检索结果；后续目录补查见逐要求记录")
+    assert row["display_reason"] in text and "【R-X】语义目录补查：已补查冻结目录" in text
+    assert row["display_transformations"] == [{"field": "reason", "rule": "dictionary_stage_unsearched_wording_v1",
+        "original_text": original, "display_text": row["display_reason"].partition("仍有资料")[0], "occurrences": 1}]
+    assert any(p.text == original for p in doc.paragraphs)  # source appendix stays verbatim
+    assert package.model_dump(mode="json") == before
+
+
+def test_reason_display_does_not_rewrite_embedded_quote_or_similar_unregistered_text():
+    from company_bid.review_document import _display_reason
+    original = "当前表达尚未完成可支持的材料检索，不能据此认定公司没有材料。"
+    for reason in ["原文引用：" + original, "当前表达尚未完成材料检索，不能据此认定公司没有材料。"]:
+        assert _display_reason(reason) == (reason, [])
+
+
+def test_exact_material_headers_use_existing_source_quote_ids_with_identity_map(tmp_path):
+    package = review_package(tmp_path); data = package.model_dump(mode="json")
+    issue = next(i for i in data["issues"] if i["issue_id"] == "M-002")
+    second = "R-" + "1" * 20
+    issue["requirement_refs"] = ["R-004", second]
+    next(s for s in data["sections"] if s["section_id"] == issue["section_id"])["requirement_refs"].append(second)
+    requirements = {r["requirement_id"]: r for r in data["requirements"]}
+    prefixes = {}
+    for rid in issue["requirement_refs"]:
+        short = " ".join(requirements[rid]["text"].split())
+        short = short[:36] + ("…" if len(short) > 36 else "")
+        prefixes[rid] = f"【{rid}｜{short}】词典阶段："
+    issue["reason"] = "原原因及条件保留。\n" + "\n".join(prefix + "未检索；语义目录补查：尚未完成补找。" for prefix in prefixes.values())
+    package = DocumentPackage.model_validate(data); before = deepcopy(package.model_dump(mode="json"))
+    catalog = task_list_catalog(package); doc, index = render_task_list(package)
+    row = next(i for i in index["issues"] if i["issue_id"] == "M-002")
+    text = "\n".join(p.text for p in doc.paragraphs)
+    assert row["original_issue"] == issue and package.model_dump(mode="json") == before
+    expected = issue["reason"]
+    for rid, original in prefixes.items():
+        qid = catalog["requirement_quote_ids"][rid]
+        display = original.replace(rid, qid, 1)
+        expected = expected.replace(original, display)
+        assert rid not in row["display_reason"] and display in text
+        assert qid in row["quote_ids"]
+        change = next(c for c in row["display_transformations"] if c["requirement_id"] == rid)
+        assert change == {"field": "reason", "rule": "material_requirement_header_source_id_v1",
+            "original_text": original, "display_text": display, "occurrences": 1,
+            "requirement_id": rid, "quote_id": qid, "source_refs": requirements[rid]["source_refs"]}
+        quote = next(q for q in index["source_quotes"] if q["display_id"] == qid)
+        assert any(c["text"] == requirements[rid]["text"] for c in quote["contained_quotes"])
+    assert row["display_reason"] == expected
+
+
+def test_material_header_display_does_not_replace_inline_foreign_or_inexact_prefixes(tmp_path):
+    from company_bid.review_document import _display_material_requirement_labels
+    from types import SimpleNamespace
+    package = review_package(tmp_path); catalog = task_list_catalog(package)
+    rid = "R-004"; short = " ".join(catalog["requirements"][rid].text.split())
+    short = short[:36] + ("…" if len(short) > 36 else "")
+    prefix = f"【{rid}｜{short}】词典阶段："
+    issue = SimpleNamespace(requirement_refs=[rid])
+    for text in ["原文引用：" + prefix + "未检索。", "\n " + prefix + "未检索。",
+                 "\n" + prefix.replace(short, "并非原要求短引", 1), "\n" + prefix.replace("词典阶段：", "词典阶段待核：")]:
+        assert _display_material_requirement_labels(text, issue, catalog) == (text, [], [])
+    foreign = SimpleNamespace(requirement_refs=[])
+    assert _display_material_requirement_labels("\n" + prefix, foreign, catalog) == ("\n" + prefix, [], [])
+    # Matching text inside the source appendix is outside the reason-only transform.
+    data = package.model_dump(mode="json")
+    target = next(i for i in data["issues"] if i["issue_id"] == "M-002")
+    target["source_requirement"] = prefix + "来源原文完整保留。"
+    package = DocumentPackage.model_validate(data); doc, index = render_task_list(package)
+    assert any(p.text == target["source_requirement"] for p in doc.paragraphs)
+    row = next(i for i in index["issues"] if i["issue_id"] == "M-002")
+    assert row["original_issue"]["source_requirement"] == target["source_requirement"]

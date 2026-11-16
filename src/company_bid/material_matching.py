@@ -364,6 +364,13 @@ def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
     rows = []
     expected = set(origin.get("pages", [])) if origin.get("format") == "pdf_pages" else set(origin.get("package_parts", []))
     observed, unread = set(), set()
+    indexed = bool(parsed and parsed.get("schema_version") == "material.content.parsed.v1")
+    if indexed:
+        # A selected view cannot lend one group's full page to another group's
+        # cropped selection or a colliding attachment ID.
+        binding = {key: group[key] for key in ("group_id", "origin", "attachment_ids", "source_refs")}
+        if binding not in parsed.get("group_bindings", []):
+            parsed = None
     if parsed is not None and group["source_bound"] and origin and expected:
         for doc in parsed.get("documents", []):
             if (doc.get("source_id") != origin.get("source_id") or doc.get("sha256") != origin.get("source_sha256")
@@ -371,6 +378,8 @@ def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
                 continue
             for unit in doc.get("units", []):
                 if unit.get("source_id") != origin["source_id"]:
+                    continue
+                if indexed and group["group_id"] not in unit.get("material_content_group_ids", []):
                     continue
                 blocks = unit.get("blocks", [])
                 if origin.get("format") == "pdf_pages":
@@ -388,12 +397,20 @@ def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
                     continue
                 if not keys:
                     continue
-                if unit.get("coverage", {}).get("status") not in {"read", "empty"}:
+                complete = unit.get("coverage", {}).get("status") in {"read", "empty"}
+                partial_native = (indexed and origin.get("format") == "pdf_pages" and
+                                  unit.get("coverage", {}).get("status") == "needs_ocr" and
+                                  unit.get("material_content_native_readable") is True)
+                if not complete:
                     unread.update(keys)
-                    continue
-                observed.update(keys)
+                    if not partial_native:
+                        continue
+                else:
+                    observed.update(keys)
                 for block in selected:
                     if block.get("source_id") != origin["source_id"]:
+                        continue
+                    if partial_native and block.get("origin", "native") != "native":
                         continue
                     text = "\n".join([block.get("text", ""), *[" | ".join(row) for row in block.get("rows", [])]]).strip()
                     if not text:
@@ -405,6 +422,7 @@ def _scope_group_read_text(group: dict, parsed: dict | None) -> None:
                                  "unit_id": unit.get("unit_id"), "block_id": block.get("block_id"),
                                  "locator": block.get("locator"), "page": unit.get("page"),
                                  "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                                 **({"content_coverage": "partial_native_page_needs_ocr"} if partial_native else {}),
                                  "hits": hits, "role_exclusions": _role_exclusions(text)})
     group["read_text_basis"] = rows
     group["read_scope_status"] = ("not_supplied" if parsed is None else "unbound" if not origin or not group["source_bound"]

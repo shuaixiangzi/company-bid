@@ -21,6 +21,8 @@ from company_bid.pipeline import build_executor
     ("source_format_contracts.py", {"N0", "N1", "N2", "N3", "N4", "N5", "N6"}),
     ("source_format_rendering.py", {"N6"}),
     ("rendering.py", {"N6"}),
+    ("material_content_matching.py", {"N3"}),
+    ("material_content_index.py", {"N3"}),
     ("review_document.py", {"N6"}),
     ("writing_candidate_import.py", {"N4", "N5"}),
     ("plan_component_controls.py", {"N3"}),

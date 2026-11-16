@@ -314,3 +314,85 @@ def test_selected_proof_manifest_is_separate_from_n1_and_passes_real_n4_prefligh
     assert preflight["status"] == "captured"
     assert ex.store.read_json(preflight["ref"])["status"] == "passed"
     assert ex.output(run)["input_kind"] == "automatic"
+
+
+def test_issue_annotations_bind_mixed_results_to_requirements_and_preserve_provenance():
+    rows = []
+    queries = []
+    for rid, status, original, searched in [
+        ("R-COURT", "no_candidate_in_frozen_catalog", "2023年至2025年无行贿犯罪查询截图。", True),
+        ("R-SOCIAL", "all_candidates_blocked", "截止日前120日内社保证明。", True),
+        ("R-SAFETY", "deferred_not_searched", "施工安全（如适用）承诺。", False),
+        ("R-CP2", "deterministic_candidate_available", "AMPP CP2及以上证书。", True),
+    ]:
+        queries.append({"requirement_id": rid, "search_status": "searched_frozen_prepared_attachments" if searched else "not_searched",
+                        "candidate_group_ids": ["G"] if rid == "R-CP2" else [], "read_scope_status": "incomplete",
+                        "request": {"original_text": original, "conditions": {"raw_text": original}}})
+        rows.append({"requirement_id": rid, "status": status, "candidates": [],
+                     "condition_findings": [{"reason": "本条要求 CP2；同源历史声明列有 CP3，原件待核。"}] if rid == "R-CP2" else [],
+                     "historical_response_reused": rid in {"R-COURT", "R-SOCIAL"},
+                     "response_sha256": "a" * 64 if rid == "R-COURT" else None,
+                     "qualification_result": "not_determined"})
+    report = {"proof_groups": [], "proof_queries": queries,
+              "semantic_recall": {"queries": rows, "response_mode": "authenticated_recorded_responses"}}
+    issue = {"issue_id": "M-310", "requirement_refs": [q["requirement_id"] for q in queries],
+             "reason": "原原因及原条件不得覆盖。", "action": "补齐资料。", "source_requirement": "原文不能改写。"}
+    before = copy.deepcopy(issue); original_report = copy.deepcopy(report)
+    change, = recall.annotate_material_issues([issue], report)
+    assert issue["reason"].startswith(before["reason"] + "\n")
+    assert all(issue[k] == before[k] for k in before if k != "reason")
+    lines = issue["reason"].splitlines()
+    assert any("【R-COURT｜2023年至2025年" in x and "已补查冻结目录，未找到可用候选" in x for x in lines)
+    assert any("【R-SOCIAL｜" in x and "候选未通过来源、类别或人员检查" in x for x in lines)
+    assert any("【R-SAFETY｜" in x and "词典阶段：表达未支持，未检索" in x and "尚未完成补找" in x for x in lines)
+    assert any("【R-CP2｜" in x and "词典已有候选，未另补查" in x for x in lines)
+    assert lines[lines.index(next(x for x in lines if "【R-CP2｜" in x)) + 1] == "条件核对：" + rows[-1]["condition_findings"][0]["reason"]
+    assert issue["reason"].count("本次目录补查未检查原件内容") == 1
+    assert "扫描原件内容尚未读全" not in issue["reason"] and "不证明公司没有材料" in issue["reason"]
+    assert change["before"] == before and change["after"] == issue
+    assert change["requirement_contexts"][0]["semantic_recall"] == rows[0]
+    assert change["requirement_contexts"][0]["original_conditions"] == queries[0]["request"]["conditions"]
+    assert change["response_mode"] == "authenticated_recorded_responses" and report == original_report
+
+
+def test_disabled_catalog_recall_is_unsearched_not_no_material():
+    issue = {"issue_id": "M-X", "requirement_refs": ["R-X"], "reason": "保留缺项。"}
+    report = {"proof_groups": [], "proof_queries": [], "semantic_recall": {"queries": [
+        {"requirement_id": "R-X", "status": "disabled_not_searched", "candidates": [], "condition_findings": []}]}}
+    recall.annotate_material_issues([issue], report)
+    assert "本次未启用，未补查" in issue["reason"] and "未找到可用候选" not in issue["reason"]
+    assert "不证明公司没有材料" in issue["reason"]
+
+
+def test_original_reading_is_a_separate_stage_from_authenticated_catalog_response():
+    issue = {"issue_id": "M-X", "requirement_refs": ["R-X"], "reason": "原条件保留。"}
+    report = {"proof_groups": [], "proof_queries": [{"requirement_id": "R-X",
+        "search_status": "searched_frozen_prepared_attachments", "candidate_group_ids": ["G"],
+        "request": {"original_text": "证明原文。", "conditions": {"raw_text": "原条件。"}},
+        "unread_scope_present": True, "read_scope_status": "incomplete"}],
+        "semantic_recall": {"queries": [{"requirement_id": "R-X", "status": "deterministic_candidate_available",
+            "catalog_stage_status": "no_candidate_in_frozen_catalog",
+            "catalog_stage_dictionary_search_status": "not_searched",
+            "catalog_stage_dictionary_candidate_group_ids": [], "historical_response_reused": True,
+            "response_sha256": "b" * 64, "candidates": [], "condition_findings": []}]},
+        "original_content_index": {"summary": {"scope": "selected_original_pages_and_images_only"},
+            "coverage": {"selected_unit_count": 3, "status_counts": {"read": 1, "needs_ocr": 2},
+                         "unread_unit_count": 2, "unbound_group_count": 1}}}
+    change, = recall.annotate_material_issues([issue], report)
+    assert "词典阶段：表达未支持，未检索" in issue["reason"]
+    assert "已补查冻结目录，未找到可用候选（复用历史响应）" in issue["reason"]
+    assert "原件读取后匹配：有候选，条件待核" in issue["reason"]
+    assert "目录索引内所选3页/图，1项读取完整，2项未读全或不支持读取，另1组范围未绑定" in issue["reason"]
+    assert "正文读取不等于资格核验" in issue["reason"]
+    assert change["requirement_contexts"][0]["current_content_matching"]["candidate_group_ids"] == ["G"]
+    assert change["requirement_contexts"][0]["semantic_recall"]["response_sha256"] == "b" * 64
+    assert change["original_content_index_sha256"]
+
+
+def test_catalog_candidate_later_blocked_is_not_relabelled_unsearched():
+    row = {"status": "all_candidates_blocked", "catalog_stage_status": "candidates_pending_original_checks",
+           "historical_response_reused": True,
+           "candidates": [{"group_id": "G", "decision": "blocked_candidate"}]}
+    display = recall._catalog_stage(row, {"G": {"title": "候选证明"}})
+    assert "历史响应曾给出候选" in display and "复用历史响应" in display
+    assert "未执行目录补查" not in display and "待核候选：候选证明" not in display

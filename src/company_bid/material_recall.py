@@ -22,6 +22,7 @@ RECALL_VERSION = "n3-material-recall.v1"
 class RecallOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool = False
+    read_selected_originals: bool = False
     max_queries: int = Field(default=12, ge=1, le=32)
     requirement_ids: list[str] | None = None
     provider: dict = Field(default_factory=dict)
@@ -148,36 +149,100 @@ def integrate_material_recall(ctx, requirements: list, manifest: dict, parsed: d
     return report
 
 
+def _dictionary_stage(query: dict, row: dict) -> str:
+    search_status = row.get("catalog_stage_dictionary_search_status", query.get("search_status"))
+    candidate_ids = row.get("catalog_stage_dictionary_candidate_group_ids", query.get("candidate_group_ids"))
+    if search_status == "not_searched":
+        return "词典阶段：表达未支持，未检索"
+    if candidate_ids:
+        return "词典阶段：有候选，条件待核"
+    if search_status == "searched_frozen_prepared_attachments":
+        return "词典阶段：冻结范围内未命中"
+    return "词典阶段：检索状态见匹配记录"
+
+
+def _catalog_stage(row: dict, groups: dict) -> str:
+    usable = [c for c in row["candidates"] if c["decision"] != "blocked_candidate"]
+    if usable:
+        titles = list(dict.fromkeys(groups[c["group_id"]]["title"] for c in usable))
+        result = "语义目录补查：语义补找的待核候选：" + "；".join(titles)
+    else:
+        result = "语义目录补查：" + {
+            "candidates_pending_original_checks": "历史响应曾给出候选，读取后检查另列",
+            "no_candidate_in_frozen_catalog": "已补查冻结目录，未找到可用候选",
+            "all_candidates_blocked": "候选未通过来源、类别或人员检查",
+            "deferred_not_searched": "不在本次冻结范围，尚未完成补找",
+            "disabled_not_searched": "本次未启用，未补查",
+            "deterministic_candidate_available": "词典已有候选，未另补查",
+            "requires_current_signed_document": "需本次签署文件，未补查历史材料",
+            "existing_performance_candidates_require_original_checks": "已有业绩候选，转原件核对",
+            "outside_material_recall_scope": "不属材料补查范围，沿用原办理要求",
+            "skip_explicit_instruction_guard": "按原文明示处理，未补查",
+        }.get(row.get("catalog_stage_status", row["status"]), "未执行目录补查，原因见匹配记录")
+    if row.get("historical_response_reused"):
+        result += "（复用历史响应）"
+    return result
+
+
 def annotate_material_issues(issues: list, report: dict) -> list:
-    """Keep every gap and its ID; append program-authored candidate context."""
+    """Append scoped stage results; retain original gaps and response provenance."""
     groups = {g["group_id"]: g for g in report["proof_groups"]}
+    queries = {q["requirement_id"]: q for q in report.get("proof_queries", [])}
     rows = {r["requirement_id"]: r for r in report.get("semantic_recall", {}).get("queries", [])}
+    annotated = {"candidates_pending_original_checks", "no_candidate_in_frozen_catalog",
+                 "all_candidates_blocked", "deferred_not_searched", "disabled_not_searched"}
     changes = []
     for issue in issues:
-        additions, refs = [], []
-        for rid in issue["requirement_refs"]:
-            row = rows.get(rid)
-            if not row:
-                continue
-            previous_count = len(additions)
-            usable = [c for c in row["candidates"] if c["decision"] != "blocked_candidate"]
-            if usable:
-                titles = list(dict.fromkeys(groups[c["group_id"]]["title"] for c in usable))
-                additions.append("语义补找的待核候选：" + "；".join(titles) + "。目录名称和历史声明仅提供检索线索，原件内容及本条条件仍待核对，原缺项继续保留。")
-            elif row["status"] == "no_candidate_in_frozen_catalog":
-                additions.append("本次已补查冻结材料目录，未找到可用候选；扫描原件内容尚未读全，不能据此认定公司没有材料。")
-            elif row["status"] == "all_candidates_blocked":
-                additions.append("语义补找返回的候选未通过程序的来源、类别或人员条件检查，本条仍待补充有效证明。")
-            elif row["status"] == "deferred_not_searched":
-                additions.append("本条不在本次语义补找的冻结范围内，尚未完成补找，不按已搜无材料处理。")
+        relevant = [(rid, rows[rid]) for rid in issue["requirement_refs"] if rid in rows]
+        if not any(row.get("catalog_stage_status", row["status"]) in annotated or row["condition_findings"] for _, row in relevant):
+            continue
+        additions, contexts = [], []
+        for rid, row in relevant:
+            query = queries.get(rid, {})
+            original = query.get("request", {}).get("original_text", "")
+            short = " ".join(original.split())
+            short = short[:36] + ("…" if len(short) > 36 else "")
+            label = rid + ("｜" + short if short else "")
+            line = f"【{label}】{_dictionary_stage(query, row)}；{_catalog_stage(row, groups)}"
+            if report.get("original_content_index"):
+                line += "；原件读取后匹配：" + ("有候选，条件待核" if query.get("candidate_group_ids") else "未形成候选")
+                if row.get("catalog_stage_status") != row["status"] and row["status"] == "all_candidates_blocked":
+                    line += "；读取后候选复查：未通过来源、类别或人员检查"
+            additions.append(line + "。")
             for finding in row["condition_findings"]:
-                additions.append(finding["reason"])
-            if len(additions) != previous_count:
-                refs.append(rid)
-        if additions:
-            before = copy.deepcopy(issue)
-            issue["reason"] += "\n" + "\n".join(dict.fromkeys(additions))
-            changes.append({"issue_id": issue["issue_id"], "requirement_refs": refs,
-                            "before": before, "after": copy.deepcopy(issue),
-                            "rule": "append_candidate_context_preserve_missing_and_conditions"})
+                # The preceding requirement ID binds the unchanged condition text.
+                additions.append("条件核对：" + finding["reason"])
+            contexts.append({"requirement_id": rid, "original_requirement": original,
+                             "original_conditions": copy.deepcopy(query.get("request", {}).get("conditions", {})),
+                             "deterministic_search_status": query.get("search_status"),
+                             "deterministic_read_scope_status": query.get("read_scope_status"),
+                             "semantic_recall": copy.deepcopy(row)})
+        content_index = report.get("original_content_index")
+        if content_index:
+            coverage = content_index["coverage"]
+            count = coverage["selected_unit_count"]
+            read = coverage["status_counts"].get("read", 0)
+            unread = coverage["unread_unit_count"]
+            unbound = coverage.get("unbound_group_count", 0)
+            missing_scope = f"，另{unbound}组范围未绑定" if unbound else ""
+            empty = coverage["status_counts"].get("empty", 0)
+            empty_scope = f"，{empty}项读取后无文字" if empty else ""
+            additions.append(f"原件读取：目录索引内所选{count}页/图，{read}项读取完整，{unread}项未读全或不支持读取{empty_scope}{missing_scope}；正文读取不等于资格核验。")
+            for context in contexts:
+                query = queries.get(context["requirement_id"], {})
+                context["current_content_matching"] = {
+                    "candidate_group_ids": copy.deepcopy(query.get("candidate_group_ids", [])),
+                    "read_scope_status": query.get("read_scope_status"),
+                    "unread_scope_present": query.get("unread_scope_present")}
+            additions.append("目录补查仅使用名称及同源历史声明，本次目录补查未检查原件内容；原件读取另列如上，适用条件待核，原缺项继续保留。未检索或未找到候选均不证明公司没有材料。")
+        else:
+            additions.append("目录补查仅使用名称及同源历史声明，本次目录补查未检查原件内容；原件及适用条件待核，原缺项继续保留。未检索或未找到候选均不证明公司没有材料。")
+        before = copy.deepcopy(issue)
+        issue["reason"] += "\n" + "\n".join(additions)
+        changes.append({"issue_id": issue["issue_id"], "requirement_refs": [rid for rid, _ in relevant],
+                        "before": before, "after": copy.deepcopy(issue),
+                        "requirement_contexts": contexts,
+                        "response_mode": report.get("semantic_recall", {}).get("response_mode"),
+                        "original_content_index_sha256": digest(content_index) if content_index else None,
+                        "rule": "append_scoped_stage_context_preserve_missing_conditions_and_provenance"})
     return changes

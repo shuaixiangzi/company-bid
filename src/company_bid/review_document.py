@@ -34,6 +34,49 @@ def _display_action(action):
     return action,changes
 
 
+_REASON_DISPLAY_REPLACEMENTS = (
+    ("dictionary_stage_unsearched_wording_v1",
+     "当前表达尚未完成可支持的材料检索，不能据此认定公司没有材料。",
+     "词典阶段：当前表达未形成可用检索结果；后续目录补查见逐要求记录，不能据此认定公司没有材料。"),
+)
+
+
+def _display_reason(reason):
+    """Relabel only the exact generated preamble; never edit source quotes."""
+    changes = []
+    for rule, original, display in _REASON_DISPLAY_REPLACEMENTS:
+        if reason.startswith(original):
+            reason = display + reason[len(original):]
+            changes.append({"field": "reason", "rule": rule, "original_text": original,
+                            "display_text": display, "occurrences": 1})
+    return reason, changes
+
+
+def _display_material_requirement_labels(reason, issue, catalog):
+    """Replace exact generated line headers with existing source appendix IDs."""
+    lines = reason.splitlines(keepends=True)
+    changes, quote_ids = [], []
+    for rid in dict.fromkeys(issue.requirement_refs):
+        requirement = catalog["requirements"][rid]
+        short = " ".join(requirement.text.split())
+        short = short[:36] + ("…" if len(short) > 36 else "")
+        original = f"【{rid}｜{short}】词典阶段："
+        qid = catalog["requirement_quote_ids"][rid]
+        display = f"【{qid}｜{short}】词典阶段："
+        count = 0
+        for number, line in enumerate(lines):
+            if line.startswith(original):
+                lines[number] = display + line[len(original):]
+                count += 1
+        if count:
+            quote_ids.append(qid)
+            changes.append({"field": "reason", "rule": "material_requirement_header_source_id_v1",
+                            "original_text": original, "display_text": display, "occurrences": count,
+                            "requirement_id": rid, "quote_id": qid,
+                            "source_refs": list(requirement.source_refs)})
+    return "".join(lines), changes, list(dict.fromkeys(quote_ids))
+
+
 def _body_quote(text):
     first, separator, rest = text.partition("\n")
     return rest if separator and rest and first in _WRAPPERS else text
@@ -145,12 +188,15 @@ def render_task_list(package):
             locs=locations(refs);qid=original(issue.source_requirement)
             status="待核对" if issue.severity=="warning" else "待补"
             display_action,display_changes=_display_action(issue.action)
+            display_reason,reason_changes=_display_reason(issue.reason)
+            display_reason,label_changes,material_qids=_display_material_requirement_labels(display_reason,issue,catalog)
+            display_changes += reason_changes + label_changes
             paragraph(f"{issue.issue_id} {issue.title}（{status}）",bold=True,keep_next=True)
-            paragraph(f"原因：{issue.reason}\n动作：{display_action}")
+            paragraph(f"原因：{display_reason}\n动作：{display_action}")
             paragraph(f"依据：{qid}；"+"；".join(locs))
             index["issues"].append({"display_id":issue.issue_id,"issue_id":issue.issue_id,"section_id":sid,
-                "requirement_refs":issue.requirement_refs,"quote_ids":[qid],"source_refs":refs,"locations":locs,"severity":issue.severity,"status":status,
-                "original_issue":issue.model_dump(mode="json"),"display_action":display_action,"display_transformations":display_changes})
+                "requirement_refs":issue.requirement_refs,"quote_ids":list(dict.fromkeys([qid,*material_qids])),"source_refs":refs,"locations":locs,"severity":issue.severity,"status":status,
+                "original_issue":issue.model_dump(mode="json"),"display_reason":display_reason,"display_action":display_action,"display_transformations":display_changes})
     doc.add_paragraph("办理与适用条件核对","Heading 1")
     paragraph("以下事项保留原文规定，尚未据此认定已办理、适用或满足。")
     for number,action in enumerate(package.review_actions,1):

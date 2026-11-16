@@ -139,6 +139,10 @@ def _material_match_report(ctx, requirements: list, manifest: dict, parsed: dict
     if recall_settings is not None:
         from .material_recall import integrate_material_recall
         report = integrate_material_recall(ctx, requirements, manifest, parsed, report, recall_settings, recall_handled)
+        if recall_settings.get("read_selected_originals", False):
+            from .material_content_matching import integrate_original_content
+            _capture(ctx, "n3-material-matching-catalog-stage", report)
+            report = integrate_original_content(ctx, requirements, manifest, parsed, report)
     _capture(ctx, "n3-material-matching", report)
     return report
 
