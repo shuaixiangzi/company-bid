@@ -9,15 +9,15 @@ from docx import Document
 from PIL import Image, ImageDraw
 import pytest
 
-from company_bid import material_content_index, material_local_ocr, material_ocr_index
+from company_bid import material_content_index, material_deepseek_ocr, material_ocr_index
 from company_bid.evidence import prepare_evidence
 from company_bid.models import file_sha256
 from company_bid.runtime import Executor, NodeSpec
 from company_bid.storage import digest
 
 
-FINGERPRINT = {"engine": "synthetic-local-ocr", "version": "test-v1", "language": "en-US"}
-OPTIONS = {"expected_engine_fingerprint": FINGERPRINT}
+FINGERPRINT = {"engine": "deepseek_ocr", "version": "synthetic-test-v1"}
+OPTIONS = {"engine": "deepseek_ocr", "expected_engine_fingerprint": FINGERPRINT}
 
 
 def _source(path):
@@ -55,9 +55,9 @@ def _manifest(path, *, pages=None, parts=None, crop=None, rotation=0):
 def _engine(monkeypatch, *, text="ISO14001 selected OCR", fail_target_once=None):
     calls = []
     failed = set()
-    monkeypatch.setattr(material_local_ocr, "engine_fingerprint", lambda options: copy.deepcopy(FINGERPRINT))
+    monkeypatch.setattr(material_deepseek_ocr, "engine_fingerprint", lambda options: copy.deepcopy(FINGERPRINT))
 
-    def recognize(ctx, *, image_path, image_sha256, identity, options):
+    def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_reference=None):
         assert file_sha256(Path(image_path)) == image_sha256
         calls.append(copy.deepcopy(identity))
         target = identity["target"]
@@ -68,7 +68,7 @@ def _engine(monkeypatch, *, text="ISO14001 selected OCR", fail_target_once=None)
                 "lines": [{"text": text, "words": [{"text": text, "box": [0.0, 0.0, 40.0, 15.0]}]}] if text else [],
                 "call_id": "synthetic-ocr-" + str(len(calls)), "api_cost_estimate_usd": 0}
 
-    monkeypatch.setattr(material_local_ocr, "recognize", recognize)
+    monkeypatch.setattr(material_deepseek_ocr, "recognize", recognize)
     return calls
 
 
@@ -213,7 +213,7 @@ def test_wrong_selected_target_cannot_borrow_another_page(tmp_path, monkeypatch)
 def test_source_and_selected_png_are_rechecked_after_recognition(tmp_path, monkeypatch, changed):
     path = _pdf(tmp_path)
     calls = _engine(monkeypatch)
-    recognize = material_local_ocr.recognize
+    recognize = material_deepseek_ocr.recognize
 
     def changed_during_call(ctx, **kwargs):
         result = recognize(ctx, **kwargs)
@@ -222,7 +222,7 @@ def test_source_and_selected_png_are_rechecked_after_recognition(tmp_path, monke
             handle.write(b"\nchanged-during-recognition")
         return result
 
-    monkeypatch.setattr(material_local_ocr, "recognize", changed_during_call)
+    monkeypatch.setattr(material_deepseek_ocr, "recognize", changed_during_call)
     _, _, state = _execute(tmp_path, _manifest(path))
     assert state["status"] == "failed"
     expected = "MATERIAL_CONTENT_SOURCE_HASH_MISMATCH" if changed == "source" else "MATERIAL_OCR_IMAGE_CHANGED_DURING_CALL"

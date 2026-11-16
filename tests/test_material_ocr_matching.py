@@ -3,7 +3,7 @@ import copy
 
 import pytest
 
-from company_bid import material_content_index, material_content_matching, material_local_ocr
+from company_bid import material_content_index, material_content_matching, material_deepseek_ocr
 from company_bid import material_ocr_index, material_recall
 from company_bid.material_matching import material_candidate_report
 from company_bid.storage import digest
@@ -16,8 +16,8 @@ from test_material_ocr_index import _engine, _execute, _manifest, _pdf
 def no_real_ocr(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("Matching tests must never invoke an OCR engine or provider")
-    monkeypatch.setattr(material_local_ocr, "recognize", forbidden)
-    monkeypatch.setattr(material_local_ocr, "engine_fingerprint", forbidden)
+    monkeypatch.setattr(material_deepseek_ocr, "recognize", forbidden)
+    monkeypatch.setattr(material_deepseek_ocr, "engine_fingerprint", forbidden)
 
 
 def requirement(text="须提供营业执照。"):
@@ -276,7 +276,7 @@ def test_issue_transcription_counts_preserve_original_missing_and_requirement_te
     assert issues[0]["reason"].startswith(before[0][0]["reason"] + "\n")
     assert all(issues[0][k] == v for k, v in before[0][0].items() if k != "reason")
     assert "全部所选3页/图" in issues[0]["reason"]
-    assert "2项已有本地OCR转录文字（含1项裁剪区域）" in issues[0]["reason"]
+    assert "2项已有历史OCR转录文字（含1项裁剪区域）" in issues[0]["reason"]
     assert "1项仍未取得可用识别文字" in issues[0]["reason"]
     assert "机器转录不等于原件完整读取或资格核验" in issues[0]["reason"]
     assert "未做OCR" not in issues[0]["reason"] and "原缺项继续保留" in issues[0]["reason"]

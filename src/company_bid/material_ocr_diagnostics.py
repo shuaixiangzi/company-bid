@@ -220,7 +220,7 @@ def index_local_ocr(state, events, spans, *, artifact_json, ref, gap):
 
     preflight = []
     for event in events:
-        if event.get("event") != "material_ocr.preflight.failed":
+        if event.get("event") != "material_ocr.preflight.failed" or event.get("provider") != "windows_ocr":
             continue
         row = {key: _token(event.get(key)) for key in ("node_key", "node_attempt_id", "unit_id", "unit_attempt_id", "error_code")}
         row.update(trace_id=event.get("trace_id"), span_id=event.get("span_id"),

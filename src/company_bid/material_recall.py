@@ -54,6 +54,8 @@ def plan_recall_scope(requirements: list, report: dict, settings: dict, handled_
         raise ProviderFailure("SEMANTIC_PLANNING_CONFIG_INVALID") from None
     if options.original_ocr is not None and not options.read_selected_originals:
         raise ProviderFailure("MATERIAL_OCR_SELECTED_ORIGINALS_REQUIRED")
+    if options.original_ocr is not None and options.original_ocr.get("engine") != "deepseek_ocr":
+        raise ProviderFailure("MATERIAL_OCR_DEEPSEEK_REQUIRED_NO_LOCAL_FALLBACK")
     reqs = {r["requirement_id"]: r for r in requirements}
     if len(reqs) != len(requirements):
         raise ProviderFailure("SEMANTIC_REQUIREMENT_ID_DUPLICATE")
@@ -187,6 +189,41 @@ def _catalog_stage(row: dict, groups: dict) -> str:
     return result
 
 
+def _numeric_review_scope(content_index: dict, query: dict, row: dict) -> dict:
+    """Bind OCR warnings to this requirement's candidate groups, never the whole library."""
+    candidate_ids = set(query.get("candidate_group_ids", []))
+    candidate_ids.update(row.get("deterministic_group_ids", []))
+    candidate_ids.update(row.get("catalog_stage_dictionary_candidate_group_ids", []))
+    candidate_ids.update(candidate["group_id"] for candidate in row.get("candidates", []))
+    units, linked_groups = {}, set()
+    for group in content_index.get("groups", []):
+        if group["group_id"] not in candidate_ids:
+            continue
+        for unit in group.get("units", []):
+            numeric = unit.get("numeric_validation")
+            if not isinstance(numeric, dict):
+                continue
+            linked_groups.add(group["group_id"])
+            # A selected image can belong to multiple material groups. Count its
+            # authenticated unit once while retaining every candidate binding.
+            identity = (unit["source_id"], unit["unit_id"], unit.get("ocr_image_sha256"))
+            units[identity] = {key: copy.deepcopy(unit.get(key)) for key in
+                ("source_id", "unit_id", "target", "ocr_image_sha256", "ocr_unit_id", "ocr_output_sha256")}
+            units[identity].update(status=numeric.get("status", "pending_source_check"),
+                numeric_validation_sha256=digest(numeric),
+                finding_codes=[finding["code"] for finding in numeric.get("findings", [])])
+    codes = {}
+    for unit in units.values():
+        for code in unit["finding_codes"]:
+            codes[code] = codes.get(code, 0) + 1
+    return {"group_ids": sorted(linked_groups), "units": list(units.values()),
+            "selected_unit_count": len(units),
+            "pending_unit_count": sum(unit["status"] not in {"no_numeric_tokens", "no_numeric_content"}
+                                      for unit in units.values()),
+            "finding_count": sum(codes.values()), "finding_codes": codes,
+            "scope": "requirement_candidate_groups_only", "automatic_numeric_adoption": False}
+
+
 def annotate_material_issues(issues: list, report: dict) -> list:
     """Append scoped stage results; retain original gaps and response provenance."""
     groups = {g["group_id"]: g for g in report["proof_groups"]}
@@ -197,7 +234,11 @@ def annotate_material_issues(issues: list, report: dict) -> list:
     changes = []
     for issue in issues:
         relevant = [(rid, rows[rid]) for rid in issue["requirement_refs"] if rid in rows]
-        if not any(row.get("catalog_stage_status", row["status"]) in annotated or row["condition_findings"] for _, row in relevant):
+        numeric_scopes = {rid: _numeric_review_scope(report.get("original_content_index") or {},
+                                                     queries.get(rid, {}), row) for rid, row in relevant}
+        if not any(row.get("catalog_stage_status", row["status"]) in annotated or row["condition_findings"]
+                   or numeric_scopes[rid]["pending_unit_count"] or numeric_scopes[rid]["finding_count"]
+                   for rid, row in relevant):
             continue
         additions, contexts = [], []
         for rid, row in relevant:
@@ -215,11 +256,22 @@ def annotate_material_issues(issues: list, report: dict) -> list:
             for finding in row["condition_findings"]:
                 # The preceding requirement ID binds the unchanged condition text.
                 additions.append("条件核对：" + finding["reason"])
+            numeric = numeric_scopes[rid]
+            if numeric["pending_unit_count"] or numeric["finding_count"]:
+                additions.append(f"本条候选证明的 OCR 核对：已关联{numeric['selected_unit_count']}页/图，"
+                                 f"{numeric['pending_unit_count']}项的数字、日期或单位仍需原图核对。")
+                if numeric["finding_count"]:
+                    labels = {"OCR_DATE_INVALID": "日期不合法", "OCR_NUMERIC_GLYPH_AMBIGUOUS": "数字字形有歧义",
+                              "OCR_TABLE_ARITHMETIC_INCONSISTENT": "表内数量、单价与金额不一致"}
+                    findings = "、".join(f"{labels.get(code, '其他数字核对疑点')}{amount}处"
+                                         for code, amount in sorted(numeric["finding_codes"].items()))
+                    additions.append(f"本条候选证明的 OCR 数字校验发现{numeric['finding_count']}处疑点（{findings}）；"
+                                     "对应页/图及来源保留在逐条诊断中，需回到原图核对，不自动改数或认定原件有错。")
             contexts.append({"requirement_id": rid, "original_requirement": original,
                              "original_conditions": copy.deepcopy(query.get("request", {}).get("conditions", {})),
                              "deterministic_search_status": query.get("search_status"),
                              "deterministic_read_scope_status": query.get("read_scope_status"),
-                             "semantic_recall": copy.deepcopy(row)})
+                             "semantic_recall": copy.deepcopy(row), "ocr_numeric_review": numeric})
         content_index = report.get("original_content_index")
         if content_index:
             coverage = content_index["coverage"]
@@ -234,7 +286,8 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                 transcribed = coverage["ocr_transcribed_unverified_count"]
                 pending = coverage["pending_ocr_unit_count"]
                 crops = coverage["ocr_transcribed_crop_count"]
-                additions.append(f"原件读取：目录索引内全部所选{count}页/图，{transcribed}项已有本地OCR转录文字（含{crops}项裁剪区域），{pending}项仍未取得可用识别文字；字段准确性、手写内容和表格关系待核。机器转录不等于原件完整读取或资格核验。")
+                engine_name = "DeepSeek OCR" if coverage.get("ocr_engine", {}).get("engine") == "deepseek_ocr" else "历史OCR"
+                additions.append(f"原件读取：目录索引内全部所选{count}页/图，{transcribed}项已有{engine_name}转录文字（含{crops}项裁剪区域），{pending}项仍未取得可用识别文字；字段准确性、手写内容和表格关系待核。机器转录不等于原件完整读取或资格核验。")
             else:
                 additions.append(f"原件读取：目录索引内所选{count}页/图，{read}项读取完整，{unread}项未读全或不支持读取{empty_scope}{missing_scope}；正文读取不等于资格核验。")
             for context in contexts:

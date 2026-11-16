@@ -73,6 +73,8 @@ def main(argv=None):
             atomic_json(target, report)
             print(json.dumps({"diagnostics": str(target.resolve()), "evidence_status": report["evidence_status"],
                               "gap_count": len(report["gaps"]), "actual_call_attempts": report["actual_call_attempts"],
+                              "deepseek_ocr_actual_attempts": report["deepseek_ocr_actual_attempts"],
+                              "deepseek_ocr_failed_attempts": report["deepseek_ocr_failed_attempts"],
                               "actual_local_ocr_attempts": report["actual_local_ocr_attempts"],
                               "local_ocr_completed_attempts": report["local_ocr_completed_attempts"],
                               "local_ocr_failed_attempts": report["local_ocr_failed_attempts"]}))

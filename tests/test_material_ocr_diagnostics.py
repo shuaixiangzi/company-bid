@@ -8,7 +8,7 @@ import json
 from PIL import Image
 import pytest
 
-from company_bid import material_local_ocr as ocr
+import legacy_local_ocr_events as ocr
 from company_bid.diagnostics import inspect_diagnostics
 from company_bid.runtime import Executor, NodeSpec
 from company_bid.storage import digest, json_bytes

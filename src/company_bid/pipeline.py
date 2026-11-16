@@ -31,7 +31,8 @@ def _version(*names: str) -> str:
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
                     "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py", "project_identity.py", "commitment_planning.py", "reviewed_source_actions.py", "material_recall.py"),
                     "material_recall.py": ("semantic_materials.py", "material_source_selection.py", "semantic_replay.py", "evidence.py"),
-                    "material_matching.py": ("material_content_matching.py", "material_content_index.py", "material_ocr_index.py", "material_local_ocr.py", "windows_material_ocr.ps1"),
+                    "material_matching.py": ("material_content_matching.py", "material_content_index.py", "material_ocr_index.py", "material_deepseek_ocr.py", "material_ocr_quality.py", "material_ocr_replay.py", "material_ocr_budget.py"),
+                    "material_ocr_replay.py": ("diagnostic_replay.py",),
                     "semantic_replay.py": ("diagnostic_replay.py",),
                     "diagnostics.py": ("material_ocr_diagnostics.py",),
                     "pipeline.py": ("project_constraint_runtime.py",),
@@ -66,6 +67,8 @@ def validate_sources(prepared: PreparedBid) -> None:
 
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
+    from .material_ocr_budget import validate_pipeline_ocr_budget
+    validate_pipeline_ocr_budget(config)
     if config.get("pipeline") == "library":
         from .library_pipeline import build_library_executor
         return build_library_executor(root, config, _version)

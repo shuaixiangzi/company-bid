@@ -1,10 +1,11 @@
-"""Bounded local transcription of selected proof images, never verified facts."""
+"""DeepSeek-only selected proof transcription; failures never fall back."""
 from __future__ import annotations
 
 import copy
 import hashlib
 import importlib.metadata
 import io
+import re
 from pathlib import Path
 import zipfile
 
@@ -15,7 +16,77 @@ from .material_content_index import MaterialContentFailure, _require, _verify_fi
 from .models import file_sha256
 from .storage import digest
 
-MATERIAL_OCR_INDEX_VERSION = 'material-ocr-index.v1'
+MATERIAL_OCR_INDEX_VERSION = 'material-ocr-index.v2'
+
+
+def _settings(options):
+    _require(isinstance(options, dict) and options.get('engine') == 'deepseek_ocr',
+             'MATERIAL_OCR_DEEPSEEK_REQUIRED_NO_LOCAL_FALLBACK')
+    provider = {k: v for k, v in options.items() if k not in {'recorded_sources', 'source_checks'}}
+    bindings, checks = options.get('recorded_sources', {}), options.get('source_checks', {})
+    for mapping in (bindings, checks):
+        _require(isinstance(mapping, dict) and len(mapping) <= 2000 and
+                 all(isinstance(k, str) and re.fullmatch(r'[0-9a-f]{64}', k) for k in mapping),
+                 'MATERIAL_OCR_REVIEW_OR_REPLAY_CONFIG_INVALID')
+        _require(all(isinstance(value, dict) and bool(value) for value in mapping.values()),
+                 'MATERIAL_OCR_REVIEW_OR_REPLAY_CONFIG_INVALID')
+    for binding in bindings.values():
+        _require(set(binding) == {'run_id', 'node_key', 'unit_id'} and
+                 all(isinstance(value, str) and value for value in binding.values()) and
+                 re.fullmatch(r'[0-9a-f]{32}', binding['run_id']) and binding['node_key'] == 'OCR_COMPARISON',
+                 'MATERIAL_OCR_REVIEW_OR_REPLAY_CONFIG_INVALID')
+    return provider, bindings, checks
+
+
+def _reviewed_reference(review, identity):
+    if review is None:
+        return None
+    _require(isinstance(review, dict) and set(review) == {
+        'source_id', 'source_sha256', 'selection_sha256', 'image_sha256',
+        'review_method', 'review_id', 'reference', 'reference_sha256'}, 'MATERIAL_OCR_REVIEW_SCHEMA_INVALID')
+    _require(all(review[k] == identity[k] for k in
+                 ('source_id', 'source_sha256', 'selection_sha256', 'image_sha256')),
+             'MATERIAL_OCR_REVIEW_SOURCE_CHANGED')
+    _require(review['review_method'] in {'operator_source_image_review', 'agent_source_image_review'} and
+             isinstance(review['review_id'], str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,120}', review['review_id']),
+             'MATERIAL_OCR_REVIEW_PROVENANCE_REQUIRED')
+    reference = review['reference']
+    _require(isinstance(reference, dict) and reference.get('image_sha256') == identity['image_sha256'] and
+             digest(reference) == review['reference_sha256'], 'MATERIAL_OCR_REVIEW_HASH_INVALID')
+    return copy.deepcopy(reference)
+
+
+def _recorded(ctx, binding, identity, dimensions, provider, fingerprint, reference):
+    from .material_ocr_replay import replay_material_ocr
+    from .material_ocr_quality import assess_ocr_response
+
+    metadata = {'operation': 'material_ocr_replay_validation', 'input_hash': digest(identity)}
+    provenance = None
+    with ctx._observer.span('material.ocr_replay_validation', {**metadata, **ctx._metadata()}):
+        try:
+            raw, provenance = replay_material_ocr(ctx, binding=binding, image_sha256=identity['image_sha256'],
+                identity=identity, purpose=provider.get('purpose', 'rich_layout_recognition'))
+            result = assess_ocr_response(raw, width=dimensions[0], height=dimensions[1],
+                                         identity=identity, numeric_reference=reference)
+            result.update(width=dimensions[0], height=dimensions[1], image_sha256=identity['image_sha256'],
+                          engine_fingerprint=fingerprint, call_id=provenance['origin_call_id'],
+                          recorded_response=provenance, actual_new_api_calls=0,
+                          qualification_result='not_determined', project_assignment='not_made',
+                          quality_status='machine_transcription_unverified')
+            captured = ctx.capture('material-ocr-replay-validation', {
+                'status': 'passed', 'provenance': provenance, 'validated_output': result})
+            _require(captured and captured['status'] == 'captured', 'MATERIAL_OCR_REPLAY_CAPTURE_REQUIRED')
+            ctx.call_event('material.ocr_replay.validated', {**metadata, 'output_hash': digest(result),
+                                                           'validation_status': 'passed'})
+            return result
+        except Exception as error:
+            code = getattr(error, 'code', 'MATERIAL_OCR_REPLAY_VALIDATION_FAILED')
+            captured = ctx.capture('material-ocr-replay-validation-error', {'status': 'failed',
+                'provenance': provenance, 'error_code': code, 'details': getattr(error, 'details', {})})
+            _require(captured and captured['status'] == 'captured', 'MATERIAL_OCR_REPLAY_CAPTURE_REQUIRED')
+            ctx.call_event('material.ocr_replay.rejected', {**metadata, 'error_code': code,
+                                                          'validation_status': 'failed'})
+            raise
 
 
 def _render(source, selection, target):
@@ -46,10 +117,11 @@ def _render(source, selection, target):
 
 
 def transcribe_selected_index(ctx, manifest, index, options):
-    from .material_local_ocr import engine_fingerprint, recognize
+    from .material_deepseek_ocr import engine_fingerprint, recognize
 
-    fingerprint = engine_fingerprint(options)
-    expected = options.get('expected_engine_fingerprint')
+    provider, bindings, reviews = _settings(options)
+    fingerprint = engine_fingerprint(provider)
+    expected = provider.get('expected_engine_fingerprint')
     _require(expected == fingerprint or expected == digest(fingerprint), 'MATERIAL_OCR_ENGINE_NOT_FROZEN')
     output = copy.deepcopy(index)
     sources = {s['source_id']: s for s in manifest['sources']}
@@ -58,9 +130,30 @@ def transcribe_selected_index(ctx, manifest, index, options):
     groups = {g['group_id']: g for g in output['groups']}
     renderer = {name: importlib.metadata.version(name) for name in ('pypdfium2', 'Pillow')}
     documents = {d['source_id']: d for d in output['parsed']['documents']}
+    planned_images = set()
+    for meta in output['units']:
+        if meta['status'] in {'read', 'empty'}:
+            continue
+        for gid in meta['group_ids']:
+            group = groups[gid]
+            selection = selections[group['origin']['selection_id']]
+            targets = selection.pages if selection.format == 'pdf_pages' else selection.package_parts
+            source = sources[meta['source_id']]
+            _require(selection.source_id == source['source_id'] and selection.source_sha256 == source['sha256']
+                     and meta['target'] in targets, 'MATERIAL_OCR_SELECTION_SOURCE_INVALID')
+            locator = (f"pdf/page[{meta['target']}]" if selection.format == 'pdf_pages'
+                       else 'docx/' + meta['target'])
+            aid = 'PROOF-' + digest([selection.selection_id, locator])[:24]
+            _require(aid in attachments and aid in group['attachment_ids'], 'MATERIAL_OCR_ATTACHMENT_SCOPE_INVALID')
+            planned_images.add(attachments[aid]['sha256'])
+    _require(set(bindings) <= planned_images and set(reviews) <= planned_images,
+             'MATERIAL_OCR_UNUSED_REPLAY_OR_REVIEW_SCOPE')
     counters = {'ocr_transcribed_unverified_count': 0, 'ocr_no_text_count': 0,
                 'ocr_transcribed_crop_count': 0, 'ocr_text_char_count': 0,
-                'ocr_processed_unit_count': 0, 'ocr_failed_count': 0}
+                'ocr_processed_unit_count': 0, 'ocr_failed_count': 0,
+                'ocr_recorded_response_count': 0, 'ocr_numeric_pending_unit_count': 0,
+                'ocr_numeric_issue_count': 0, 'ocr_numeric_issue_codes': {}}
+    seen_images = set()
     for meta in output['units']:
         if meta['status'] in {'read', 'empty'}:
             continue
@@ -96,12 +189,17 @@ def transcribe_selected_index(ctx, manifest, index, options):
                     'rotate_clockwise': selection.rotate_clockwise, 'render_dpi': selection.render_dpi,
                     'group_bindings': [{k: g[k] for k in ('group_id', 'origin', 'attachment_ids', 'source_refs')}
                                        for g in selected_groups], 'image_sha256': attachment['sha256']}
+        seen_images.add(attachment['sha256'])
+        binding = bindings.get(attachment['sha256'])
+        review = reviews.get(attachment['sha256'])
+        reference = _reviewed_reference(review, identity)
         inputs = {'version': MATERIAL_OCR_INDEX_VERSION, 'identity': identity, 'renderer': renderer,
-                  'engine_fingerprint': fingerprint, 'options': options}
+                  'engine_fingerprint': fingerprint, 'options': provider,
+                  'recorded_source': binding, 'reviewed_numeric_reference': review}
         unit_id = 'material-ocr-' + digest(identity)[:24]
 
         def transcribe(source=source, selection=selection, target=meta['target'], identity=identity,
-                       attachment=attachment, inputs=inputs):
+                       attachment=attachment, inputs=inputs, binding=binding, reference=reference):
             try:
                 data, dimensions = _render(source, selection, target)
             except MaterialContentFailure:
@@ -111,14 +209,16 @@ def transcribe_selected_index(ctx, manifest, index, options):
             _require(hashlib.sha256(data).hexdigest() == attachment['sha256'],
                      'MATERIAL_OCR_RENDERED_SCOPE_HASH_MISMATCH')
             # Use the authenticated original attachment bytes, never a whole page for a crop.
-            response = recognize(ctx, image_path=attachment['path'], image_sha256=attachment['sha256'],
-                                 identity=identity, options=options)
+            response = (_recorded(ctx, binding, identity, dimensions, provider, fingerprint, reference)
+                if binding is not None else recognize(ctx, image_path=attachment['path'],
+                    image_sha256=attachment['sha256'], identity=identity, options=provider,
+                    numeric_reference=reference))
             _verify_file(source)
             _require(file_sha256(Path(attachment['path'])) == attachment['sha256'],
                      'MATERIAL_OCR_IMAGE_CHANGED_DURING_CALL')
             result = {'input_sha256': digest(inputs), 'identity': identity, 'dimensions': dimensions,
                       'response': response, 'quality_status': 'machine_transcription_unverified',
-                      'reading_completeness': 'not_established', 'layout_status': 'lines_boxes_only_unverified',
+                      'reading_completeness': 'not_established', 'layout_status': 'regions_and_tables_unverified',
                       'qualification_result': 'not_determined', 'automatic_assembly_allowed': False}
             result['output_sha256'] = digest(result)
             return result
@@ -145,13 +245,16 @@ def transcribe_selected_index(ctx, manifest, index, options):
         for number, line in enumerate(response['lines']):
             if line['text'].strip():
                 boxes = [word['box'] for word in line.get('words', [])]
-                bbox = ([min(b[0] for b in boxes), min(b[1] for b in boxes),
+                bbox = line.get('bounding_box') or ([min(b[0] for b in boxes), min(b[1] for b in boxes),
                          max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)] if boxes else None)
                 unit['blocks'].append({'block_id': unit_id + '-line-' + str(number), 'source_id': source['source_id'],
                                       'kind': 'paragraph', 'origin': 'ocr', 'locator': prefix + '/ocr/line[' + str(number) + ']',
                                       'text': line['text'], 'rows': [], 'bbox': bbox})
         unit['material_content_ocr_candidate_readable'] = bool(text.strip())
         unit['transcription_status'] = transcription
+        numeric = copy.deepcopy(response.get('numeric_validation', {'status': 'pending_source_check'}))
+        unit['ocr_numeric_validation'] = numeric
+        unit['ocr_tables_unverified'] = copy.deepcopy(response.get('tables', []))
         unit['coverage'].update(status='needs_ocr', origin='mixed' if unit['coverage']['native_text_chars'] else 'ocr',
                                 error_code=None, warnings=[*unit['coverage'].get('warnings', []),
                                     'OCR_TEXT_AND_TABLE_RELATIONSHIPS_NOT_HUMAN_VERIFIED'])
@@ -159,8 +262,10 @@ def transcribe_selected_index(ctx, manifest, index, options):
                     ocr_char_count=len(text), ocr_text_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(),
                     ocr_unit_id=unit_id, ocr_input_sha256=digest(inputs), ocr_output_sha256=result['output_sha256'],
                     ocr_image_sha256=attachment['sha256'], coordinate_space='selected_image_pixels',
-                    local_ocr_call_id=response['call_id'], reading_completeness='not_established',
-                    layout_status='lines_boxes_only_unverified', status='needs_ocr')
+                    ocr_call_id=response['call_id'], ocr_provider='deepseek_official_ocr',
+                    ocr_recorded_response=copy.deepcopy(response.get('recorded_response')),
+                    numeric_validation=numeric, reading_completeness='not_established',
+                    layout_status='regions_and_tables_unverified', status='needs_ocr')
         for group in selected_groups:
             for row in group['units']:
                 if row['unit_id'] == meta['unit_id']:
@@ -170,22 +275,31 @@ def transcribe_selected_index(ctx, manifest, index, options):
         counters['ocr_transcribed_unverified_count'] += bool(text.strip())
         counters['ocr_no_text_count'] += not text.strip()
         counters['ocr_transcribed_crop_count'] += bool(text.strip() and selection.crop_box_normalized)
+        counters['ocr_recorded_response_count'] += response.get('recorded_response') is not None
+        counters['ocr_numeric_pending_unit_count'] += numeric.get('status') not in {'no_numeric_tokens', 'no_numeric_content'}
+        counters['ocr_numeric_issue_count'] += len(numeric.get('findings', []))
+        for finding in numeric.get('findings', []):
+            code = finding['code']
+            counters['ocr_numeric_issue_codes'][code] = counters['ocr_numeric_issue_codes'].get(code, 0) + 1
+    _require(set(bindings) <= seen_images and set(reviews) <= seen_images,
+             'MATERIAL_OCR_UNUSED_REPLAY_OR_REVIEW_SCOPE')
     coverage = output['coverage']
     coverage.update(counters)
     coverage['status_counts'] = {status: sum(u['status'] == status for u in output['units'])
                                  for status in ('read', 'empty', 'needs_ocr', 'unsupported')}
     coverage['pending_ocr_unit_count'] = sum(u['status'] not in {'read', 'empty'} and
         u.get('transcription_status') != 'ocr_transcribed_unverified' for u in output['units'])
-    coverage['local_ocr_engine'] = fingerprint
+    coverage['ocr_engine'] = fingerprint
+    coverage['fallback_enabled'] = False
     coverage['ocr_processed_count_includes_reused_checkpoints'] = True
-    coverage['api_ocr_calls'] = 0
+    coverage['actual_api_call_count_source'] = 'diagnostics_calls_and_attempts_not_checkpoint_count'
     # Per-attempt events are authoritative for actual calls, not this checkpoint total.
     coverage.pop('ocr_calls', None)
     output['parsed']['coverage'] = copy.deepcopy(coverage)
-    output['summary']['local_ocr'] = 'candidate_text_only_no_fact_or_qualification_adoption'
+    output['summary']['deepseek_ocr'] = 'candidate_text_only_no_fact_or_qualification_adoption'
     output['native_index_sha256'] = index['output_sha256']
     output['ocr_index_version'] = MATERIAL_OCR_INDEX_VERSION
     output['output_sha256'] = digest({k: v for k, v in output.items() if k != 'output_sha256'})
-    captured = ctx.capture('material-local-ocr-index', output)
+    captured = ctx.capture('material-deepseek-ocr-index', output)
     _require(captured and captured.get('status') == 'captured', 'MATERIAL_OCR_INDEX_CAPTURE_UNAVAILABLE')
     return output

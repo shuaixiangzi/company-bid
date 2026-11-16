@@ -342,14 +342,28 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         gaps.append({"code": "RUN_TRACE_INCOMPLETE", "status": state["observability"]["trace_status"]})
     from .material_ocr_diagnostics import index_local_ocr
     local_ocr = index_local_ocr(state, events, spans, artifact_json=artifact_json, ref=ref, gap=gap)
+    ocr_calls = [c for c in calls.values() if c.get("provider") == "deepseek_official_ocr"]
+    ocr_replays = [{**{key: event.get(key) for key in ("node_key", "unit_id", "unit_attempt_id",
+        "input_hash", "output_hash", "validation_status", "trace_id", "span_id")},
+        "origin_run_id": event.get("reused_from_run_id")}
+        for event in events if event.get("event") == "material.ocr_response_replayed"]
+    ocr_rejections = [{key: event.get(key) for key in ("node_key", "unit_id", "unit_attempt_id",
+        "error_code", "trace_id", "span_id")} for event in events
+        if event.get("event") == "material.ocr_replay.rejected" or
+        event.get("event") == "material_ocr.preflight.failed" and event.get("provider") == "deepseek_official_ocr"]
     return {"schema_version": "chain.diagnostic-index.v1", "run_id": run_id, "run_status": state["status"],
             **local_ocr,
+            "deepseek_ocr_calls": ocr_calls, "deepseek_ocr_actual_attempts": len(ocr_calls),
+            "deepseek_ocr_failed_attempts": sum(c["outcome"] == "failed" for c in ocr_calls),
+            "deepseek_ocr_replayed_sources": ocr_replays, "deepseek_ocr_replay_or_preflight_failures": ocr_rejections,
+            "material_ocr_local_fallback_enabled": False,
             "parent_run_id": state.get("parent_run_id"), "fork_from_node": state.get("fork_from_node"),
             "observability": state["observability"], "capture_policy": state["capture_policy"],
             "evidence_status": "incomplete" if gaps else "metadata_only_capture_disabled" if not state["capture_policy"] else
                                "available_with_content_limitations" if content_limitations else "available",
             "gaps": gaps, "content_limitations": content_limitations, "nodes": nodes, "execution_attempts": execution, "calls": list(calls.values()),
-            "actual_call_attempts": len(calls), "unknown_usage_attempts": sum(c.get("usage_status") != "known" for c in calls.values()),
+            "actual_call_attempts": len(calls), "unknown_usage_attempts": sum(c.get("usage_status") not in {"known", "not_token_billed"} for c in calls.values()),
+            "non_token_billed_attempts": sum(c.get("usage_status") == "not_token_billed" for c in calls.values()),
             "known_estimated_cost_usd": sum(c["cost"] for c in calls.values() if isinstance(c.get("cost"), (int, float))),
             "cost_is_provider_invoice": False, "call_reservations": budgets, "budget_summary": budget_summary,
             "storage_write_retries": [{key: item.get(key) for key in
