@@ -226,16 +226,21 @@ def assess_candidates(response: dict, report: dict, query: dict) -> list[dict]:
     return output
 
 
-def semantic_probe(ctx, value: dict, provider) -> dict:
+def semantic_probe(ctx, value: dict, provider, *, matching_report=None, query_limit=12) -> dict:
     manifest, requirements = value["manifest"], value["requirements"]
-    _require(len(requirements) <= 12 and len({r["requirement_id"] for r in requirements}) == len(requirements),
+    _require(1 <= query_limit <= 32 and len(requirements) <= query_limit and len({r["requirement_id"] for r in requirements}) == len(requirements),
              "SEMANTIC_QUERY_LIMIT_INVALID")
     source_hash = verify_material_files(manifest)
-    report = material_candidate_report(requirements, manifest.get("material_records", []),
+    report = matching_report if matching_report is not None else material_candidate_report(requirements, manifest.get("material_records", []),
         attachments=manifest.get("attachments", []), sources=manifest["sources"], parsed=value.get("parsed"),
         evidence_selections=manifest.get("evidence_selections"), proof_derivations=manifest.get("proof_derivations", []))
     catalog = ctx.run_unit("semantic-catalog", {"source_files_sha256": source_hash, "report_sha256": digest(report),
         "version": SEMANTIC_VERSION}, lambda: build_catalog(report))
+    # Checkpoint JSON sorts object keys. Preserve the original deterministic
+    # request string order on restart without changing or trusting new data.
+    rebuilt_catalog = build_catalog(report)
+    _require(catalog == rebuilt_catalog, "SEMANTIC_CATALOG_CHECKPOINT_CHANGED")
+    catalog = rebuilt_catalog
     queries = {q["requirement_id"]: q for q in report["proof_queries"]}
     rows = []
     for requirement in requirements:
@@ -269,7 +274,9 @@ def semantic_probe(ctx, value: dict, provider) -> dict:
                 validate=validate)
             _require(verify_material_files(manifest) == source_hash, "SEMANTIC_SOURCE_FILE_CHANGED")
             assessed = assess_candidates(response, report, query)
-            result = {"requirement_id": requirement["requirement_id"], "route": route, "model_called": True,
+            result = {"requirement_id": requirement["requirement_id"], "route": route,
+                      "model_called": not getattr(provider, "is_recorded_replay", False),
+                      "historical_response_reused": bool(getattr(provider, "is_recorded_replay", False)),
                       "candidates": assessed, "model_unresolved_conditions": response["unresolved_conditions"],
                       "qualification_result": "not_determined", "absence_conclusion": "not_established",
                       "required_conditions": copy.deepcopy(query["request"]["conditions"]),

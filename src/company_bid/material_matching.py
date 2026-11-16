@@ -773,7 +773,7 @@ def material_candidate_report(requirements: list[dict], records: list[dict], *,
                    excluded_group_ids=[item["group_id"] for item in evaluations if item["relation"] == "excluded"],
                    read_scope_status="incomplete" if scope_incomplete else "no_unread_selected_units_reported",
                    semantic_recall_status="not_applicable_negative_instruction" if request["rule"] == "negative_proof_instruction_not_searched"
-                   else "needed_but_not_implemented" if not supported or not selected else "not_performed")
+                   else "needed_not_performed_in_deterministic_report" if not supported or not selected else "not_performed")
         if "corrosion_control_qualification" in request["kinds"]:
             row["distinct_related_group_ids"] = [group["group_id"] for group in groups if group["proof_kind"] in
                 {"corrosion_control_design_qualification", "anti_corrosion_construction_qualification"}]
@@ -797,6 +797,7 @@ def material_candidate_report(requirements: list[dict], records: list[dict], *,
                                  "explicit_historical_performance_compilation"}
                              else "requested_proof_candidate"})
     report.update(schema_version="material.candidates.v3", matching_version=MATERIAL_MATCHING_VERSION,
+                  report_scope="deterministic_baseline_only",
                   scope="frozen_prepared_declarations_and_proof_packages_only",
                   reading_scope=reading, record_candidates=[_record_view(record) for record in records],
                   proof_groups=groups, proof_queries=proof_queries, assembly_candidates=assembly,

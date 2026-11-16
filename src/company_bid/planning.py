@@ -102,7 +102,7 @@ def _response_writing_control(requirement: dict, blocks: dict) -> str | None:
     return rule
 
 
-def _material_match_report(ctx, requirements: list, manifest: dict, parsed: dict) -> dict:
+def _material_match_report(ctx, requirements: list, manifest: dict, parsed: dict, *, recall_settings=None, recall_handled=None) -> dict:
     """Persist one shared inventory and independently resumable query results.
 
     Full text stays in controlled inputs/outputs; ordinary unit events contain
@@ -136,6 +136,9 @@ def _material_match_report(ctx, requirements: list, manifest: dict, parsed: dict
         report["checkpoint_units"].append({"unit_id": unit_id, "requirement_id": requirement["requirement_id"],
                                            "output_sha256": _hash(result)})
     report["matching_version"] = MATCHING_VERSION
+    if recall_settings is not None:
+        from .material_recall import integrate_material_recall
+        report = integrate_material_recall(ctx, requirements, manifest, parsed, report, recall_settings, recall_handled)
     _capture(ctx, "n3-material-matching", report)
     return report
 
@@ -1128,6 +1131,13 @@ def _remote_format_resolution(requirement, chapter, ledger, blocks, windows, doc
 def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, config: dict) -> dict:
     """N3: freeze an automatic PreparedBid; never let a model fill values."""
     manifest = _json(manifest)
+    source_manifest = copy.deepcopy(manifest)
+    if config.get("semantic_material_recall") is not None:
+        from .material_recall import RecallOptions
+        recall_options = RecallOptions.model_validate(config["semantic_material_recall"])
+        if recall_options.additional_evidence:
+            from .material_source_selection import extend_material_evidence
+            manifest = extend_material_evidence(ctx, manifest, parsed, recall_options.additional_evidence)
     _fail("map_table_fields" in config and type(config["map_table_fields"]) is not bool, "PLANNING_CONFIGURATION_INVALID")
     blocks, units, documents = _index(parsed, manifest)
     _fail(extracted.get("producer_version") != EXTRACTION_VERSION or extracted.get("parsed_hash") != _hash(parsed),
@@ -1170,8 +1180,10 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         document, [block for block in blocks.values() if block["source_id"] == document["source_id"]],
         [proof for proof in table_continuations if proof["source_id"] == document["source_id"]])]
 
-    input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": manifest,
+    input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": source_manifest,
                   "parsed_hash": _hash(parsed), "config": config}
+    if manifest != source_manifest:
+        input_data["material_manifest"] = manifest
 
     def assemble():
         planned_formats, format_ledger, format_errors = _format_plan(extracted, blocks, documents)
@@ -1336,7 +1348,15 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                                              "remote_format_resolutions": remote_format_resolutions,
                                              "errors": format_errors, "status": "failed" if format_errors else "complete"})
         _fail(bool(format_errors), "REQUIRED_FORMAT_UNRESOLVED")
-        material_report = _material_match_report(ctx, planned_requirements, manifest, parsed)
+        recall_handled = {}
+        for route, bindings in (("source_bound_contract_pending", contract_bindings),
+                                ("source_bound_contract_review", contract_review_bindings),
+                                ("source_bound_preparation_action", source_rules),
+                                ("source_bound_reviewed_action", reviewed_actions_by_id)):
+            for rid, binding in bindings.items():
+                recall_handled[rid] = {"route": route, "binding_sha256": _hash(binding)}
+        material_report = _material_match_report(ctx, planned_requirements, manifest, parsed,
+            recall_settings=config.get("semantic_material_recall"), recall_handled=recall_handled)
         sources = copy.deepcopy(manifest["sources"])
         source_map = {item["source_id"]: item for item in sources}
         facts = _fact_index(manifest)
@@ -2099,6 +2119,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         _capture(ctx, "n3-outline-grouping", {"producer_version": PLANNING_VERSION,
             "placements": outline_groups, "writing_controls": writing_control_handling,
             "n2_candidate_mutation": False, "satisfaction_status": "not_determined"})
+        material_recall_issue_changes = []
+        if config.get("semantic_material_recall") is not None:
+            from .material_recall import annotate_material_issues
+            material_recall_issue_changes = annotate_material_issues(issues, material_report)
+            _capture(ctx, "n3-material-recall-issues", {"changes": material_recall_issue_changes,
+                "qualification_result": "not_determined", "assembly_candidates_added": 0})
         output = PreparedBid.model_validate(output_values).model_dump(mode="json")
         report = {"producer_version": PLANNING_VERSION, "parsed_hash": _hash(parsed),
                   "writing_refinement": writing_refinement, "response_organization": response_organization,
@@ -2106,6 +2132,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                   "commitment_writing_plan": commitment_plan,
                   "reviewed_source_actions": reviewed_source_report,
                   "material_matching": material_report,
+                  "material_recall_issue_changes": material_recall_issue_changes,
                   "outline_grouping": outline_groups, "response_writing_controls": writing_control_handling,
                   "source_format_derivations": source_format_derivations,
                   "requirement_placements": placements, "tables": table_reports, "attachments": attachment_reports,

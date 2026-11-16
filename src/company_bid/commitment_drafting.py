@@ -255,6 +255,34 @@ def _same_writing_input(original, current):
     return digest(old) == digest(new)
 
 
+def _review_config_rebind(original, current, binding):
+    """Permit one N3-only option while retaining exact writing authentication.
+
+    This comparison is not sufficient to reuse a candidate: the caller must
+    still validate the pinned N1/N2/N3, every writing input and the actual wire.
+    An absent planning container may be created solely for the allowed option.
+    """
+    if digest(original) == digest(current):
+        return None
+    spec = binding.get("source_rebind")
+    _require(isinstance(spec, dict) and spec.get("version") == "exact-writing-inputs-v1",
+             "REVIEW_ORIGIN_CONFIG_CHANGED")
+    old, new = copy.deepcopy(original), copy.deepcopy(current)
+    old_planning, new_planning = old.pop("planning", {}), new.pop("planning", {})
+    _require(isinstance(old_planning, dict) and isinstance(new_planning, dict),
+             "REVIEW_ORIGIN_CONFIG_CHANGED")
+    key = "semantic_material_recall"
+    old_present, new_present = key in old_planning, key in new_planning
+    old_value, new_value = old_planning.pop(key, None), new_planning.pop(key, None)
+    _require((old_present != new_present or digest(old_value) != digest(new_value))
+             and digest(old) == digest(new) and digest(old_planning) == digest(new_planning),
+             "REVIEW_ORIGIN_CONFIG_CHANGED")
+    return {"allowed_config_path": "planning.semantic_material_recall",
+            "origin_execution_config_sha256": digest(original),
+            "current_execution_config_without_review_sha256": digest(current),
+            "origin_option_present": old_present, "current_option_present": new_present}
+
+
 def _prepare_reviewed(ctx, provider, prepared, constraints):
     binding = provider.config.get("reviewed_candidates")
     _require(isinstance(binding, dict) and set(binding) in ({"path", "sha256"}, {"path", "sha256", "source_rebind"})
@@ -268,7 +296,7 @@ def _prepare_reviewed(ctx, provider, prepared, constraints):
     origin = _review_origin(ctx, packet["origin"])
     expected_config = copy.deepcopy(ctx.execution_config)
     expected_config["commitment_drafting"].pop("reviewed_candidates")
-    _require(digest(expected_config) == digest(origin.state["execution_config"]), "REVIEW_ORIGIN_CONFIG_CHANGED")
+    config_rebind = _review_config_rebind(origin.state["execution_config"], expected_config, binding)
     current_n3 = next(item for item in ctx._state["nodes"] if item["key"] == "N3")
     original_n3 = origin.node("N3")
     _require(original_n3.get("status") == "succeeded", "REVIEW_N3_PREFIX_CHANGED")
@@ -278,6 +306,8 @@ def _prepare_reviewed(ctx, provider, prepared, constraints):
     if "source_rebind" in binding:
         original_prepared, original_constraints, rebind = _review_rebind_origin(
             ctx, origin, binding, current_n3, original_n3, frozen)
+        if config_rebind is not None:
+            rebind["configuration_rebind"] = config_rebind
     else:
         _require(current_n3["output_ref"] == original_n3["output_ref"], "REVIEW_N3_PREFIX_CHANGED")
         _require(frozen["prepared"] == prepared.model_dump(mode="json"), "REVIEW_PREPARED_CHANGED")

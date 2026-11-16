@@ -26,7 +26,7 @@ from company_bid.pipeline import build_executor
     ("project_constraints.py", {"N3", "N4", "N5", "N6"}),
     ("project_constraint_runtime.py", {"N3", "N4", "N5", "N6"}),
     # N4/N5 also authenticate historical writing via its shared origin reader.
-    ("diagnostic_replay.py", {"N2", "N4", "N5"}),
+    ("diagnostic_replay.py", {"N2", "N3", "N4", "N5"}),
     ("writing_replay.py", {"N4", "N5"}),
     ("material_heading_sources.py", {"N2", "N3"}),
     ("format_continuation_sources.py", {"N2", "N3"}),
@@ -42,6 +42,10 @@ from company_bid.pipeline import build_executor
     ("source_clauses.py", {"N2", "N3"}),
     ("table_continuations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("material_matching.py", {"N3"}),
+    ("material_recall.py", {"N3"}),
+    ("material_source_selection.py", {"N3"}),
+    ("semantic_materials.py", {"N3"}),
+    ("semantic_replay.py", {"N3"}),
     ("response_organization.py", {"N3"}),
     ("preparation_rules.py", {"N3", "N4", "N5", "N6"}),
 ])
