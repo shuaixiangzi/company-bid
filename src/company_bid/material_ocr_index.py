@@ -16,13 +16,13 @@ from .material_content_index import MaterialContentFailure, _require, _verify_fi
 from .models import file_sha256
 from .storage import digest
 
-MATERIAL_OCR_INDEX_VERSION = 'material-ocr-index.v3'
+MATERIAL_OCR_INDEX_VERSION = 'material-ocr-index.v4'
 
 
 def _settings(options):
     _require(isinstance(options, dict) and options.get('engine') == 'deepseek_ocr',
              'MATERIAL_OCR_DEEPSEEK_REQUIRED_NO_LOCAL_FALLBACK')
-    provider = {k: v for k, v in options.items() if k not in {'recorded_sources', 'source_checks', 'reading_crops', 'recorded_only'}}
+    provider = {k: v for k, v in options.items() if k not in {'recorded_sources', 'source_checks', 'reading_crops', 'recorded_only', 'failed_sources', 'failure_dispositions'}}
     _require(type(options.get('recorded_only', False)) is bool, 'MATERIAL_OCR_RECORDED_ONLY_INVALID')
     bindings, checks = options.get('recorded_sources', {}), options.get('source_checks', {})
     for mapping in (bindings, checks):
@@ -132,9 +132,17 @@ def _image_identity(source, meta, selection, selected_groups, attachment):
 def transcribe_selected_index(ctx, manifest, index, options):
     from .material_deepseek_ocr import engine_fingerprint, recognize
     from .material_ocr_regions import validate_reading_crops, derive_reading_region
+    from .material_ocr_disposition import validate_dispositions, recorded_quality_disposition
+    from .material_ocr_failure import validate_failed_sources
 
     provider, bindings, reviews = _settings(options)
     crops = validate_reading_crops(options.get('reading_crops', {}))
+    dispositions = validate_dispositions(options.get('failure_dispositions', {}))
+    failures = validate_failed_sources(options.get('failed_sources', {}))
+    _require(not (failures or dispositions) or options.get('recorded_only') is True,
+             'MATERIAL_OCR_DISPOSITION_RECORDED_ONLY_REQUIRED')
+    _require(not set(failures) & set(bindings) and set(dispositions) <= set(bindings),
+             'MATERIAL_OCR_DISPOSITION_BINDING_INVALID')
     fingerprint = engine_fingerprint(provider)
     expected = provider.get('expected_engine_fingerprint')
     _require(expected == fingerprint or expected == digest(fingerprint), 'MATERIAL_OCR_ENGINE_NOT_FROZEN')
@@ -172,15 +180,15 @@ def transcribe_selected_index(ctx, manifest, index, options):
                 planned_regions[attachment['sha256']] = region
     _require(set(crops) <= planned_images, 'MATERIAL_OCR_UNUSED_READING_CROP_SCOPE')
     reading_images = (planned_images - set(crops)) | {r['child_identity']['image_sha256'] for r in planned_regions.values()}
-    _require(set(bindings) <= reading_images and set(reviews) <= reading_images,
+    _require(set(bindings) <= reading_images and set(reviews) <= reading_images and set(failures) <= reading_images,
              'MATERIAL_OCR_UNUSED_REPLAY_OR_REVIEW_SCOPE')
-    _require(not options.get('recorded_only') or set(bindings) == reading_images,
+    _require(not options.get('recorded_only') or set(bindings) | set(failures) == reading_images,
              'MATERIAL_OCR_RECORDED_ONLY_COVERAGE_MISSING')
     counters = {'ocr_transcribed_unverified_count': 0, 'ocr_no_text_count': 0,
                 'ocr_transcribed_crop_count': 0, 'ocr_text_char_count': 0,
                 'ocr_processed_unit_count': 0, 'ocr_failed_count': 0,
                 'ocr_recorded_response_count': 0, 'ocr_numeric_pending_unit_count': 0,
-                'ocr_numeric_issue_count': 0, 'ocr_numeric_issue_codes': {}}
+                'ocr_numeric_issue_count': 0, 'ocr_numeric_issue_codes': {}, 'ocr_failed_pending_review_count': 0}
     seen_images = set()
     for meta in output['units']:
         if meta['status'] in {'read', 'empty'}:
@@ -223,6 +231,48 @@ def transcribe_selected_index(ctx, manifest, index, options):
         if region:
             inputs['reading_region_projection'] = region['projection']
         unit_id = 'material-ocr-' + digest(identity)[:24]
+
+        failure_spec, disposition_spec = failures.get(identity['image_sha256']), dispositions.get(identity['image_sha256'])
+        if failure_spec is not None or disposition_spec is not None:
+            _require(source.get('kind') in {'company_material', 'attachment'},
+                     'MATERIAL_OCR_FAILURE_COMPANY_PROOF_ONLY')
+            data, dimensions = _render(source, selection, meta['target'])
+            _require(hashlib.sha256(data).hexdigest() == attachment['sha256'], 'MATERIAL_OCR_RENDERED_SCOPE_HASH_MISMATCH')
+            if region:
+                dimensions = region['dimensions']
+            disposition_input = {**inputs, 'failed_source': failure_spec, 'failure_disposition': disposition_spec}
+            def dispose():
+                if failure_spec is not None:
+                    from .material_ocr_failure import authenticate_failed_material_ocr
+                    return authenticate_failed_material_ocr(ctx, specification=failure_spec,
+                        identity=identity, image_sha256=identity['image_sha256'],
+                        purpose=provider.get('purpose', 'rich_layout_recognition'))
+                return recorded_quality_disposition(ctx, binding=binding, identity=identity, dimensions=dimensions,
+                    provider=provider, reference=reference, specification=disposition_spec)
+            disposition = ctx.run_unit('material-ocr-disposition-' + digest(identity)[:24], disposition_input, dispose)
+            _require(disposition.get('identity_sha256') == digest(identity) and
+                     disposition.get('status') == 'reading_failed_pending_review' and
+                     disposition.get('machine_text_adopted') is False, 'MATERIAL_OCR_FAILURE_DISPOSITION_INVALID')
+            _verify_file(source)
+            _require(file_sha256(Path(attachment['path'])) == attachment['sha256'], 'MATERIAL_OCR_IMAGE_CHANGED_DURING_CALL')
+            units = [u for u in documents[source['source_id']]['units'] if u['unit_id'] == meta['unit_id']
+                     and set(u['material_content_group_ids']) == set(meta['group_ids'])]
+            _require(len(units) == 1, 'MATERIAL_OCR_PROJECTED_UNIT_AMBIGUOUS')
+            unit = units[0]
+            unit.update(material_content_ocr_candidate_readable=False, transcription_status='ocr_failed_pending_review',
+                        ocr_failure_disposition=copy.deepcopy(disposition))
+            unit['coverage'].update(status='needs_ocr', error_code=disposition['error_code'],
+                                    warnings=[*unit['coverage'].get('warnings', []), 'COMPANY_PROOF_READING_FAILED_PENDING_REVIEW'])
+            meta.update(transcription_status='ocr_failed_pending_review', ocr_failure_disposition=copy.deepcopy(disposition),
+                        ocr_image_sha256=identity['image_sha256'], ocr_char_count=0,
+                        reading_completeness='not_established', status='needs_ocr')
+            for group in selected_groups:
+                for row in group['units']:
+                    if row['unit_id'] == meta['unit_id']:
+                        row.update(copy.deepcopy(meta))
+            counters['ocr_failed_pending_review_count'] += 1
+            counters['ocr_failed_count'] += 1
+            continue
 
         def transcribe(source=source, selection=selection, target=meta['target'], identity=identity,
                        attachment=attachment, inputs=inputs, binding=binding, reference=reference,
@@ -321,10 +371,12 @@ def transcribe_selected_index(ctx, manifest, index, options):
         for finding in numeric.get('findings', []):
             code = finding['code']
             counters['ocr_numeric_issue_codes'][code] = counters['ocr_numeric_issue_codes'].get(code, 0) + 1
-    _require(set(bindings) <= seen_images and set(reviews) <= seen_images,
+    _require(set(bindings) <= seen_images and set(reviews) <= seen_images and set(failures) <= seen_images,
              'MATERIAL_OCR_UNUSED_REPLAY_OR_REVIEW_SCOPE')
     coverage = output['coverage']
     coverage.update(counters)
+    coverage['reading_result'] = ('ok_with_issues' if counters['ocr_failed_pending_review_count']
+                                  else 'candidate_transcription_only')
     coverage['status_counts'] = {status: sum(u['status'] == status for u in output['units'])
                                  for status in ('read', 'empty', 'needs_ocr', 'unsupported')}
     coverage['pending_ocr_unit_count'] = sum(u['status'] not in {'read', 'empty'} and

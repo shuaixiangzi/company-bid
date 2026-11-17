@@ -246,7 +246,7 @@ class _N3OCROrigin(_OCROrigin):
                  "SOURCE_SERVICE_INVALID")
         from .material_deepseek_ocr import _options, engine_fingerprint
         provider = {k: v for k, v in self.settings.items() if k not in {
-            "recorded_sources", "source_checks", "reading_crops", "recorded_only"}}
+            "recorded_sources", "source_checks", "reading_crops", "recorded_only", "failed_sources", "failure_dispositions"}}
         self.provider, self.options = provider, _options(provider, require_expected=True)
         self.fingerprint = engine_fingerprint(self.options)
         initial = self.artifact(self.state["initial_input_ref"])

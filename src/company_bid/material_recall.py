@@ -7,6 +7,7 @@ suggestions. A frozen explicit scope may defer queries, never claim them read.
 from __future__ import annotations
 
 import copy
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -189,12 +190,17 @@ def _catalog_stage(row: dict, groups: dict) -> str:
     return result
 
 
-def _numeric_review_scope(content_index: dict, query: dict, row: dict) -> dict:
-    """Bind OCR warnings to this requirement's candidate groups, never the whole library."""
+def _candidate_group_ids(query: dict, row: dict) -> set:
     candidate_ids = set(query.get("candidate_group_ids", []))
     candidate_ids.update(row.get("deterministic_group_ids", []))
     candidate_ids.update(row.get("catalog_stage_dictionary_candidate_group_ids", []))
     candidate_ids.update(candidate["group_id"] for candidate in row.get("candidates", []))
+    return candidate_ids
+
+
+def _numeric_review_scope(content_index: dict, query: dict, row: dict) -> dict:
+    """Bind OCR warnings to this requirement's candidate groups, never the whole library."""
+    candidate_ids = _candidate_group_ids(query, row)
     units, linked_groups = {}, set()
     for group in content_index.get("groups", []):
         if group["group_id"] not in candidate_ids:
@@ -224,6 +230,151 @@ def _numeric_review_scope(content_index: dict, query: dict, row: dict) -> dict:
             "scope": "requirement_candidate_groups_only", "automatic_numeric_adoption": False}
 
 
+def _ocr_failure_review_scope(content_index: dict, query: dict, row: dict) -> dict:
+    """Consume authenticated index dispositions, never classify source facts from OCR."""
+    from .material_content_index import _require
+    from .material_source_review import validate_material_source_review
+
+    candidate_ids = _candidate_group_ids(query, row)
+    units, linked_groups = {}, set()
+    for group in content_index.get("groups", []):
+        if group["group_id"] not in candidate_ids:
+            continue
+        for unit in group.get("units", []):
+            disposition = unit.get("ocr_failure_disposition")
+            if disposition is None and unit.get("transcription_status") != "ocr_failed_pending_review":
+                continue
+            _require(isinstance(disposition, dict)
+                     and unit.get("transcription_status") == "ocr_failed_pending_review"
+                     and unit.get("status") == "needs_ocr"
+                     and disposition.get("status") == "reading_failed_pending_review"
+                     and disposition.get("machine_text_adopted") is False
+                     and disposition.get("material_presence") == "present_but_unread_or_conflicting"
+                     and disposition.get("qualification_result") == "not_determined"
+                     and isinstance(disposition.get("schema_version"), str)
+                     and bool(disposition["schema_version"]), "MATERIAL_OCR_FAILURE_DISPLAY_INVALID")
+            for key, pattern in (("origin_run_id", r"[0-9a-f]{32}"),
+                                 ("origin_unit_id", r"[A-Za-z0-9_.:-]{1,160}"),
+                                 ("identity_sha256", r"[0-9a-f]{64}"),
+                                 ("error_code", r"[A-Z][A-Z0-9_]{1,120}")):
+                _require(isinstance(disposition.get(key), str) and re.fullmatch(pattern, disposition[key]),
+                         "MATERIAL_OCR_FAILURE_DISPLAY_INVALID")
+            review = disposition.get("source_review")
+            if review is not None:
+                _require(disposition.get("source_review_authenticated") is True,
+                         "MATERIAL_OCR_FAILURE_REVIEW_NOT_AUTHENTICATED")
+                review = validate_material_source_review(review)
+                original_identity = disposition.get("identity")
+                _require(isinstance(original_identity, dict)
+                         and digest(original_identity) == disposition["identity_sha256"]
+                         and all(review["identity"][key] == original_identity.get(key)
+                                 for key in ("source_id", "source_sha256", "selection_sha256", "image_sha256"))
+                         and review["identity"]["source_id"] == unit.get("source_id")
+                         and review["identity"]["source_sha256"] == unit.get("source_sha256")
+                         and review["identity"]["image_sha256"] == unit.get("ocr_image_sha256")
+                         and review["ocr"]["run_id"] == disposition["origin_run_id"]
+                         and review["ocr"]["unit_id"] == disposition["origin_unit_id"],
+                         "MATERIAL_OCR_FAILURE_REVIEW_SOURCE_CHANGED")
+            identity = (unit["source_id"], unit["unit_id"], unit.get("ocr_image_sha256"))
+            item = {key: copy.deepcopy(unit.get(key)) for key in
+                    ("source_id", "source_sha256", "unit_id", "target", "format", "ocr_image_sha256", "ocr_unit_id")}
+            item.update(disposition=copy.deepcopy(disposition), disposition_sha256=digest(disposition),
+                        source_review=review)
+            if identity in units:
+                _require(units[identity]["disposition_sha256"] == item["disposition_sha256"],
+                         "MATERIAL_OCR_FAILURE_DISPLAY_AMBIGUOUS")
+                units[identity]["group_ids"].append(group["group_id"])
+            else:
+                item["group_ids"] = [group["group_id"]]
+                units[identity] = item
+            linked_groups.add(group["group_id"])
+    return {"group_ids": sorted(linked_groups), "units": list(units.values()), "failed_unit_count": len(units),
+            "scope": "requirement_candidate_groups_only", "machine_text_adopted": False,
+            "qualification_result": "not_determined"}
+
+
+def _ocr_failure_notes(scope: dict, groups: dict) -> list[str]:
+    from .material_source_review import material_source_review_note
+
+    notes = []
+    if scope["failed_unit_count"]:
+        notes.append(f"本条候选证明有{scope['failed_unit_count']}页/图读取失败待核；原材料已关联，"
+                     "失败转录未采用，不能据此认定原文留空、公司缺资料或资格满足。")
+    labels = {"MATERIAL_OCR_OUTPUT_INCOMPLETE": "接口输出被截断，未取得完整转录",
+              "MATERIAL_OCR_REPETITIVE_OUTPUT": "接口输出重复，未通过转录校验",
+              "MATERIAL_OCR_NUMERIC_REFERENCE_MISMATCH": "转录与已审原图字段冲突",
+              "MATERIAL_OCR_NUMERIC_REFERENCE_AMBIGUOUS": "转录范围包含相互冲突的单位，字段范围待核"}
+    for unit in scope["units"]:
+        title = "、".join(dict.fromkeys(groups[gid].get("title", gid) if gid in groups else gid
+                                      for gid in unit["group_ids"]))
+        target = unit["target"]
+        location = f"原件第{target}页" if unit.get("format") == "pdf_pages" else f"原件图片 {target}"
+        code = unit["disposition"]["error_code"]
+        detail = labels.get(code, "读取或校验未通过")
+        notes.append(f"候选证明“{title}”｜{location}：{detail}（{code}）；读取失败状态保留，需核对原图或补齐可读证明。")
+        if unit["source_review"] is not None:
+            notes.append(material_source_review_note(unit["source_review"]))
+    return notes
+
+
+def _ocr_reading_scope(content_index: dict, query: dict, row: dict) -> dict:
+    """Keep partial reading and no-text states bound to candidate proof images."""
+    from .material_content_index import _require
+
+    candidate_ids = _candidate_group_ids(query, row)
+    units, linked_groups = {}, set()
+    for group in content_index.get("groups", []):
+        if group["group_id"] not in candidate_ids:
+            continue
+        for unit in group.get("units", []):
+            partial = (unit.get("transcription_status") == "ocr_transcribed_unverified"
+                       and unit.get("transcription_scope") in {"partial_selected_region", "selected_crop"})
+            no_text = unit.get("transcription_status") == "ocr_no_text_unresolved"
+            if not partial and not no_text:
+                continue
+            identity = (unit["source_id"], unit["unit_id"], unit.get("ocr_image_sha256"))
+            item = {key: copy.deepcopy(unit.get(key)) for key in
+                    ("source_id", "source_sha256", "unit_id", "target", "format", "ocr_image_sha256",
+                     "ocr_unit_id", "ocr_output_sha256", "transcription_status", "transcription_scope",
+                     "reading_region_projection")}
+            item.update(partial_region_transcribed=partial, no_text_unresolved=no_text,
+                        reading_completeness="not_established", qualification_result="not_determined")
+            if identity in units:
+                previous = {key: value for key, value in units[identity].items() if key != "group_ids"}
+                _require(digest(previous) == digest(item), "MATERIAL_OCR_READING_SCOPE_DISPLAY_AMBIGUOUS")
+                units[identity]["group_ids"].append(group["group_id"])
+            else:
+                item["group_ids"] = [group["group_id"]]
+                units[identity] = item
+            linked_groups.add(group["group_id"])
+    return {"group_ids": sorted(linked_groups), "units": list(units.values()),
+            "selected_unit_count": len(units),
+            "partial_transcribed_unit_count": sum(u["partial_region_transcribed"] for u in units.values()),
+            "no_text_unit_count": sum(u["no_text_unresolved"] for u in units.values()),
+            "scope": "requirement_candidate_groups_only", "reading_completeness": "not_established",
+            "qualification_result": "not_determined", "automatic_fact_adoption": False}
+
+
+def _ocr_reading_scope_notes(scope: dict, groups: dict) -> list[str]:
+    notes = []
+    for unit in scope["units"]:
+        title = "、".join(dict.fromkeys(groups[gid].get("title", gid) if gid in groups else gid
+                                      for gid in unit["group_ids"]))
+        location = (f"原件第{unit['target']}页" if unit.get("format") == "pdf_pages"
+                    else f"原件图片 {unit['target']}")
+        if unit["no_text_unresolved"]:
+            detail = "未取得可用识别文字，需核对原图；不代表原文留空或资料缺失。"
+        else:
+            detail = "仅所选区域已转录，未读取全页。"
+            projection = unit.get("reading_region_projection")
+            if (isinstance(projection, dict) and projection.get("original_appendix_replaced") is False
+                    and projection.get("whole_image_read") is False):
+                detail += "完整附件保留。"
+            detail += "机器文字、字段准确性和表格关系仍待核，不作为资格通过依据。"
+        notes.append(f"本条候选证明“{title}”｜{location}：{detail}")
+    return notes
+
+
 def annotate_material_issues(issues: list, report: dict) -> list:
     """Append scoped stage results; retain original gaps and response provenance."""
     groups = {g["group_id"]: g for g in report["proof_groups"]}
@@ -234,10 +385,26 @@ def annotate_material_issues(issues: list, report: dict) -> list:
     changes = []
     for issue in issues:
         relevant = [(rid, rows[rid]) for rid in issue["requirement_refs"] if rid in rows]
+        # Reading failures remain visible when no semantic lookup row exists.
+        # This annotation-only row neither invents a query nor changes the report.
+        for rid in issue["requirement_refs"]:
+            if rid not in rows and rid in queries:
+                fallback = {"requirement_id": rid, "status": "not_run_or_unavailable", "candidates": [],
+                            "condition_findings": [], "annotation_only_no_semantic_record": True}
+                content = report.get("original_content_index") or {}
+                if (_ocr_failure_review_scope(content, queries[rid], fallback)["failed_unit_count"]
+                        or _ocr_reading_scope(content, queries[rid], fallback)["selected_unit_count"]):
+                    relevant.append((rid, fallback))
         numeric_scopes = {rid: _numeric_review_scope(report.get("original_content_index") or {},
                                                      queries.get(rid, {}), row) for rid, row in relevant}
+        failure_scopes = {rid: _ocr_failure_review_scope(report.get("original_content_index") or {},
+                                                       queries.get(rid, {}), row) for rid, row in relevant}
+        reading_scopes = {rid: _ocr_reading_scope(report.get("original_content_index") or {},
+                                                queries.get(rid, {}), row) for rid, row in relevant}
         if not any(row.get("catalog_stage_status", row["status"]) in annotated or row["condition_findings"]
                    or numeric_scopes[rid]["pending_unit_count"] or numeric_scopes[rid]["finding_count"]
+                   or failure_scopes[rid]["failed_unit_count"]
+                   or reading_scopes[rid]["selected_unit_count"]
                    for rid, row in relevant):
             continue
         additions, contexts = [], []
@@ -267,11 +434,16 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                                          for code, amount in sorted(numeric["finding_codes"].items()))
                     additions.append(f"本条候选证明的 OCR 数字校验发现{numeric['finding_count']}处疑点（{findings}）；"
                                      "对应页/图及来源保留在逐条诊断中，需回到原图核对，不自动改数或认定原件有错。")
+            failure = failure_scopes[rid]
+            additions.extend(_ocr_failure_notes(failure, groups))
+            reading_scope = reading_scopes[rid]
+            additions.extend(_ocr_reading_scope_notes(reading_scope, groups))
             contexts.append({"requirement_id": rid, "original_requirement": original,
                              "original_conditions": copy.deepcopy(query.get("request", {}).get("conditions", {})),
                              "deterministic_search_status": query.get("search_status"),
                              "deterministic_read_scope_status": query.get("read_scope_status"),
-                             "semantic_recall": copy.deepcopy(row), "ocr_numeric_review": numeric})
+                             "semantic_recall": copy.deepcopy(row), "ocr_numeric_review": numeric,
+                             "ocr_failure_review": failure, "ocr_reading_scope": reading_scope})
         content_index = report.get("original_content_index")
         if content_index:
             coverage = content_index["coverage"]
