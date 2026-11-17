@@ -33,6 +33,7 @@ def _version(*names: str) -> str:
                     "material_recall.py": ("semantic_materials.py", "material_source_selection.py", "semantic_replay.py", "evidence.py"),
                     "material_matching.py": ("material_content_matching.py", "material_content_index.py", "material_ocr_index.py", "material_deepseek_ocr.py", "material_ocr_quality.py", "material_ocr_replay.py", "material_ocr_budget.py"),
                     "material_ocr_replay.py": ("diagnostic_replay.py",),
+                    "material_ocr_index.py": ("material_ocr_regions.py",),
                     "semantic_replay.py": ("diagnostic_replay.py",),
                     "diagnostics.py": ("material_ocr_diagnostics.py",),
                     "pipeline.py": ("project_constraint_runtime.py",),
