@@ -1,6 +1,7 @@
 """Readable task list with one complete source appendix and a private index."""
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import OrderedDict
 
@@ -82,6 +83,137 @@ def _body_quote(text):
     return rest if separator and rest and first in _WRAPPERS else text
 
 
+def _excerpt_heading(title, requirement_refs, catalog):
+    """Mark a demonstrably truncated source prefix, without completing it."""
+    short = " ".join(title.split())
+    if short and not short.endswith("…") and any(
+        " ".join(catalog["requirements"][rid].text.split()).startswith(short)
+        and len(" ".join(catalog["requirements"][rid].text.split())) > len(short)
+        for rid in requirement_refs
+    ):
+        return title + "…（摘要，完整要求见原文附录）"
+    return title
+
+
+def _note_references(note_ids):
+    """Compact only consecutive known IDs, preserving order and exact members."""
+    numbers = [int(note_id.removeprefix("核对说明")) for note_id in dict.fromkeys(note_ids)]
+    spans = []
+    for number in numbers:
+        if spans and number == spans[-1][-1] + 1:
+            spans[-1].append(number)
+        else:
+            spans.append([number])
+    return "、".join(f"核对说明{span[0]:03d}" + (f"～{span[-1]:03d}" if len(span)>1 else "")
+                    for span in spans)
+
+
+def shared_reason_catalog(rows, catalog):
+    """Deduplicate exact complete generated lines; keep each occurrence in place.
+
+    This is a reversible display projection, not a new material conclusion.
+    Candidate notes must follow an authenticated, exact requirement header.
+    Similar notes, embedded quotations and unrecognized scopes stay inline.
+    """
+    candidates = OrderedDict()
+    prepared = {}
+    for row in rows:
+        issue = row["original_issue"]
+        headers = [change for change in row["display_transformations"]
+                   if change["rule"] == "material_requirement_header_source_id_v1"]
+        original_lines = issue["reason"].splitlines()
+        parts = []
+        active = []
+        offset = 0
+        for line_number, raw_line in enumerate(row["display_reason"].splitlines(keepends=True)):
+            text = raw_line.rstrip("\r\n")
+            ending = raw_line[len(text):]
+            if text.startswith("【") and "】词典阶段：" in text:
+                active = []
+            # Different original RIDs can intentionally share one readable
+            # quote ID and heading. Bind this occurrence to its original line,
+            # never to the set of IDs with the same displayed heading.
+            original_line = original_lines[line_number] if line_number < len(original_lines) else ""
+            matches = [change["requirement_id"] for change in headers
+                       if original_line.startswith(change["original_text"])
+                       and text.startswith(change["display_text"])]
+            if matches:
+                active = list(dict.fromkeys(matches)) if len(set(matches)) == 1 else []
+            scope = None
+            refs = list(active)
+            if text.startswith("本条候选证明") and active:
+                scope = "requirement_candidates"
+            elif (active and text.startswith("候选证明“") and
+                  text.endswith("；读取失败状态保留，需核对原图或补齐可读证明。") and
+                  re.search(r"（MATERIAL_OCR_[A-Z0-9_]+）",text)):
+                scope = "requirement_candidates"
+            elif text.startswith("原件读取："):
+                scope = "selected_material_reading_summary"
+                refs = list(issue["requirement_refs"])
+                active = []
+            elif text.startswith("目录补查仅使用名称"):
+                scope = "catalog_scope_limit"
+                refs = list(issue["requirement_refs"])
+                active = []
+            source_refs = list(dict.fromkeys(
+                source for rid in refs for source in catalog["requirements"][rid].source_refs))
+            part = {"kind": "inline", "text": text, "line_ending": ending,
+                    "start": offset, "end": offset + len(text)}
+            if scope:
+                part.update(scope=scope, requirement_refs=refs, source_refs=source_refs)
+                candidates.setdefault((scope, text), []).append(
+                    {"issue_id": row["issue_id"], "start": offset, "end": offset + len(text),
+                     "requirement_refs": refs, "source_refs": source_refs})
+            parts.append(part)
+            offset += len(raw_line)
+        assert offset == len(row["display_reason"])
+        prepared[row["issue_id"]] = parts
+    notes = []
+    ids = {}
+    for (scope, text), occurrences in candidates.items():
+        if len({item["issue_id"] for item in occurrences}) < 2:
+            continue
+        note_id = f"核对说明{len(notes)+1:03d}"
+        ids[(scope, text)] = note_id
+        notes.append({"display_id": note_id, "scope": scope, "text": text,
+                      "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                      "occurrences": occurrences})
+    for row in rows:
+        parts = prepared[row["issue_id"]]
+        for part in parts:
+            key = (part.get("scope"), part["text"])
+            if key in ids:
+                part["kind"] = "shared_note"
+                part["note_id"] = ids[key]
+        # Preserve exact text and offsets independently of the shortened prose.
+        assert "".join(p["text"] + p["line_ending"] for p in parts) == row["display_reason"]
+        display = []
+        for part in parts:
+            if part["kind"] == "shared_note":
+                same_scope = (display and display[-1]["kind"] == "shared_notes"
+                              and display[-1]["scope"] == part["scope"]
+                              and display[-1]["requirement_refs"] == part["requirement_refs"])
+                if not same_scope:
+                    display.append({"kind": "shared_notes", "scope": part["scope"],
+                                    "requirement_refs": part["requirement_refs"], "note_ids": [], "parts": []})
+                display[-1]["note_ids"].append(part["note_id"])
+                display[-1]["parts"].append(part)
+            else:
+                display.append({"kind": "inline", "text": part["text"], "parts": [part]})
+        for segment in display:
+            if segment["kind"] != "shared_notes":
+                continue
+            label = {"requirement_candidates": "本条证明读取仍待核对",
+                     "selected_material_reading_summary": "整体读取范围与局限",
+                     "catalog_scope_limit": "目录补查适用范围"}[segment["scope"]]
+            segment["text"] = label + "：见" + _note_references(segment["note_ids"]) + "。"
+        row["reason_segments"] = parts
+        row["rendered_reason_segments"] = display
+        row["rendered_reason"] = "\n".join(segment["text"] for segment in display)
+        row["shared_note_ids"] = list(dict.fromkeys(p["note_id"] for p in parts if p["kind"] == "shared_note"))
+    return notes
+
+
 def _location(source):
     """Only reader-facing page/paragraph/table positions, never artifact paths."""
     locator=source.locator
@@ -154,7 +286,8 @@ def task_list_catalog(package):
 
 
 def render_task_list(package):
-    from .rendering import _base_document, _font, _page_furniture, _render_table, _render_section_content
+    from .rendering import _base_document, _font, _indent, _page_furniture, _render_table, _render_section_content, RenderingError
+    from .source_format_rendering import recover_review_source_tables, render_review_source_table
     doc=_base_document(package,"待补与办理清单")
     _page_furniture(doc.sections[0],package.style,numbered=True,start=1)
     catalog=task_list_catalog(package)
@@ -162,18 +295,39 @@ def render_task_list(package):
     index={"mode":"task_list","schema_version":"review-document-index-v1","issues":[],"actions":[],"review_sections":[],
         "source_quotes":catalog["entries"],"requirement_quote_ids":catalog["requirement_quote_ids"],
         "source_index":[source.model_dump(mode="json") for source in package.sources]}
+    for issue in package.issues:
+        refs=list(dict.fromkeys(ref for rid in issue.requirement_refs for ref in catalog["requirements"][rid].source_refs))
+        locs=list(dict.fromkeys(_location(sources[ref]) for ref in refs))
+        qid=catalog["quote_ids"][issue.source_requirement]
+        status="待核对" if issue.severity=="warning" else "待补"
+        display_action,display_changes=_display_action(issue.action)
+        display_reason,reason_changes=_display_reason(issue.reason)
+        display_reason,label_changes,material_qids=_display_material_requirement_labels(display_reason,issue,catalog)
+        index["issues"].append({"display_id":issue.issue_id,"issue_id":issue.issue_id,"section_id":issue.section_id,
+            "requirement_refs":issue.requirement_refs,"quote_ids":list(dict.fromkeys([qid,*material_qids])),
+            "source_refs":refs,"locations":locs,"severity":issue.severity,"status":status,
+            "original_issue":issue.model_dump(mode="json"),"display_reason":display_reason,"display_action":display_action,
+            "display_transformations":display_changes+reason_changes+label_changes})
+    index["shared_reason_notes"]=shared_reason_catalog(index["issues"],catalog)
+    issue_rows={row["issue_id"]:row for row in index["issues"]}
+    index["section_heading_display"]=[]
+    index["source_quote_layout"]=[]
     def paragraph(text="",*,bold=False,keep_next=False):
         p=doc.add_paragraph()
         p.alignment=WD_ALIGN_PARAGRAPH.LEFT
-        pf=p.paragraph_format;pf.first_line_indent=Pt(0);pf.space_before=Pt(0);pf.space_after=Pt(3)
-        pf.line_spacing=1.2;pf.keep_with_next=keep_next
-        _font(p.add_run(text),name=package.style.font_family,size=12,bold=bold)
+        pf=p.paragraph_format;pf.space_before=pf.space_after=Pt(0)
+        pf.line_spacing=package.style.body_line_spacing;pf.keep_with_next=keep_next
+        pf.widow_control=True;pf.keep_together=len(text)<=240
+        _indent(p._p,0 if bold else package.style.body_first_line_chars,package.style.body_pt)
+        _font(p.add_run(text),name=package.style.font_family,size=package.style.body_pt,bold=bold)
         return p
     def locations(refs):return list(dict.fromkeys(_location(sources[ref]) for ref in refs))
     def original(text):return catalog["quote_ids"][text]
     doc.add_paragraph("待补与办理清单","Title")
     paragraph("项目："+package.project.name)
     paragraph("按编号核对待补资料、待确认事实和办理事项。原文集中列于后面的原文附录；已附材料不代表资格或评分已通过。")
+    if index["shared_reason_notes"]:
+        paragraph("重复的读取说明集中列在“核对说明”中，事项中的说明编号保留其原对应要求；请结合所在要求核对，不据此认定事实或资格。")
     if package.synthetic:paragraph("合成测试样本，仅用于系统验证。",bold=True)
     doc.add_paragraph("待补事项","Heading 1")
     if not package.issues:paragraph("本次未列出待补事项；办理和来源核对仍见下文。")
@@ -181,22 +335,17 @@ def render_task_list(package):
     for issue in package.issues:groups.setdefault(issue.section_id,[]).append(issue)
     for sid,issues in groups.items():
         section=sections[sid]
-        doc.add_paragraph(section.title,"Heading 2")
+        display_title=_excerpt_heading(section.title,section.requirement_refs,catalog)
+        doc.add_paragraph(display_title,"Heading 2")
+        index["section_heading_display"].append({"section_id":sid,"original_title":section.title,"display_title":display_title})
         if section.document_role=="review":paragraph("位置：配套核对内容；不作为已完成的投标响应。")
         for issue in issues:
-            refs=list(dict.fromkeys(ref for rid in issue.requirement_refs for ref in catalog["requirements"][rid].source_refs))
-            locs=locations(refs);qid=original(issue.source_requirement)
-            status="待核对" if issue.severity=="warning" else "待补"
-            display_action,display_changes=_display_action(issue.action)
-            display_reason,reason_changes=_display_reason(issue.reason)
-            display_reason,label_changes,material_qids=_display_material_requirement_labels(display_reason,issue,catalog)
-            display_changes += reason_changes + label_changes
-            paragraph(f"{issue.issue_id} {issue.title}（{status}）",bold=True,keep_next=True)
-            paragraph(f"原因：{display_reason}\n动作：{display_action}")
-            paragraph(f"依据：{qid}；"+"；".join(locs))
-            index["issues"].append({"display_id":issue.issue_id,"issue_id":issue.issue_id,"section_id":sid,
-                "requirement_refs":issue.requirement_refs,"quote_ids":list(dict.fromkeys([qid,*material_qids])),"source_refs":refs,"locations":locs,"severity":issue.severity,"status":status,
-                "original_issue":issue.model_dump(mode="json"),"display_reason":display_reason,"display_action":display_action,"display_transformations":display_changes})
+            row=issue_rows[issue.issue_id]
+            paragraph(f"{issue.issue_id} {issue.title}（{row['status']}）",bold=True,keep_next=True)
+            for number,segment in enumerate(row["rendered_reason_segments"]):
+                paragraph(("原因：" if number==0 else "")+segment["text"])
+            paragraph("动作："+row["display_action"])
+            paragraph(f"依据：{original(issue.source_requirement)}；"+"；".join(row["locations"]))
     doc.add_paragraph("办理与适用条件核对","Heading 1")
     paragraph("以下事项保留原文规定，尚未据此认定已办理、适用或满足。")
     for number,action in enumerate(package.review_actions,1):
@@ -220,7 +369,9 @@ def render_task_list(package):
         paragraph("以下来源原文集中见附录，保留相关核对内容；不作为已完成的投标响应。")
         issues={i.issue_id:i for i in package.issues};seen=set()
         for sec in review:
-            doc.add_paragraph(sec.title,"Heading 2");qids=[];retained=[]
+            display_title=_excerpt_heading(sec.title,sec.requirement_refs,catalog)
+            doc.add_paragraph(display_title,"Heading 2");qids=[];retained=[]
+            index["section_heading_display"].append({"section_id":sec.section_id,"original_title":sec.title,"display_title":display_title})
             for block in sec.blocks:
                 if block.kind=="paragraph":qids.append(original(_body_quote(block.text)))
                 elif block.kind=="list":qids.extend(original(text) for text in block.items)
@@ -235,10 +386,29 @@ def render_task_list(package):
             index["review_sections"].append({"section_id":sec.section_id,"title":sec.title,"requirement_refs":sec.requirement_refs,"quote_ids":qids,"issue_ids":retained,
                 "table_ids":[b.table.table_id for b in sec.blocks if b.kind=="table"],
                 "attachment_ids":[b.attachment_id for b in sec.blocks if b.kind=="attachment"]})
+    if index["shared_reason_notes"]:
+        doc.add_page_break();doc.add_paragraph("核对说明","Heading 1")
+        paragraph("以下完整说明按文字完全相同集中保留。每次引用的位置及对应要求不变；相同说明不表示不同要求或证明已通过核验。")
+        for note in index["shared_reason_notes"]:
+            paragraph(note["display_id"],bold=True,keep_next=True)
+            paragraph(note["text"])
     doc.add_page_break();doc.add_paragraph("原文附录","Heading 1")
     paragraph("每段原文仅集中保留一次；事项中的原文编号可在本文件中直接搜索。")
+    table_cache={}
     for entry in catalog["entries"]:
         paragraph(entry["display_id"],bold=True,keep_next=True)
         paragraph("；".join(entry["locations"]),keep_next=True)
-        paragraph(entry["text"])
+        layout=recover_review_source_tables(entry["text"],entry["source_refs"],sources,table_cache)
+        if layout["status"]=="failed":
+            raise RenderingError("REVIEW_SOURCE_TABLE_SOURCE_VALIDATION_FAILED")
+        index["source_quote_layout"].append({"display_id":entry["display_id"],**layout})
+        if layout["status"]=="unsupported":
+            paragraph("表格布局待核：本段保留已读原文，尚未可靠恢复列及合并关系；金额、分值或条件对应须回原件核对。",bold=True)
+        for fragment in layout["fragments"]:
+            if fragment["kind"]=="table":
+                render_review_source_table(doc,fragment,package.style)
+            elif fragment["text"].strip():
+                if fragment.get("layout_status")=="unsupported":
+                    paragraph("以下片段的表格布局待核：原文完整保留，列及合并关系尚未可靠恢复，请回原件核对。",bold=True)
+                paragraph(fragment["text"])
     return doc,index
