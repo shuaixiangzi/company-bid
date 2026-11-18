@@ -447,3 +447,100 @@ def test_legacy_whole_table_rejects_scope_inconsistency(source_grid, before, aft
     _, sources = whole_native_grid(source_grid, text, 'r0c0,r0c1,r1c0,r1c1,r2c0')
     sources['scope']['locator'] = sources['scope']['locator'].replace(before, after)
     assert recover((text, sources))['reason'] == 'exact_whole_native_table_scope_required'
+
+
+def issue_composition_fixture(source_grid):
+    child, sources = source_grid
+    sources['scope']['locator'] += f'; chars[0:{len(child)}]'
+    note = 'Separate clause'
+    sources['note'] = {**sources['original'], 'source_id': 'note', 'locator': (
+        f'pdf/page[1]/line[1]; basis=native_block_text_v1; chars[0:{len(note)}]; '
+        f'quote_sha256={hashlib.sha256(note.encode()).hexdigest()}')}
+    parts = [(child, ['scope']), (note, ['note']), (child, ['scope'])]
+    return '；'.join(text for text, _ in parts), parts, sources
+
+
+def test_issue_composition_binds_both_occurrences_and_preserves_text(source_grid):
+    text, parts, sources = issue_composition_fixture(source_grid)
+    sources['catalog-only'] = {**sources['note'], 'source_id': 'catalog-only'}
+    refs = ['scope', 'note', 'catalog-only']
+    assert recover_review_source_tables(text, refs, sources)['status'] == 'unsupported'
+    result = recover_review_source_tables(text, refs, sources, issue_components=parts)
+    assert result['status'] == 'restored'
+    assert result['catalog_only_source_refs'] == ['catalog-only']
+    first, second = result['proofs']
+    assert first['source_ref'] == second['source_ref'] == 'scope'
+    assert first['start'] == 6
+    assert second['start'] == len(parts[0][0]) + len(parts[1][0]) + 2 + first['start']
+    assert ''.join(fragment['text'] if fragment['kind'] == 'paragraph' else
+                   '\n'.join('\t'.join(row) for row in fragment['rows']) for fragment in result['fragments']) == text
+    doc = Document()
+    for fragment in result['fragments']:
+        if fragment['kind'] == 'table':
+            assert fragment['row_heights_pt'] == [50, 50, 50]
+            render_review_source_table(doc, fragment, DocumentStyle())
+    assert len(doc.tables) == 2
+    assert all(row.height.pt == 50 for table in doc.tables for row in table.rows)
+
+
+@pytest.mark.parametrize('change, status, reason', [
+    ('wrong_order', 'unsupported', 'issue_composition_mismatch'),
+    ('unbound', 'unsupported', 'issue_component_precise_source_required'),
+    ('wrong_hash', 'unsupported', 'issue_component_exact_quote_scope_required'),
+    ('wrong_bytes', 'failed', 'issue_component_source_authentication_failed'),
+])
+def test_issue_composition_fails_closed(source_grid, change, status, reason):
+    text, parts, sources = issue_composition_fixture(source_grid)
+    if change == 'wrong_order':
+        parts[0], parts[1] = parts[1], parts[0]
+    elif change == 'unbound':
+        parts[1][1][0] = 'other'
+    elif change == 'wrong_hash':
+        loc = sources['note']['locator']
+        sources['note']['locator'] = loc[:loc.rindex('=')+1] + '0' * 64
+    else:
+        sources['note']['sha256'] = '0' * 64
+    result = recover_review_source_tables(text, ['scope', 'note'], sources, issue_components=parts)
+    assert result['status'] == status and not result['proofs']
+    assert result['reason'] in {reason, 'aggregate_source_hash_mismatch'}
+    assert result['fragments'] == [{'kind': 'paragraph', 'text': text}]
+
+
+def test_issue_composition_restores_empty_source_rows_only_when_present_in_exact_quote(source_grid):
+    from pathlib import Path
+    from pypdf import PdfReader
+
+    old, sources = source_grid
+    path = Path(sources['original']['path'])
+    writer = PdfWriter()
+    page = writer.add_page(PdfReader(path).pages[0])
+    data = page.get_contents().get_data()
+    stream = DecodedStreamObject()
+    stream.set_data(data[:data.index(b' BT /F1 12 Tf 60 270 Td')])
+    page[NameObject('/Contents')] = writer._add_object(stream)
+    with path.open('wb') as out:
+        writer.write(out)
+    new = old.replace('Alpha\t8\nBeta\t', '\t\n\t')
+    for source in sources.values():
+        source['sha256'] = file_sha256(path)
+    scope = sources['scope']
+    locator = scope['locator'].replace(hashlib.sha256(old.encode()).hexdigest(), hashlib.sha256(new.encode()).hexdigest())
+    head, rest = locator.split('cells=')
+    selected, tail = rest.split(';', 1)
+    headers = ','.join(cell for cell in selected.split(',') if ':r0' in cell)
+    scope['locator'] = head + 'cells=' + headers + ';' + tail
+    text, parts, sources = issue_composition_fixture((new, sources))
+    result = recover_review_source_tables(text, ['scope', 'note'], sources, issue_components=parts)
+    assert result['status'] == 'restored'
+    assert [proof['exact_blank_source_rows'] for proof in result['proofs']] == [[1, 2], [1, 2]]
+    assert all(fragment['rows'] == [['Label', 'Score'], ['', ''], ['', '']]
+               for fragment in result['fragments'] if fragment['kind'] == 'table')
+
+    cropped = new.replace('\n\t\n\t', '')
+    scope['locator'] = scope['locator'].rsplit('; chars[', 1)[0].replace(
+        hashlib.sha256(new.encode()).hexdigest(), hashlib.sha256(cropped.encode()).hexdigest())
+    text, parts, sources = issue_composition_fixture((cropped, sources))
+    result = recover_review_source_tables(text, ['scope', 'note'], sources, issue_components=parts)
+    assert result['status'] == 'restored'
+    assert [proof['source_rows'] for proof in result['proofs']] == [[0], [0]]
+    assert all('exact_blank_source_rows' not in proof for proof in result['proofs'])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -96,8 +97,7 @@ def reviewed_page_note(candidate: dict) -> str:
     locator = candidate["locator"]
     where = f"Word 原件中的 {Path(locator).name}" if locator.startswith("docx/") else locator
     if candidate["proof_kind"] == "social_insurance_proof":
-        check = ("本页为职工参保登记明细。请核对拟派项目负责人、用工主体及正式递交截止时点，"
-                 "并查规定窗口内的实际缴费凭据。")
+        check = "本页为职工参保登记明细。"
     else:
         check = ("本页为环境管理体系认证证书。请按评分子项核对认证范围、"
                  "递交时的有效状态及年度监督记录。")
@@ -106,3 +106,12 @@ def reviewed_page_note(candidate: dict) -> str:
         "ocr_failed_pending_review": "该图的 OCR 读取或校验失败，原状态待核。",
     }.get(candidate["transcription_status"], "")
     return f"原图复核候选（{where}）。{check}{reading}"
+
+
+def social_insurance_action(original_text: str) -> str:
+    """Retain the original requirement's window without guessing a closing date."""
+    windows = set(re.findall(r"截止(?:日|时间|时点)\s*前\s*([1-9][0-9]{0,3})\s*日内", original_text))
+    window = f"截止前 {next(iter(windows))} 日内" if len(windows) == 1 else "招标条款规定窗口内"
+    once = "，核对是否至少缴纳一次" if re.search(r"至少\s*缴纳(?:过)?\s*[一1]\s*次", original_text) else ""
+    return ("核对拟派项目负责人及用工主体，确认正式递交截止时点，"
+            f"再提供{window}的实际缴费凭据{once}。")

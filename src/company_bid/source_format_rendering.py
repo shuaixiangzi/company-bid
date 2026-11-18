@@ -249,7 +249,7 @@ def _review_glyph_rules(configured_rules, source_sha, pages):
     return by_page
 
 
-def _review_native_table(page, table, source_id, locator, *, glyphs=None):
+def _review_native_table(page, table, source_id, locator, *, glyphs=None, measure_rows=False):
     """Read only native rectangles and glyph centres into an editable grid.
 
     Independent local implementation of this appendix's geometry contract.
@@ -270,7 +270,7 @@ def _review_native_table(page, table, source_id, locator, *, glyphs=None):
     if len(xs) < 2 or len(ys) < 2:
         raise ValueError("REVIEW_NATIVE_GRID_EMPTY")
     rows = [["" for _ in xs[:-1]] for _ in ys[:-1]]
-    merges, occupied, transformations = [], set(), []
+    merges, occupied, transformations, top_aligned = [], set(), [], []
     def inside(box, x, y):
         return box[0] <= x < box[2] and box[1] <= y < box[3]
     for box in boxes:
@@ -302,6 +302,12 @@ def _review_native_table(page, table, source_id, locator, *, glyphs=None):
                 if "".join(shown) != original:
                     chars[index] = {**char, "text": "".join(shown)}
         rows[row][col] = (pdfplumber.utils.extract_text(chars) or "").strip() if chars else ""
+        if measure_rows and rows[row][col]:
+            visible = [char for char in chars if char["text"].strip()]
+            gap_above = min(char["top"] for char in visible) - top
+            gap_below = bottom - max(char["bottom"] for char in visible)
+            if gap_below - gap_above > 6:
+                top_aligned.append([row, col])
         if row_span > 1 or col_span > 1:
             merges.append({"row": row, "column": col, "row_span": row_span, "col_span": col_span})
     for char in page.chars:
@@ -314,6 +320,9 @@ def _review_native_table(page, table, source_id, locator, *, glyphs=None):
               "column_widths": [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]}
     if transformations:
         result["glyph_transformations"] = transformations
+    if measure_rows:
+        result["row_heights_pt"] = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+        result["top_aligned_cells"] = top_aligned
     return result
 
 
@@ -449,7 +458,103 @@ def _recover_review_source_aggregate(text, source_refs, sources, cache, glyph_ma
             "hash_work_bytes": hash_bytes,
             "hash_work_byte_budget": _REVIEW_AGGREGATE_HASH_BYTE_BUDGET}
 
-def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyph_maps=None):
+def _recover_review_issue_composition(text, components, source_refs, sources, cache, glyph_maps):
+    """Lift each ordered N5 issue requirement to its exact occurrence in the appendix."""
+    import copy
+    import hashlib
+    import re
+    from pathlib import Path
+    from .models import file_sha256
+
+    def fallback(reason, status="unsupported"):
+        return {"version": REVIEW_SOURCE_TABLE_VERSION, "status": status, "reason": reason,
+                "fragments": [{"kind": "paragraph", "text": text}], "proofs": []}
+
+    separator = "；"
+    if not 2 <= len(components) <= 32 or len(text) > 100000 or separator.join(part for part, _ in components) != text:
+        return fallback("issue_composition_mismatch")
+    refs = set(source_refs)
+    result, proofs, scope_parts = [], [], []
+    cursor = 0
+    aggregate_hash = hashlib.sha256(text.encode()).hexdigest()
+    verified_files, recovered = set(), {}
+    for component, component_refs in components:
+        if not component or len(component_refs) != 1 or component_refs[0] not in refs:
+            return fallback("issue_component_precise_source_required")
+        ref = component_refs[0]
+        source = sources.get(ref)
+        if source is None:
+            return fallback("issue_component_source_missing", "failed")
+        value = source.get if isinstance(source, dict) else lambda field: getattr(source, field)
+        sha, path, locator = value("sha256"), Path(value("path")), value("locator")
+        try:
+            key = (path.resolve(), sha)
+            if value("kind") != "tender" or (key not in verified_files and file_sha256(path) != sha):
+                return fallback("issue_component_source_authentication_failed", "failed")
+            verified_files.add(key)
+        except OSError:
+            return fallback("issue_component_source_unreadable", "failed")
+        quote_hash = hashlib.sha256(component.encode()).hexdigest()
+        hashes = re.findall(r"(?:^|;\s*)quote_sha256=([0-9a-f]{64})(?=;|$)", locator)
+        spans = re.findall(r"(?:^|;\s*)(?:selected_row_view_)?chars\[(\d+):(\d+)\](?=;|$)", locator)
+        if (hashes != [quote_hash] or len(spans) != 1 or int(spans[0][1]) - int(spans[0][0]) != len(component)):
+            return fallback("issue_component_exact_quote_scope_required")
+        child_key = (ref, quote_hash)
+        if child_key not in recovered:
+            recovered[child_key] = recover_review_source_tables(component, [ref], sources, cache,
+                                                                  glyph_maps=glyph_maps, _measure_form=True)
+        child = recovered[child_key]
+        if child["status"] not in {"restored", "not_applicable"}:
+            return fallback("issue_component_layout_unresolved", child["status"])
+        end = cursor + len(component)
+        scope_parts.append({"source_ref": ref, "source_sha256": sha, "locator": locator, "quote_sha256": quote_hash,
+                            "start": cursor, "end": end, "layout_status": child["status"], "layout_reason": child["reason"]})
+        if cursor:
+            result.append({"kind": "paragraph", "text": separator, "quote_start": cursor - 1, "quote_end": cursor})
+        offset, rebuilt = cursor, []
+        for fragment in copy.deepcopy(child["fragments"]):
+            rendered = fragment["text"] if fragment["kind"] == "paragraph" else _review_grid_text(fragment["rows"])
+            fragment.update(quote_start=offset, quote_end=offset + len(rendered))
+            if fragment["kind"] == "table":
+                proof = fragment["proof"]
+                proof.update(child_start=proof["start"], child_end=proof["end"], aggregate_quote_sha256=aggregate_hash,
+                             source_scope_start=cursor, source_scope_end=end)
+                proof["start"], proof["end"] = fragment["quote_start"], fragment["quote_end"]
+                proofs.append(proof)
+            result.append(fragment)
+            offset += len(rendered)
+            rebuilt.append(rendered)
+        if "".join(rebuilt) != component or offset != end:
+            return fallback("issue_component_roundtrip_failed", "failed")
+        cursor = end + 1
+    if not proofs:
+        return fallback("issue_composition_no_table")
+    fragments = []
+    for fragment in result:
+        if fragments and fragments[-1]["kind"] == fragment["kind"] == "paragraph":
+            fragments[-1]["text"] += fragment["text"]
+            fragments[-1]["quote_end"] = fragment["quote_end"]
+        else:
+            fragments.append(fragment)
+    return {"version": REVIEW_SOURCE_TABLE_VERSION, "status": "restored", "reason": None,
+            "fragments": fragments, "proofs": proofs, "scope_parts": scope_parts,
+            "composition_rule": "exact_ordered_n5_issue_components_v1", "aggregate_quote_sha256": aggregate_hash,
+            "catalog_only_source_refs": [ref for ref in source_refs if ref not in {part["source_ref"] for part in scope_parts}]}
+
+
+def _review_grid_text(rows):
+    return "\n".join("\t".join(row) for row in rows)
+
+
+def _review_grid_interval(text, tsv):
+    if not tsv or text.find(tsv) != text.rfind(tsv) or (start := text.find(tsv)) < 0:
+        return None
+    end = start + len(tsv)
+    return (start, end) if (not start or text[start - 1] == "\n") and (end == len(text) or text[end] == "\n") else None
+
+
+def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyph_maps=None,
+                                 issue_components=None, _measure_form=False):
     """Recover exact native PDF row views, or retain the complete quoted text.
 
     ``sources`` is the package SourceRef mapping (or sequence). A caller-owned
@@ -485,8 +590,12 @@ def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyp
             candidates.append((ref, source))
     if not candidates:
         if len(set(source_refs)) > 1:
-            return _recover_review_source_aggregate(text, source_refs, source_map, cache, glyph_maps)
-        return fallback("exact_quote_scope_unavailable")
+            layout = _recover_review_source_aggregate(text, source_refs, source_map, cache, glyph_maps)
+        else:
+            layout = fallback("exact_quote_scope_unavailable")
+        if issue_components is not None and layout["status"] == "unsupported":
+            return _recover_review_issue_composition(text, issue_components, source_refs, source_map, cache, glyph_maps)
+        return layout
     # Multiple identical quote locations are not interchangeable provenance.
     if len(candidates) != 1:
         return fallback("ambiguous_quote_scope")
@@ -544,7 +653,7 @@ def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyp
                           for (font, symbol), rule in sorted(glyphs.items()))
         key = (REVIEW_SOURCE_TABLE_VERSION, _REVIEW_NATIVE_GRID_VERSION, pdfplumber.__version__,
                str(path.resolve()), sha, tuple(pages), tuple(sorted(selected)),
-               tuple(sorted(value(s, "source_id") for s in originals)), glyph_key)
+               tuple(sorted(value(s, "source_id") for s in originals)), glyph_key, _measure_form)
         saved = cache.get(key) if cache is not None else None
         if saved is not None and saved[0] == context_digest(saved[1]):
             import copy
@@ -569,7 +678,7 @@ def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyp
                             continue
                         original, bid = matches[0]
                         block = _review_native_table(page, table, value(original, "source_id"), table_locator,
-                                                     glyphs=glyph_rules.get(number))
+                                                     glyphs=glyph_rules.get(number), measure_rows=_measure_form)
                         native.append(block)
             if cache is not None:
                 if len(cache) >= 128:
@@ -591,6 +700,14 @@ def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyp
             # all nonempty anchors must still be explicitly cited.
             if any(block["rows"][r][c] and (r, c) not in coordinates for r in rows for c in range(columns)):
                 return fallback("partial_row_scope")
+            original_rows = rows
+            full_grid = block["rows"]
+            # Some exact form quotes carry trailing empty native rows in TSV,
+            # but list only non-empty cells in their frozen source selections.
+            if (_measure_form and rows == list(range(len(rows))) and len(rows) < len(full_grid)
+                    and not any(any(row) for row in full_grid[len(rows):])
+                    and _review_grid_interval(text, _review_grid_text(full_grid)) is not None):
+                rows = list(range(len(full_grid)))
             merges = []
             for merge in block["merges"]:
                 end = merge["row"] + merge["row_span"] - 1
@@ -599,15 +716,16 @@ def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyp
                         return fallback("merge_crosses_quote_boundary")
                     merges.append({**merge, "row": merge["row"] - rows[0]})
             grid = [list(block["rows"][r]) for r in rows]
-            tsv = "\n".join("\t".join(row) for row in grid)
+            tsv = _review_grid_text(grid)
             if whole_native_table and (rows != list(range(len(block["rows"]))) or tsv != text):
                 return fallback("native_whole_table_quote_mismatch")
-            if not tsv or text.count(tsv) != 1:
+            if not tsv or text.find(tsv) == -1 or text.find(tsv) != text.rfind(tsv):
                 return fallback("native_grid_quote_mismatch")
-            start = text.index(tsv)
             # Never replace a matching interior string of a larger source cell.
-            if (start and text[start - 1] != "\n") or (start + len(tsv) < len(text) and text[start + len(tsv)] != "\n"):
+            interval = _review_grid_interval(text, tsv)
+            if interval is None:
                 return fallback("native_grid_quote_boundary_mismatch")
+            start, end = interval
             proof = {"rule": REVIEW_SOURCE_TABLE_VERSION, "source_ref": ref, "source_sha256": sha,
                      "quote_sha256": quote_hash, "native_source_id": block["source_id"],
                      "block_id": block["block_id"], "locator": block["locator"], "source_rows": rows,
@@ -615,13 +733,21 @@ def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyp
                      "grid_sha256": context_digest({"rows": grid, "merges": merges,
                                                     "column_widths": block["column_widths"]}),
                      "parser": "pdfplumber", "parser_version": pdfplumber.__version__,
-                     "reader_contract": "source_format_rendering._review_native_table", "reader_version": _REVIEW_NATIVE_GRID_VERSION, "start": start, "end": start + len(tsv)}
+                     "reader_contract": "source_format_rendering._review_native_table", "reader_version": _REVIEW_NATIVE_GRID_VERSION, "start": start, "end": end}
             transformations = [item for item in block.get("glyph_transformations", ()) if item["row"] in rows]
             if transformations:
                 proof["glyph_transformations"] = transformations
-            replacements.append((start, start + len(tsv), {"kind": "table", "rows": grid,
+            fragment = {"kind": "table", "rows": grid,
                 "column_widths": block["column_widths"], "merges": merges,
-                "header_rows": [], "proof": proof}))
+                "header_rows": [], "proof": proof}
+            if _measure_form:
+                geometry = {"row_heights_pt": [block["row_heights_pt"][r] for r in rows],
+                            "top_aligned_cells": [[r - rows[0], c] for r, c in block["top_aligned_cells"] if r in rows]}
+                fragment.update(geometry)
+                proof["row_geometry_sha256"] = context_digest(geometry)
+                if rows != original_rows:
+                    proof["exact_blank_source_rows"] = rows[len(original_rows):]
+            replacements.append((start, end, fragment))
         replacements.sort(key=lambda r: r[0])
         fragments, proofs, cursor = [], [], 0
         for start, end, fragment in replacements:
@@ -651,4 +777,10 @@ def render_review_source_table(document, fragment, style):
         source_refs=[proof["source_ref"]], requirement_refs=["review-source-quote"],
         column_widths=fragment["column_widths"], merges=fragment["merges"],
         header_from_columns=False, repeat_header_rows=0)
-    _render_table(document, table, {}, style, show_title=False)
+    editable = _render_table(document, table, {}, style, show_title=False)
+    if "row_heights_pt" in fragment:
+        from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE
+        for row, height in zip(editable.rows, fragment["row_heights_pt"], strict=True):
+            row.height, row.height_rule = Pt(height), WD_ROW_HEIGHT_RULE.AT_LEAST
+        for row, column in fragment["top_aligned_cells"]:
+            editable.cell(row, column).vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP

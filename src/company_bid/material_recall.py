@@ -11,7 +11,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .material_reviewed_pages import ReviewedProofPage, reviewed_page_note
+from .material_reviewed_pages import ReviewedProofPage, reviewed_page_note, social_insurance_action
 from .provider import ChatConfig, ChatProposalProvider, ProviderFailure
 from .semantic_materials import (SEMANTIC_VERSION, check_declared_credential_conditions,
                                  recall_route, semantic_probe)
@@ -379,13 +379,52 @@ def _ocr_reading_scope_notes(scope: dict, groups: dict) -> list[str]:
     return notes
 
 
-def annotate_material_issues(issues: list, report: dict) -> list:
+_CERTIFICATE_CHECKS = {
+    "environment_management_certificate": "核对该证的认证范围、递交时的有效状态及年度监督记录。",
+    "occupational_health_safety_certificate": "核对职业健康安全体系认证范围、持证主体和递交时的有效状态。",
+    "quality_management_certificate": "核对质量管理体系认证范围、持证主体和递交时的有效状态。",
+    "corrosion_control_design_qualification": "核对设计资格的许可类别、设计范围及证书有效状态。",
+    "corrosion_control_qualification": "对照评分子项核对腐蚀控制资质等级、持证主体和有效状态。",
+    "high_tech_enterprise": "核对高新技术企业认定的发证机关、持证主体和证书有效期。",
+}
+
+
+def proof_submission_followup(request: dict) -> tuple[str, str, str] | None:
+    """Describe only explicit alternative proof paths in the bound clause."""
+    text = re.sub(r"\s+", "", request.get("original_text", ""))
+    if request.get("negative_clauses"):
+        return None
+    paths = {path.get("proof_kind") for path in request.get("alternatives", [])}
+    if (request.get("rule") == "performance_proof_paths_require_separate_review"
+            and paths == {"performance_contract", "performance_acceptance"}
+            and "证明文件之一" in text and "合同主要页原件扫描件" in text
+            and "项目时间以合同签订时间或项目竣工（交工）验收文件签署时间为准" in text):
+        return (
+            "业绩评分证明路径待核",
+            "本评分项允许选用合同主要页原件扫描件或竣工（交工）验收文件扫描件。相关业绩材料已列候选，完整性、时间和适用条件待核。",
+            "按该项业绩核对合同首页、承包范围页和签署页，以签约日期计时。选用验收件时，逐项核对参与单位及人员、验收内容、结论和日期，以验收文件签署时间计时。按资格条款另核其证明种类。",
+        )
+    if re.search(r"法定代表人（单位负责人）签字或加盖电子印章的，应附法定代表人（单位负责人）身份证明[，。]"
+                 r"由代理人签字或加盖电子印章的，应附由法定代表人（单位负责人）签署的授权委托书[。]$", text):
+        return (
+            "按实际签署人补齐身份证明或授权",
+            "本条证明取决于实际签署人。签署人及对应证明仍待本项目确认。",
+            "由法定代表人（单位负责人）签署时附其身份证明。由代理人签署时附法定代表人（单位负责人）签署的授权委托书，按招标格式核对人员、证件、授权期限、日期和签章。",
+        )
+    return None
+
+
+def annotate_material_issues(issues: list, report: dict, *, proof_assembly=()) -> list:
     """Append scoped stage results; retain original gaps and response provenance."""
     groups = {g["group_id"]: g for g in report["proof_groups"]}
     queries = {q["requirement_id"]: q for q in report.get("proof_queries", [])}
     rows = {r["requirement_id"]: r for r in report.get("semantic_recall", {}).get("queries", [])}
     annotated = {"candidates_pending_original_checks", "no_candidate_in_frozen_catalog",
                  "all_candidates_blocked", "deferred_not_searched", "disabled_not_searched"}
+    placements = {}
+    for placement in proof_assembly:
+        placements.setdefault((placement["issue_id"], placement["requirement_id"]), []).append(placement)
+    content_index = report.get("original_content_index")
     changes = []
     for issue in issues:
         relevant = [(rid, rows[rid]) for rid in issue["requirement_refs"] if rid in rows]
@@ -395,17 +434,27 @@ def annotate_material_issues(issues: list, report: dict) -> list:
             if rid not in rows and rid in queries:
                 fallback = {"requirement_id": rid, "status": "not_run_or_unavailable", "candidates": [],
                             "condition_findings": [], "annotation_only_no_semantic_record": True}
-                content = report.get("original_content_index") or {}
+                content = content_index or {}
                 if (queries[rid].get("reviewed_page_candidates")
                         or _ocr_failure_review_scope(content, queries[rid], fallback)["failed_unit_count"]
                         or _ocr_reading_scope(content, queries[rid], fallback)["selected_unit_count"]):
                     relevant.append((rid, fallback))
-        numeric_scopes = {rid: _numeric_review_scope(report.get("original_content_index") or {},
-                                                     queries.get(rid, {}), row) for rid, row in relevant}
-        failure_scopes = {rid: _ocr_failure_review_scope(report.get("original_content_index") or {},
-                                                       queries.get(rid, {}), row) for rid, row in relevant}
-        reading_scopes = {rid: _ocr_reading_scope(report.get("original_content_index") or {},
-                                                queries.get(rid, {}), row) for rid, row in relevant}
+        certificate_placements = {}
+        scoped_indexes = {}
+        for rid, _ in relevant:
+            scope = content_index or {}
+            matches = placements.get((issue["issue_id"], rid), [])
+            if (len(matches) == 1 and any(page["proof_kind"] == "environment_management_certificate"
+                                         for page in queries.get(rid, {}).get("reviewed_page_candidates", []))):
+                placement, = matches
+                group_id = placement["group_id"]
+                if groups[group_id]["proof_kind"] in _CERTIFICATE_CHECKS:
+                    certificate_placements[rid] = placement
+                    scope = {**scope, "groups": [group for group in scope.get("groups", []) if group["group_id"] == group_id]}
+            scoped_indexes[rid] = scope
+        numeric_scopes = {rid: _numeric_review_scope(scoped_indexes[rid], queries.get(rid, {}), row) for rid, row in relevant}
+        failure_scopes = {rid: _ocr_failure_review_scope(scoped_indexes[rid], queries.get(rid, {}), row) for rid, row in relevant}
+        reading_scopes = {rid: _ocr_reading_scope(scoped_indexes[rid], queries.get(rid, {}), row) for rid, row in relevant}
         if not any(row.get("catalog_stage_status", row["status"]) in annotated or row["condition_findings"]
                    or queries.get(rid, {}).get("reviewed_page_candidates")
                    or numeric_scopes[rid]["pending_unit_count"] or numeric_scopes[rid]["finding_count"]
@@ -413,6 +462,7 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                    or reading_scopes[rid]["selected_unit_count"]
                    for rid, row in relevant):
             continue
+        before = copy.deepcopy(issue)
         additions, contexts = [], []
         for rid, row in relevant:
             query = queries.get(rid, {})
@@ -420,19 +470,33 @@ def annotate_material_issues(issues: list, report: dict) -> list:
             short = " ".join(original.split())
             short = short[:36] + ("…" if len(short) > 36 else "")
             label = rid + ("｜" + short if short else "")
-            line = f"【{label}】{_dictionary_stage(query, row)}；{_catalog_stage(row, groups)}"
-            if report.get("original_content_index"):
-                line += "；原件读取后匹配：" + ("有候选，条件待核" if query.get("candidate_group_ids") else "未形成候选")
-                if row.get("catalog_stage_status") != row["status"] and row["status"] == "all_candidates_blocked":
-                    line += "；读取后候选复查：未通过来源、类别或人员检查"
+            pages = query.get("reviewed_page_candidates", [])
+            social = (query.get("request", {}).get("kinds") == ["social_insurance_proof"]
+                      and any(page["proof_kind"] == "social_insurance_proof" for page in pages))
+            placement = certificate_placements.get(rid)
+            if social:
+                line = f"【{label}】已定位参保登记页，实际缴费依据待补"
+            elif placement:
+                line = f"【{label}】按本项所附证书核对"
+                if issue["requirement_refs"] == [rid]:
+                    issue["action"] = _CERTIFICATE_CHECKS[groups[placement["group_id"]]["proof_kind"]]
+            else:
+                line = f"【{label}】{_dictionary_stage(query, row)}；{_catalog_stage(row, groups)}"
+                if content_index:
+                    line += "；原件读取后匹配：" + ("有候选，条件待核" if query.get("candidate_group_ids") else "未形成候选")
+                    if row.get("catalog_stage_status") != row["status"] and row["status"] == "all_candidates_blocked":
+                        line += "；读取后候选复查：未通过来源、类别或人员检查"
             additions.append(line + "。")
-            reviewed_pages = query.get("reviewed_page_candidates", [])
+            reviewed_pages = [page for page in pages if page["proof_kind"] != "environment_management_certificate"
+                or (placement and page["group_id"] == placement["group_id"] and page["attachment_id"] in placement["attachment_ids"])]
             additions.extend(reviewed_page_note(page) for page in reviewed_pages)
-            for finding in row["condition_findings"]:
-                # The preceding requirement ID binds the unchanged condition text.
-                additions.append("条件核对：" + finding["reason"])
+            if social and issue.get("action") != social_insurance_action(original):
+                additions.append(social_insurance_action(original))
+            if not (social or placement):
+                for finding in row["condition_findings"]:
+                    additions.append("条件核对：" + finding["reason"])
             numeric = numeric_scopes[rid]
-            if numeric["pending_unit_count"] or numeric["finding_count"]:
+            if not social and (numeric["pending_unit_count"] or numeric["finding_count"]):
                 additions.append(f"本条候选证明的 OCR 核对：已关联{numeric['selected_unit_count']}页/图，"
                                  f"{numeric['pending_unit_count']}项的数字、日期或单位仍需原图核对。")
                 if numeric["finding_count"]:
@@ -443,9 +507,10 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                     additions.append(f"本条候选证明的 OCR 数字校验发现{numeric['finding_count']}处疑点（{findings}）；"
                                      "对应页/图及来源保留在逐条诊断中，需回到原图核对，不自动改数或认定原件有错。")
             failure = failure_scopes[rid]
-            additions.extend(_ocr_failure_notes(failure, groups))
             reading_scope = reading_scopes[rid]
-            additions.extend(_ocr_reading_scope_notes(reading_scope, groups))
+            if not social:
+                additions.extend(_ocr_failure_notes(failure, groups))
+                additions.extend(_ocr_reading_scope_notes(reading_scope, groups))
             contexts.append({"requirement_id": rid, "original_requirement": original,
                              "original_conditions": copy.deepcopy(query.get("request", {}).get("conditions", {})),
                              "deterministic_search_status": query.get("search_status"),
@@ -454,7 +519,8 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                              "ocr_failure_review": failure, "ocr_reading_scope": reading_scope})
             if reviewed_pages:
                 contexts[-1]["reviewed_page_candidates"] = copy.deepcopy(reviewed_pages)
-        content_index = report.get("original_content_index")
+            if placement:
+                contexts[-1]["proof_assembly_group_id"] = placement["group_id"]
         if content_index:
             coverage = content_index["coverage"]
             count = coverage["selected_unit_count"]
@@ -481,7 +547,6 @@ def annotate_material_issues(issues: list, report: dict) -> list:
             additions.append("目录补查仅使用名称及同源历史声明，本次目录补查未检查原件内容；原件读取另列如上，适用条件待核，原缺项继续保留。未检索或未找到候选均不证明公司没有材料。")
         else:
             additions.append("目录补查仅使用名称及同源历史声明，本次目录补查未检查原件内容；原件及适用条件待核，原缺项继续保留。未检索或未找到候选均不证明公司没有材料。")
-        before = copy.deepcopy(issue)
         issue["reason"] += "\n" + "\n".join(additions)
         changes.append({"issue_id": issue["issue_id"], "requirement_refs": [rid for rid, _ in relevant],
                         "before": before, "after": copy.deepcopy(issue),

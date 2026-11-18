@@ -1891,7 +1891,21 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                         requirement = next(item for item in requirements if item["requirement_id"] == rid)
                         section["fixed_content"].append({"kind": "paragraph", "text": "证明提交说明（招标原文）：\n" + detail["text"],
                                                          "source_refs": requirement["source_refs"]})
+                    elif (query.get("reviewed_page_candidates")
+                          and query["request"]["kinds"] == ["social_insurance_proof"]):
+                        from .material_reviewed_pages import social_insurance_action
+
+                        issue(section, [rid], "已有参保登记明细，实缴依据待补",
+                              "已定位本条参保登记明细。拟派负责人、用工主体、正式递交截止时点及规定窗口内实缴情况待核。",
+                              social_insurance_action(query["request"]["original_text"]))
                     else:
+                        from .material_recall import proof_submission_followup
+
+                        followup = proof_submission_followup(query.get("request", {}))
+                        if followup:
+                            title, reason, action = followup
+                            issue(section, [rid], title, reason, action)
+                            continue
                         reason = ("当前表达尚未完成可支持的材料检索，不能据此认定公司没有材料。"
                                   if matching_policy["query_status"] == "not_searched" else
                                   "已找到相关材料，但其来源、类别或适用条件不足以支持本条装配。"
@@ -2142,7 +2156,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         material_recall_issue_changes = []
         if config.get("semantic_material_recall") is not None:
             from .material_recall import annotate_material_issues
-            material_recall_issue_changes = annotate_material_issues(issues, material_report)
+            material_recall_issue_changes = annotate_material_issues(
+                issues, material_report, proof_assembly=response_organization.get("proof_assembly", []))
             _capture(ctx, "n3-material-recall-issues", {"changes": material_recall_issue_changes,
                 "qualification_result": "not_determined", "assembly_candidates_added": 0})
         output = PreparedBid.model_validate(output_values).model_dump(mode="json")

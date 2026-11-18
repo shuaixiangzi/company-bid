@@ -57,6 +57,14 @@ def _display_reason(reason):
 
 _NUMERIC_CONFLICT = "MATERIAL_OCR_NUMERIC_REFERENCE_MISMATCH"
 _LINKED_OCR_SUCCESS = "所关联 OCR 状态保持执行成功（不代表字段准确）。"
+_MATERIAL_HEADER_PREFIXES = ("词典阶段：", "已定位参保登记页，实际缴费依据待补", "按本项所附证书核对")
+
+
+def _material_header_suffix(line):
+    if line.startswith("【"):
+        following = line.partition("】")[2]
+        return next((prefix for prefix in _MATERIAL_HEADER_PREFIXES if following.startswith(prefix)), "")
+    return ""
 
 
 def material_review_report(ctx):
@@ -150,14 +158,14 @@ def _display_source_review_status(issue, change, groups, failed, sources):
     offsets = [len(prefix)]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
-    headers = [index for index, line in enumerate(lines) if line.startswith("【") and "】词典阶段：" in line]
+    headers = [index for index, line in enumerate(lines) if _material_header_suffix(line)]
     changes = []
     for context in contexts:
         rid = context["requirement_id"]
         short = " ".join(context["original_requirement"].split())
         short = short[:36] + ("…" if len(short) > 36 else "")
         label = rid + ("｜" + short if short else "")
-        matches = [index for index in headers if lines[index].startswith(f"【{label}】词典阶段：")]
+        matches = [index for index in headers if lines[index].startswith(f"【{label}】")]
         if len(matches) != 1:
             continue
         start = matches[0] + 1
@@ -199,18 +207,18 @@ def _display_material_requirement_labels(reason, issue, catalog):
         requirement = catalog["requirements"][rid]
         short = " ".join(requirement.text.split())
         short = short[:36] + ("…" if len(short) > 36 else "")
-        original = f"【{rid}｜{short}】词典阶段："
+        original_label = f"【{rid}｜{short}】"
         qid = catalog["requirement_quote_ids"][rid]
-        display = f"【{qid}｜{short}】词典阶段："
-        count = 0
+        display_label = f"【{qid}｜{short}】"
+        counts = {}
         for number, line in enumerate(lines):
-            if line.startswith(original):
-                lines[number] = display + line[len(original):]
-                count += 1
-        if count:
+            if line.startswith(original_label) and (prefix := _material_header_suffix(line)):
+                lines[number] = display_label + line[len(original_label):]
+                counts[prefix] = counts.get(prefix, 0) + 1
+        for prefix, count in counts.items():
             quote_ids.append(qid)
             changes.append({"field": "reason", "rule": "material_requirement_header_source_id_v1",
-                            "original_text": original, "display_text": display, "occurrences": count,
+                            "original_text": original_label + prefix, "display_text": display_label + prefix, "occurrences": count,
                             "requirement_id": rid, "quote_id": qid,
                             "source_refs": list(requirement.source_refs)})
     return "".join(lines), changes, list(dict.fromkeys(quote_ids))
@@ -266,7 +274,7 @@ def shared_reason_catalog(rows, catalog):
         for line_number, raw_line in enumerate(row["display_reason"].splitlines(keepends=True)):
             text = raw_line.rstrip("\r\n")
             ending = raw_line[len(text):]
-            if text.startswith("【") and "】词典阶段：" in text:
+            if _material_header_suffix(text):
                 active = []
             # Different original RIDs can intentionally share one readable
             # quote ID and heading. Bind this occurrence to its original line,
@@ -439,7 +447,12 @@ def render_task_list(package, *, material_review_report=None, glyph_maps=None):
     material_changes = {change["issue_id"]: change for change in review_changes}
     material_groups = {group["group_id"]: group for group in report.get("proof_groups", [])}
     failed_validations = report.get("validation_failures", {})
+    quote_compositions = {}
     for issue in package.issues:
+        requirements = [catalog["requirements"][rid] for rid in issue.requirement_refs]
+        components = tuple((requirement.text, tuple(requirement.source_refs)) for requirement in requirements)
+        if "\t" in issue.source_requirement and len(components) > 1 and "；".join(text for text, _ in components) == issue.source_requirement:
+            quote_compositions.setdefault(issue.source_requirement, set()).add(components)
         refs=list(dict.fromkeys(ref for rid in issue.requirement_refs for ref in catalog["requirements"][rid].source_refs))
         locs=list(dict.fromkeys(_location(sources[ref]) for ref in refs))
         qid=catalog["quote_ids"][issue.source_requirement]
@@ -547,7 +560,9 @@ def render_task_list(package, *, material_review_report=None, glyph_maps=None):
     for entry in catalog["entries"]:
         paragraph(entry["display_id"],bold=True,keep_next=True)
         paragraph("；".join(entry["locations"]),keep_next=True)
-        layout=recover_review_source_tables(entry["text"],entry["source_refs"],sources,table_cache,**table_options)
+        compositions = quote_compositions.get(entry["text"], ())
+        options = {**table_options, "issue_components": next(iter(compositions))} if len(compositions) == 1 else table_options
+        layout=recover_review_source_tables(entry["text"],entry["source_refs"],sources,table_cache,**options)
         if layout["status"]=="failed":
             raise RenderingError("REVIEW_SOURCE_TABLE_SOURCE_VALIDATION_FAILED")
         index["source_quote_layout"].append({"display_id":entry["display_id"],**layout})

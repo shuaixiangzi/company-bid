@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 
 from company_bid.evidence import EvidenceSelection
-from company_bid.material_recall import annotate_material_issues
+from company_bid.material_recall import annotate_material_issues, proof_submission_followup
 from company_bid.material_reviewed_pages import ReviewedProofPage, bind_reviewed_pages
 from company_bid.provider import ProviderFailure
 from company_bid.storage import digest
@@ -27,7 +27,7 @@ def reviewed_personnel():
               "ocr_image_sha256": attachment["sha256"], "group_ids": [group_id],
               "transcription_status": "ocr_failed_pending_review" if part == target else "ocr_no_text_unresolved"}
              for part, attachment in zip([sibling, target], attachments)]
-    requirement = "项目负责人应有截止日前的社会保险证明。"
+    requirement = "项目负责人应提供递交截止日\n前120日内至少缴纳过一次社会保险的证明。"
     query = {"requirement_id": "R-social", "request": {"kinds": ["social_insurance_proof"], "original_text": requirement},
              "search_status": "no_candidate", "candidate_group_ids": []}
     report = {"proof_queries": [query], "assembly_candidates": [],
@@ -60,8 +60,53 @@ def test_candidate_does_not_promote_personnel_group_or_change_original_issue(rev
     assert change["before"]["reason"] == "仍需缴费凭据。"
     assert change["requirement_contexts"][0]["reviewed_page_candidates"] == candidates
     assert "social.png" in social["reason"] and "实际缴费凭据" in social["reason"]
+    assert "截止前 120 日内" in social["reason"] and "未形成候选" not in social["reason"]
     assert "card.png" not in social["reason"] and social["severity"] == "missing"
     assert other["reason"] == "另一要求。"
+
+
+def test_environment_review_scope_follows_actual_attachment_and_scoring_item():
+    page = {"proof_kind": "environment_management_certificate", "group_id": "env-group",
+            "attachment_id": "proof-env", "locator": "docx/word/media/env.png",
+            "transcription_status": "ocr_no_text_unresolved"}
+    query = {"requirement_id": "R-score", "request": {"kinds": ["environment_management_certificate",
+               "quality_management_certificate"], "original_text": "评分证明"},
+             "candidate_group_ids": ["env-group", "quality-group"], "reviewed_page_candidates": [page]}
+    report = {"proof_queries": [query], "proof_groups": [
+        {"group_id": "env-group", "proof_kind": "environment_management_certificate"},
+        {"group_id": "quality-group", "proof_kind": "quality_management_certificate"},
+    ]}
+    issues = [{"issue_id": iid, "requirement_refs": ["R-score"], "reason": "已附原件，继续核对。",
+               "action": "核对证书。", "severity": "warning"} for iid in ["M-env", "M-quality", "M-summary"]]
+    assembly = [
+        {"issue_id": "M-env", "requirement_id": "R-score", "group_id": "env-group", "attachment_ids": ["proof-env"]},
+        {"issue_id": "M-quality", "requirement_id": "R-score", "group_id": "quality-group", "attachment_ids": ["proof-quality"]},
+    ]
+    annotate_material_issues(issues, report, proof_assembly=assembly)
+    assert "env.png" in issues[0]["reason"] and "年度监督" in issues[0]["action"]
+    assert "env.png" not in issues[1]["reason"] and "质量管理体系" in issues[1]["action"]
+    assert "env.png" not in issues[2]["reason"]
+    assembly[0]["attachment_ids"] = ["proof-other"]
+    issues[0]["reason"] = "该证书需核。"
+    annotate_material_issues(issues[:1], report, proof_assembly=assembly)
+    assert "env.png" not in issues[0]["reason"]
+
+
+def test_explicit_performance_alternatives_do_not_make_acceptance_mandatory():
+    request = {"rule": "performance_proof_paths_require_separate_review",
+               "alternatives": [{"proof_kind": "performance_contract"}, {"proof_kind": "performance_acceptance"}],
+               "original_text": ("得分需提供以下证明文件之一：合同主要页原件扫描件或竣工（交工）验收文件。"
+                                 "项目时间以合同签订时间或项目竣工（交工）验收文件签署时间为准。")}
+    title, reason, action = proof_submission_followup(request)
+    assert "评分" in title and "或竣工（交工）" in reason and "选用验收件时" in action
+    assert proof_submission_followup({**request, "original_text": request["original_text"].replace("之一", "全部")}) is None
+
+
+def test_signer_followup_requires_both_source_branches():
+    direct = "由法定代表人（单位负责人）签字或加盖电子印章的，应附法定代表人（单位负责人）身份证明"
+    agent = "由代理人签字或加盖电子印章的，应附由法定代表人（单位负责人）签署的授权委托书"
+    assert "授权期限" in proof_submission_followup({"original_text": direct + "，" + agent + "。" })[2]
+    assert proof_submission_followup({"original_text": direct + "。" }) is None
 
 
 @pytest.mark.parametrize("changes, error", [
