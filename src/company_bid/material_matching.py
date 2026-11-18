@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import PureWindowsPath
 
 
-MATERIAL_MATCHING_VERSION = "material-matching.v3"
+MATERIAL_MATCHING_VERSION = "material-matching.v4"
 
 _CAPTIONS = {
     "营业执照": "business_license", "企业营业执照": "business_license",
@@ -40,6 +40,16 @@ _ALIASES = {
 _TERMS = {**_CAPTIONS, **_ALIASES}
 _STANDARD_TERMS = {"ISO9001": "quality_management_certificate", "ISO14001": "environment_management_certificate",
                    "ISO45001": "occupational_health_safety_certificate"}
+# Recognize explicit variants in tender wording, including bounded repetition
+# of the certificate suffix. Maintained labels and read evidence retain their
+# separate type and role checks.
+_CERTIFICATE_SUFFIX = r"(?:认证)?证(?:书?证){0,2}书"
+_REQUEST_TYPE_PATTERNS = {
+    "quality_management_certificate": re.compile(r"质量(?:管理)?体系" + _CERTIFICATE_SUFFIX),
+    "environment_management_certificate": re.compile(r"环境管理体系" + _CERTIFICATE_SUFFIX),
+    "occupational_health_safety_certificate": re.compile(r"职业健康安全管理体系" + _CERTIFICATE_SUFFIX),
+    "corrosion_control_qualification": re.compile(r"中国腐蚀控制[特一二三四五壹贰叁肆伍1-5]级资质证书"),
+}
 _PERFORMANCE_TYPES = {
     "项目合同": "performance_contract", "合同主要页": "performance_contract",
     "中标通知书": "performance_award_notice", "项目竣工验收文件": "performance_acceptance",
@@ -62,12 +72,16 @@ _PROOF_LABELS.update({"personnel_proof_package": "人员证明资料", "performa
                       "social_insurance_proof": "社会保险证明"})
 
 
-def _term_hits(value: str) -> list[dict]:
+def _term_hits(value: str, *, request_text: bool = False) -> list[dict]:
     text = _normal(value).upper()
     hits = [{"term": term, "proof_kind": kind, "relation": "equivalent_alias" if term in _ALIASES else "maintained_type"}
             for term, kind in _TERMS.items() if term.upper() in text]
     hits.extend({"term": term, "proof_kind": kind, "relation": "related_standard_requires_validation"}
                 for term, kind in _STANDARD_TERMS.items() if re.search(re.escape(term) + r"(?!\d)", text))
+    if request_text:
+        hits.extend({"term": term, "proof_kind": kind, "relation": "equivalent_alias"}
+                    for kind, pattern in _REQUEST_TYPE_PATTERNS.items()
+                    for term in dict.fromkeys(pattern.findall(text)) if term not in _TERMS)
     return hits
 
 
@@ -548,8 +562,10 @@ def _proof_request(requirement: dict) -> dict:
     else:
         hits = []
         for clause in re.split(r"[；;，,]", search_text):
-            document_list = any(_caption(clause).upper().startswith(term.upper()) for term in {**_TERMS, **_STANDARD_TERMS})
-            for hit in _term_hits(clause):
+            clause_hits = _term_hits(clause, request_text=True)
+            label = _caption(clause).upper()
+            document_list = any(label.startswith(hit["term"].upper()) for hit in clause_hits)
+            for hit in clause_hits:
                 prefix, _, suffix = clause.upper().partition(hit["term"].upper())
                 # Local proof request or a standalone document list is allowed;
                 # a licence mentioned in a financial/status clause is not.

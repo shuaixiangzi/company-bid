@@ -6,7 +6,7 @@ import pytest
 
 from company_bid.planning import _material_match_report, plan_bid
 from company_bid.runtime import Executor, NodeSpec
-from test_planning import Context, add_unit, extract, fixture, no_call, requirement, response
+from test_planning import Context, add_unit, cite, extract, fixture, no_call, requirement, response
 
 
 def proof_case(tmp_path, text, title, *, description="合成证明包", organize=False):
@@ -39,6 +39,59 @@ def test_synonym_match_reaches_real_planning_without_model(tmp_path, text, title
     assert report["assembly_candidates"][0]["qualification_result"] == "not_determined"
     assert len(report["checkpoint_units"]) == 1
     assert ctx.captures["n3-planning-report"]["attachments"][0]["matching_policy"]["rule"] == "unified_source_bound_material_match"
+
+
+def test_compound_scoring_reaches_only_matching_selected_images(tmp_path):
+    text = ("技术评分：持有中国腐蚀控制设计资格证书得分。"
+            "持有中国腐蚀控制贰级资质证书得分。"
+            "持有质量管理体系认证证书得分、职业健康安全管理体\n系证证书得分，"
+            "环境管理体系证书证证书得分；上述证书均须在有效期内。")
+    manifest, parsed = fixture(tmp_path)
+    block = add_unit(parsed, "U1", text)
+    form = add_unit(parsed, "U2", "企业资质情况")
+    fixed = add_unit(parsed, "U3", "此处附相应证书复印件。")
+    labels = {"DESIGN": "中国腐蚀控制设计资格证书", "CORROSION": "中国腐蚀控制资质证书",
+              "QUALITY": "质量管理体系认证证书", "HEALTH": "职业健康安全管理体系认证证书",
+              "ENV": "环境管理体系认证证书", "OTHER": "安全生产许可证",
+              "APPLICATION": "环境管理体系认证证书申请说明"}
+    source = next(item for item in manifest["sources"] if item["source_id"] == "company")
+    manifest["attachments"] = [{"attachment_id": group, "bundle_id": group, "section_id": "unassigned",
+        "title": title, "description": "合成证明包", "path": str(tmp_path / f"{group}.png"), "sha256": "c" * 64,
+        "source_refs": ["company"], "requirement_refs": ["unassigned"], "synthetic": True,
+        "page_index": 1, "page_count": 1} for group, title in labels.items()]
+    manifest["evidence_selections"] = [{"selection_id": group, "title": title, "source_id": "company",
+        "source_sha256": source["sha256"], "format": "docx_images", "pages": [],
+        "package_parts": [f"word/media/{group}.png"]} for group, title in labels.items()]
+    ctx = Context()
+    extracted = extract(ctx, parsed, manifest, lambda p: response(p, [
+        requirement(block, category="commercial", mode="factual_response",
+                    format_status="prescribed", format_title=form["text"])],
+        [{"title": form["text"], "level": 1, "citation": cite(form),
+          "content_block_ids": [fixed["block_id"]], "requirement_indices": [0]}]))
+    output = plan_bid(ctx, extracted, parsed, manifest, no_call, {"organize_response": True})
+
+    rid = next(item["requirement_id"] for item in output["requirements"] if item["text"] == text)
+    assert {a["attachment_id"] for a in output["attachments"] if rid in a["requirement_refs"]} == {
+        "DESIGN", "CORROSION", "QUALITY", "HEALTH", "ENV"}
+    report = ctx.captures["n3-material-matching"]
+    query = next(row for row in report["proof_queries"] if row["requirement_id"] == rid)
+    assert query["request"]["original_text"] == text
+    assert query["request"]["conditions"]["validation"] == "pending_original_evidence"
+    assert query["request"]["conditions"]["dates_levels_and_standards"] == ["贰级", "有效期"]
+    assert query["request"]["alternatives_operator"] == "and"
+    assert query["read_scope_status"] == "incomplete"
+    assert query["excluded_group_ids"] == ["APPLICATION"]
+    by_group = {row["group_id"]: row for row in report["assembly_candidates"] if row["requirement_id"] == rid}
+    assert set(by_group) == {"DESIGN", "CORROSION", "QUALITY", "HEALTH", "ENV"}
+    for group, candidate in by_group.items():
+        assert candidate["attachment_ids"] == [group]
+        assert candidate["basis"]["origin"]["package_parts"] == [f"word/media/{group}.png"]
+        assert candidate["qualification_result"] == "not_determined"
+        assert candidate["project_assignment"] == "not_made"
+    env, = [row for row in query["candidate_evaluations"] if row["group_id"] == "ENV"]
+    assert env["read_text_hits"] == []
+    assert any(rid in issue["requirement_refs"] and issue["title"] == "已附证明的适用条件仍待核对"
+               for issue in output["issues"])
 
 
 @pytest.mark.parametrize("organize", [False, True])

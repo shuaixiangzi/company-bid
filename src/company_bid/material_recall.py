@@ -11,6 +11,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .material_reviewed_pages import ReviewedProofPage, reviewed_page_note
 from .provider import ChatConfig, ChatProposalProvider, ProviderFailure
 from .semantic_materials import (SEMANTIC_VERSION, check_declared_credential_conditions,
                                  recall_route, semantic_probe)
@@ -30,6 +31,7 @@ class RecallOptions(BaseModel):
     provider: dict = Field(default_factory=dict)
     additional_evidence: list[dict] = Field(default_factory=list)
     recorded_source: dict | None = None
+    reviewed_page_candidates: list[ReviewedProofPage] = Field(default_factory=list, max_length=100)
 
 
 def admission_route(requirement: dict, query: dict) -> str:
@@ -57,6 +59,8 @@ def plan_recall_scope(requirements: list, report: dict, settings: dict, handled_
         raise ProviderFailure("MATERIAL_OCR_SELECTED_ORIGINALS_REQUIRED")
     if options.original_ocr is not None and options.original_ocr.get("engine") != "deepseek_ocr":
         raise ProviderFailure("MATERIAL_OCR_DEEPSEEK_REQUIRED_NO_LOCAL_FALLBACK")
+    if options.reviewed_page_candidates and options.original_ocr is None:
+        raise ProviderFailure("MATERIAL_REVIEWED_PAGE_OCR_INDEX_REQUIRED")
     reqs = {r["requirement_id"]: r for r in requirements}
     if len(reqs) != len(requirements):
         raise ProviderFailure("SEMANTIC_REQUIREMENT_ID_DUPLICATE")
@@ -392,7 +396,8 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                 fallback = {"requirement_id": rid, "status": "not_run_or_unavailable", "candidates": [],
                             "condition_findings": [], "annotation_only_no_semantic_record": True}
                 content = report.get("original_content_index") or {}
-                if (_ocr_failure_review_scope(content, queries[rid], fallback)["failed_unit_count"]
+                if (queries[rid].get("reviewed_page_candidates")
+                        or _ocr_failure_review_scope(content, queries[rid], fallback)["failed_unit_count"]
                         or _ocr_reading_scope(content, queries[rid], fallback)["selected_unit_count"]):
                     relevant.append((rid, fallback))
         numeric_scopes = {rid: _numeric_review_scope(report.get("original_content_index") or {},
@@ -402,6 +407,7 @@ def annotate_material_issues(issues: list, report: dict) -> list:
         reading_scopes = {rid: _ocr_reading_scope(report.get("original_content_index") or {},
                                                 queries.get(rid, {}), row) for rid, row in relevant}
         if not any(row.get("catalog_stage_status", row["status"]) in annotated or row["condition_findings"]
+                   or queries.get(rid, {}).get("reviewed_page_candidates")
                    or numeric_scopes[rid]["pending_unit_count"] or numeric_scopes[rid]["finding_count"]
                    or failure_scopes[rid]["failed_unit_count"]
                    or reading_scopes[rid]["selected_unit_count"]
@@ -420,6 +426,8 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                 if row.get("catalog_stage_status") != row["status"] and row["status"] == "all_candidates_blocked":
                     line += "；读取后候选复查：未通过来源、类别或人员检查"
             additions.append(line + "。")
+            reviewed_pages = query.get("reviewed_page_candidates", [])
+            additions.extend(reviewed_page_note(page) for page in reviewed_pages)
             for finding in row["condition_findings"]:
                 # The preceding requirement ID binds the unchanged condition text.
                 additions.append("条件核对：" + finding["reason"])
@@ -444,6 +452,8 @@ def annotate_material_issues(issues: list, report: dict) -> list:
                              "deterministic_read_scope_status": query.get("read_scope_status"),
                              "semantic_recall": copy.deepcopy(row), "ocr_numeric_review": numeric,
                              "ocr_failure_review": failure, "ocr_reading_scope": reading_scope})
+            if reviewed_pages:
+                contexts[-1]["reviewed_page_candidates"] = copy.deepcopy(reviewed_pages)
         content_index = report.get("original_content_index")
         if content_index:
             coverage = content_index["coverage"]

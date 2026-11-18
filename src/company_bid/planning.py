@@ -137,13 +137,26 @@ def _material_match_report(ctx, requirements: list, manifest: dict, parsed: dict
                                            "output_sha256": _hash(result)})
     report["matching_version"] = MATCHING_VERSION
     if recall_settings is not None:
-        from .material_recall import integrate_material_recall
+        from .material_recall import RecallOptions, integrate_material_recall
         report = integrate_material_recall(ctx, requirements, manifest, parsed, report, recall_settings, recall_handled)
         if recall_settings.get("read_selected_originals", False):
             from .material_content_matching import integrate_original_content
             _capture(ctx, "n3-material-matching-catalog-stage", report)
             report = integrate_original_content(ctx, requirements, manifest, parsed, report,
                                                 recall_settings.get("original_ocr"))
+            reviewed_pages = RecallOptions.model_validate(recall_settings).reviewed_page_candidates
+            if reviewed_pages:
+                from .material_reviewed_pages import bind_reviewed_pages
+
+                reviewed_page_result = ctx.run_unit("material-reviewed-pages", {
+                    "report_sha256": _hash(report),
+                    "reviews": [page.model_dump(mode="json") for page in reviewed_pages],
+                }, lambda: {"candidates": bind_reviewed_pages(manifest, report, reviewed_pages)})
+                candidates = reviewed_page_result["candidates"]
+                queries = {q["requirement_id"]: q for q in report["proof_queries"]}
+                for candidate in candidates:
+                    queries[candidate["requirement_id"]].setdefault("reviewed_page_candidates", []).append(candidate)
+                report["reviewed_page_candidates"] = candidates
     _capture(ctx, "n3-material-matching", report)
     return report
 

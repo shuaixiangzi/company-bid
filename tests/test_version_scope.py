@@ -54,6 +54,7 @@ from company_bid.pipeline import build_executor
     ("diagnostics.py", {"N4", "N5"}),
     ("material_ocr_diagnostics.py", {"N4", "N5"}),
     ("material_recall.py", {"N3", "N6"}),
+    ("material_reviewed_pages.py", {"N3", "N6"}),
     ("material_source_selection.py", {"N3", "N6"}),
     ("semantic_materials.py", {"N3", "N6"}),
     ("semantic_replay.py", {"N3", "N6"}),
