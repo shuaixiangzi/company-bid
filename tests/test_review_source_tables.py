@@ -338,3 +338,112 @@ def test_aggregate_keeps_interior_duplicate_ambiguous(source_grid):
     text=text+'\nprefixLabel\tScoresuffix'
     result=recover_review_source_tables(text,['part1','part2'],sources)
     assert result['status']=='unsupported' and result['reason']=='aggregate_child_quote_ambiguous'
+
+
+@pytest.fixture
+def glyph_grid(source_grid, monkeypatch):
+    """Present a native private-use glyph with a distinctive font identity."""
+    from pdfplumber.page import Page
+
+    native_chars = Page.chars.fget
+    marked = []
+
+    def chars(page):
+        result = native_chars(page)
+        for char in result:
+            if char['text'] == '8':
+                char.update(text='\uf052', fontname='synthetic-checkbox-font')
+                marked.append(char)
+        return result
+
+    monkeypatch.setattr(Page, 'chars', property(chars))
+    original, sources = source_grid
+    text = original.replace('Alpha\t8', 'Alpha\t☑')
+    sources['scope']['locator'] = sources['scope']['locator'].replace(
+        hashlib.sha256(original.encode()).hexdigest(), hashlib.sha256(text.encode()).hexdigest())
+    glyphs = [{'source_sha256': sources['scope']['sha256'], 'font': 'synthetic-checkbox-font',
+               'pages': [1], 'codepoint': 'U+F052', 'replacement': '☑', 'reason': 'synthetic source review'}]
+    return text, sources, glyphs, marked
+
+
+def test_frozen_glyph_proof_and_cache_binding(glyph_grid):
+    text, sources, glyphs, marked = glyph_grid
+    cache = {}
+    result = recover_review_source_tables(text, ['scope'], sources, cache, glyph_maps=glyphs)
+    assert result['status'] == 'restored'
+    proof = result['proofs'][0]
+    assert proof['source_sha256'] == glyphs[0]['source_sha256']
+    assert proof['locator'] == 'pdf/page[1]/table[0]'
+    glyph, = proof['glyph_transformations']
+    assert glyph == {'row': 1, 'column': 1, 'font': 'synthetic-checkbox-font', 'original_symbol': '\uf052',
+                     'codepoint': 'U+F052', 'replacement': '☑', 'reason': 'synthetic source review',
+                     'bbox': [marked[0][key] for key in ('x0', 'top', 'x1', 'bottom')]}
+    assert marked[0]['text'] == '\uf052'
+    assert result['fragments'][1]['rows'][1] == ['Alpha', '☑']
+    assert recover_review_source_tables(text, ['scope'], sources, cache, glyph_maps=glyphs) == result
+    assert recover_review_source_tables(text, ['scope'], sources, cache)['reason'] == 'native_grid_quote_mismatch'
+
+
+@pytest.mark.parametrize('field,wrong', [('source_sha256', 'f' * 64), ('font', 'other-font'),
+    ('pages', [2]), ('codepoint', 'U+F0A3'), ('replacement', '□')])
+def test_wrong_frozen_glyph_identity_or_interpretation_cannot_match(glyph_grid, field, wrong):
+    text, sources, glyphs, _ = glyph_grid
+    glyphs[0][field] = wrong
+    result = recover_review_source_tables(text, ['scope'], sources, glyph_maps=glyphs)
+    assert result['reason'] == 'native_grid_quote_mismatch'
+    assert result['fragments'] == [{'kind':'paragraph', 'text':text}]
+
+
+def test_duplicate_glyph_rules_fail_as_source_validation(glyph_grid):
+    text, sources, glyphs, _ = glyph_grid
+    result = recover_review_source_tables(text, ['scope'], sources, glyph_maps=glyphs * 2)
+    assert result['status'] == 'failed' and result['reason'] == 'native_source_parse_failed'
+    assert result['proofs'] == []
+
+
+def test_aggregate_applies_the_frozen_glyph_rule_to_its_child(glyph_grid):
+    original, sources, glyphs, _ = glyph_grid
+    restored, sources = aggregate_fixture((original.replace('☑', '8'), sources))
+    text = restored.replace('Alpha\t8', 'Alpha\t☑')
+    old, new = restored.split('\n', 1)[1], text.split('\n', 1)[1]
+    sources['part2']['locator'] = sources['part2']['locator'].replace(
+        hashlib.sha256(old.encode()).hexdigest(), hashlib.sha256(new.encode()).hexdigest())
+    result = recover_review_source_tables(text, ['part1', 'part2'], sources, glyph_maps=glyphs)
+    assert result['status'] == 'restored'
+    assert result['proofs'][0].get('glyph_transformations') is None
+    assert result['proofs'][1]['glyph_transformations'][0]['replacement'] == '☑'
+
+
+def whole_native_grid(source_grid, text, cells):
+    _, sources = source_grid
+    scope = sources['scope']
+    block = scope['locator'].split('; blocks=')[1]
+    anchor = 'pdf/page[1]/table[0]'
+    scope['locator'] = (f'{anchor}; basis=table_rows_tsv_v1; chars[0:{len(text)}]; '
+                        f'quote_sha256={hashlib.sha256(text.encode()).hexdigest()}; cells={cells}; '
+                        f'through={anchor}; blocks={block}')
+    return text, sources
+
+
+def test_frozen_legacy_whole_table_unqualified_cells(source_grid):
+    text = 'Label\tScore\nAlpha\t8\nBeta\t'
+    result = recover(whole_native_grid(source_grid, text, 'r0c0,r0c1,r1c0,r1c1,r2c0'))
+    assert result['status'] == 'restored'
+    assert result['fragments'][0]['rows'] == [['Label', 'Score'], ['Alpha', '8'], ['Beta', '']]
+    assert result['proofs'][0]['source_rows'] == [0, 1, 2]
+
+
+def test_legacy_whole_table_rejects_a_proper_row_subset(source_grid):
+    text = 'Label\tScore\nAlpha\t8'
+    result = recover(whole_native_grid(source_grid, text, 'r0c0,r0c1,r1c0,r1c1'))
+    assert result['reason'] == 'native_whole_table_quote_mismatch'
+    assert result['fragments'] == [{'kind':'paragraph', 'text':text}]
+
+
+@pytest.mark.parametrize('before,after', [('through=pdf/page[1]/table[0]', 'through=pdf/page[1]/table[1]'),
+    ('chars[0:', 'chars[1:'), ('cells=r0c0,', 'cells=b-000000000000000000000000:r0c0,')])
+def test_legacy_whole_table_rejects_scope_inconsistency(source_grid, before, after):
+    text = 'Label\tScore\nAlpha\t8\nBeta\t'
+    _, sources = whole_native_grid(source_grid, text, 'r0c0,r0c1,r1c0,r1c1,r2c0')
+    sources['scope']['locator'] = sources['scope']['locator'].replace(before, after)
+    assert recover((text, sources))['reason'] == 'exact_whole_native_table_scope_required'

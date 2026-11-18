@@ -8,6 +8,8 @@ from collections import OrderedDict
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
 
+from .storage import digest
+
 
 _WRAPPERS = {
     "响应要求（招标原文）：", "响应表格要求（招标原文）：", "响应编写规则（招标原文，待核对）：",
@@ -51,6 +53,142 @@ def _display_reason(reason):
             changes.append({"field": "reason", "rule": rule, "original_text": original,
                             "display_text": display, "occurrences": 1})
     return reason, changes
+
+
+_NUMERIC_CONFLICT = "MATERIAL_OCR_NUMERIC_REFERENCE_MISMATCH"
+_LINKED_OCR_SUCCESS = "所关联 OCR 状态保持执行成功（不代表字段准确）。"
+
+
+def material_review_report(ctx):
+    """Read the completed N3 unit used by this run, even after an N6-only fork."""
+    n3 = next((node for node in ctx._state["nodes"] if node["key"] == "N3"), None)
+    if n3 is None or n3["status"] != "succeeded":
+        return None
+    assembly = n3["units"].get("plan-assemble")
+    if assembly is None or assembly["status"] != "succeeded":
+        return None
+    report = ctx.executor._checkpoint_data(assembly).get("report")
+    if not report:
+        return None
+    run_id = assembly["output_ref"]["path"].split("/")[1]
+    failed = {}
+    for unit_id, unit in n3["units"].items():
+        if not unit_id.startswith("material-ocr-validation-") or unit["status"] != "failed":
+            continue
+        attempt = unit["attempts"][-1]
+        if attempt["status"] == "failed" and attempt.get("error_code") == _NUMERIC_CONFLICT:
+            failed[unit_id] = {"run_id": run_id, "unit_id": unit_id, "attempt_id": attempt["attempt_id"],
+                               "status": "failed", "error_code": attempt["error_code"]}
+    return {"changes": report.get("material_recall_issue_changes", []),
+            "proof_groups": report.get("material_matching", {}).get("proof_groups", []),
+            "validation_failures": failed}
+
+
+def _numeric_conflict_evidence(unit, failed, sources):
+    from .material_source_review import MaterialSourceReviewFailure, validate_material_source_review
+
+    disposition = unit["disposition"]
+    if (disposition["error_code"] != _NUMERIC_CONFLICT or
+            disposition.get("schema_version") != "material-ocr-disposition.v1" or
+            disposition["status"] != "reading_failed_pending_review" or
+            disposition.get("source_review_authenticated") is not True or
+            disposition["machine_text_adopted"] is not False or
+            disposition["qualification_result"] != "not_determined" or
+            disposition.get("source_review") != unit["source_review"] or
+            digest(disposition) != unit["disposition_sha256"]):
+        return None
+    try:
+        review = validate_material_source_review(unit["source_review"])
+    except MaterialSourceReviewFailure:
+        return None
+    identity, ocr = disposition["identity"], review["ocr"]
+    identity_hash = digest(identity)
+    current = failed.get("material-ocr-validation-" + identity_hash[:24])
+    source = sources.get(unit["source_id"])
+    if (current is None or current["run_id"] != disposition.get("validation_run_id") or
+            current["status"] != "failed" or current["error_code"] != disposition["error_code"] or
+            identity_hash != disposition["identity_sha256"] or
+            any(identity.get(key) != value for key, value in review["identity"].items()) or
+            any(identity.get(key) != unit[key] for key in ("source_id", "source_sha256", "target", "format")) or
+            identity["image_sha256"] != unit["ocr_image_sha256"] or
+            source is None or source.kind != "company_material" or source.sha256 != identity["source_sha256"] or
+            not set(unit["group_ids"]) <= {link["group_id"] for link in identity["group_bindings"]}):
+        return None
+    provenance = disposition["provenance"]
+    if (review["field"]["disposition"] != "machine_error" or ocr["status"] != "succeeded" or
+            ocr["run_id"] != disposition["origin_run_id"] or ocr["unit_id"] != disposition["origin_unit_id"] or
+            any(ocr[key] != provenance.get(origin) for key, origin in (
+                ("run_id", "origin_run_id"), ("node_key", "origin_node_key"),
+                ("unit_id", "origin_unit_id"), ("response_sha256", "raw_response_sha256"))) or
+            ocr["response_sha256"] != provenance.get("raw_response_snapshot", {}).get("sha256")):
+        return None
+    return {"source_identity": {**review["identity"], "target": unit["target"], "format": unit["format"]},
+            "source_review_sha256": review["record_sha256"], "disposition_sha256": unit["disposition_sha256"],
+            "historical_ocr": ocr, "current_validation": {**current, "disposition": disposition["status"],
+                                                           "machine_text_adopted": False}}
+
+
+def _display_source_review_status(issue, change, groups, failed, sources):
+    """Relabel one generated field note only where the same proof failed current validation."""
+    reason = issue["reason"]
+    if (not failed or change is None or change["after"] != issue or
+            change["rule"] != "append_scoped_stage_context_preserve_missing_conditions_and_provenance"):
+        return reason, []
+    prefix = change["before"]["reason"] + "\n"
+    if not reason.startswith(prefix):
+        return reason, []
+
+    contexts = change["requirement_contexts"]
+    rids = [context["requirement_id"] for context in contexts]
+    if (rids != change["requirement_refs"] or len(rids) != len(set(rids)) or
+            not set(rids) <= set(issue["requirement_refs"])):
+        return reason, []
+
+    from .material_recall import _ocr_failure_notes
+
+    lines = reason[len(prefix):].splitlines(keepends=True)
+    offsets = [len(prefix)]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    headers = [index for index, line in enumerate(lines) if line.startswith("【") and "】词典阶段：" in line]
+    changes = []
+    for context in contexts:
+        rid = context["requirement_id"]
+        short = " ".join(context["original_requirement"].split())
+        short = short[:36] + ("…" if len(short) > 36 else "")
+        label = rid + ("｜" + short if short else "")
+        matches = [index for index in headers if lines[index].startswith(f"【{label}】词典阶段：")]
+        if len(matches) != 1:
+            continue
+        start = matches[0] + 1
+        end = next((index for index in headers if index >= start), len(lines))
+        for unit in context["ocr_failure_review"]["units"]:
+            if unit["source_review"] is None or not unit["group_ids"] or not set(unit["group_ids"]) <= groups.keys():
+                continue
+            evidence = _numeric_conflict_evidence(unit, failed, sources)
+            if evidence is None:
+                continue
+            earlier, review_line = _ocr_failure_notes({"failed_unit_count": 0, "units": [unit]}, groups)
+            matching_pairs = [index for index in range(start, end - 1)
+                              if lines[index].rstrip("\r\n") == earlier
+                              and lines[index + 1].rstrip("\r\n") == review_line]
+            if len(matching_pairs) != 1 or review_line.count(_LINKED_OCR_SUCCESS) != 1:
+                continue
+            left = offsets[matching_pairs[0] + 1] + review_line.index(_LINKED_OCR_SUCCESS)
+            right = left + len(_LINKED_OCR_SUCCESS)
+            display = ("历史 OCR 执行成功（当时返回转录）。该页当前原图字段校验失败"
+                       f"（{evidence['current_validation']['error_code']}），失败转录未采用，仍待核对。")
+            changes.append({"field": "reason", "rule": "material_ocr_historical_and_current_status_v1",
+                            "original_text": _LINKED_OCR_SUCCESS, "display_text": display, "occurrences": 1,
+                            "original_start": left, "original_end": right, "requirement_id": rid,
+                            "group_ids": unit["group_ids"], **evidence})
+    changes.sort(key=lambda item: item["original_start"])
+    if len({item["original_start"] for item in changes}) != len(changes):
+        return reason, []
+    display_reason = reason
+    for item in reversed(changes):
+        display_reason = display_reason[:item["original_start"]] + item["display_text"] + display_reason[item["original_end"]:]
+    return display_reason, changes
 
 
 def _display_material_requirement_labels(reason, issue, catalog):
@@ -285,8 +423,9 @@ def task_list_catalog(package):
             "sources":sources,"requirement_quote_ids":{r.requirement_id:ids[owner[r.text]] for r in package.requirements}}
 
 
-def render_task_list(package):
+def render_task_list(package, *, material_review_report=None, glyph_maps=None):
     from .rendering import _base_document, _font, _indent, _page_furniture, _render_table, _render_section_content, RenderingError
+    from .review_source_context import material_stage_display
     from .source_format_rendering import recover_review_source_tables, render_review_source_table
     doc=_base_document(package,"待补与办理清单")
     _page_furniture(doc.sections[0],package.style,numbered=True,start=1)
@@ -295,19 +434,28 @@ def render_task_list(package):
     index={"mode":"task_list","schema_version":"review-document-index-v1","issues":[],"actions":[],"review_sections":[],
         "source_quotes":catalog["entries"],"requirement_quote_ids":catalog["requirement_quote_ids"],
         "source_index":[source.model_dump(mode="json") for source in package.sources]}
+    report = material_review_report or {}
+    review_changes = report.get("changes", [])
+    material_changes = {change["issue_id"]: change for change in review_changes}
+    material_groups = {group["group_id"]: group for group in report.get("proof_groups", [])}
+    failed_validations = report.get("validation_failures", {})
     for issue in package.issues:
         refs=list(dict.fromkeys(ref for rid in issue.requirement_refs for ref in catalog["requirements"][rid].source_refs))
         locs=list(dict.fromkeys(_location(sources[ref]) for ref in refs))
         qid=catalog["quote_ids"][issue.source_requirement]
         status="待核对" if issue.severity=="warning" else "待补"
+        original_issue = issue.model_dump(mode="json")
         display_action,display_changes=_display_action(issue.action)
-        display_reason,reason_changes=_display_reason(issue.reason)
+        display_reason,source_changes=_display_source_review_status(
+            original_issue, material_changes.get(issue.issue_id), material_groups, failed_validations, sources)
+        display_reason,reason_changes=_display_reason(display_reason)
         display_reason,label_changes,material_qids=_display_material_requirement_labels(display_reason,issue,catalog)
+        display_reason,stage_changes,stage_qids=material_stage_display(display_reason,issue,catalog,review_changes)
         index["issues"].append({"display_id":issue.issue_id,"issue_id":issue.issue_id,"section_id":issue.section_id,
-            "requirement_refs":issue.requirement_refs,"quote_ids":list(dict.fromkeys([qid,*material_qids])),
+            "requirement_refs":issue.requirement_refs,"quote_ids":list(dict.fromkeys([qid,*material_qids,*stage_qids])),
             "source_refs":refs,"locations":locs,"severity":issue.severity,"status":status,
-            "original_issue":issue.model_dump(mode="json"),"display_reason":display_reason,"display_action":display_action,
-            "display_transformations":display_changes+reason_changes+label_changes})
+            "original_issue":original_issue,"display_reason":display_reason,"display_action":display_action,
+            "display_transformations":display_changes+reason_changes+label_changes+stage_changes+source_changes})
     index["shared_reason_notes"]=shared_reason_catalog(index["issues"],catalog)
     issue_rows={row["issue_id"]:row for row in index["issues"]}
     index["section_heading_display"]=[]
@@ -395,10 +543,11 @@ def render_task_list(package):
     doc.add_page_break();doc.add_paragraph("原文附录","Heading 1")
     paragraph("每段原文仅集中保留一次；事项中的原文编号可在本文件中直接搜索。")
     table_cache={}
+    table_options = {} if glyph_maps is None else {"glyph_maps": glyph_maps}
     for entry in catalog["entries"]:
         paragraph(entry["display_id"],bold=True,keep_next=True)
         paragraph("；".join(entry["locations"]),keep_next=True)
-        layout=recover_review_source_tables(entry["text"],entry["source_refs"],sources,table_cache)
+        layout=recover_review_source_tables(entry["text"],entry["source_refs"],sources,table_cache,**table_options)
         if layout["status"]=="failed":
             raise RenderingError("REVIEW_SOURCE_TABLE_SOURCE_VALIDATION_FAILED")
         index["source_quote_layout"].append({"display_id":entry["display_id"],**layout})

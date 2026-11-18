@@ -216,19 +216,47 @@ def render_native_section(document, package, section, *, cover=False, append=Fal
               name=package.style.font_family, size=9)
 
 # This appendix recovery is deliberately independent of response form filling.
-REVIEW_SOURCE_TABLE_VERSION = "review-source-tables-v4"
-_REVIEW_NATIVE_GRID_VERSION = "review-native-pdf-grid-v1"
+REVIEW_SOURCE_TABLE_VERSION = "review-source-tables-v5"
+_REVIEW_NATIVE_GRID_VERSION = "review-native-pdf-grid-v2"
 _REVIEW_AGGREGATE_HASH_BYTE_BUDGET = 8 * 1024 * 1024
 
 
-def _review_native_table(page, table, source_id, locator):
+def _review_glyph_rules(configured_rules, source_sha, pages):
+    """Select the frozen N1 interpretation by file, physical page, font and codepoint."""
+    import re
+
+    by_page = {}
+    for rule in configured_rules or ():
+        if rule["source_sha256"] != source_sha:
+            continue
+        font, token = rule["font"], rule["codepoint"]
+        replacement, reason, rule_pages = rule["replacement"], rule["reason"], rule["pages"]
+        if (any(not isinstance(value, str) for value in (font, token, replacement, reason)) or
+                not isinstance(rule_pages, (list, tuple)) or not font.strip() or
+                not re.fullmatch(r"U\+[0-9A-Fa-f]{4,6}", token) or
+                not reason.strip() or len(replacement) != 1 or not replacement.strip() or
+                not rule_pages or any(type(p) is not int or p < 1 for p in rule_pages) or
+                len(rule_pages) != len(set(rule_pages))):
+            raise ValueError("REVIEW_NATIVE_GLYPH_RULE_INVALID")
+        symbol = chr(int(token[2:], 16))
+        if unicodedata.category(symbol) != "Co" or unicodedata.category(replacement) == "Co":
+            raise ValueError("REVIEW_NATIVE_GLYPH_RULE_INVALID")
+        for number in sorted(set(rule_pages) & set(pages)):
+            glyphs = by_page.setdefault(number, {})
+            if (font, symbol) in glyphs:
+                raise ValueError("REVIEW_NATIVE_GLYPH_RULE_AMBIGUOUS")
+            glyphs[font, symbol] = {"replacement": replacement, "reason": reason}
+    return by_page
+
+
+def _review_native_table(page, table, source_id, locator, *, glyphs=None):
     """Read only native rectangles and glyph centres into an editable grid.
 
     Independent local implementation of this appendix's geometry contract.
     Equivalence baseline: this project's reading._pdf_table, native-reading-3;
     there is deliberately no runtime import of that N1 implementation. Native
     column boundaries, blank merged continuations and unassigned text checks
-    must agree. Glyph interpretation, OCR and semantic fills are unsupported.
+    must agree. Only glyph interpretations frozen with the source are accepted.
     """
     import hashlib
     import math
@@ -242,7 +270,7 @@ def _review_native_table(page, table, source_id, locator):
     if len(xs) < 2 or len(ys) < 2:
         raise ValueError("REVIEW_NATIVE_GRID_EMPTY")
     rows = [["" for _ in xs[:-1]] for _ in ys[:-1]]
-    merges, occupied = [], set()
+    merges, occupied, transformations = [], set(), []
     def inside(box, x, y):
         return box[0] <= x < box[2] and box[1] <= y < box[3]
     for box in boxes:
@@ -257,6 +285,22 @@ def _review_native_table(page, table, source_id, locator):
         occupied.update(cells)
         chars = [char for char in page.chars if inside(box, (char["x0"] + char["x1"]) / 2,
                                                      (char["top"] + char["bottom"]) / 2)]
+        if glyphs:
+            for index, char in enumerate(chars):
+                font = char.get("fontname")
+                original = char.get("text", "")
+                shown = []
+                for symbol in original:
+                    rule = glyphs.get((font, symbol))
+                    if rule is None:
+                        shown.append(symbol)
+                        continue
+                    shown.append(rule["replacement"])
+                    transformations.append({"row": row, "column": col, "font": font,
+                        "codepoint": f"U+{ord(symbol):04X}", "original_symbol": symbol,
+                        "bbox": [float(char[key]) for key in ("x0", "top", "x1", "bottom")], **rule})
+                if "".join(shown) != original:
+                    chars[index] = {**char, "text": "".join(shown)}
         rows[row][col] = (pdfplumber.utils.extract_text(chars) or "").strip() if chars else ""
         if row_span > 1 or col_span > 1:
             merges.append({"row": row, "column": col, "row_span": row_span, "col_span": col_span})
@@ -265,12 +309,15 @@ def _review_native_table(page, table, source_id, locator):
         if (str(char.get("text", "")).strip() and inside(table.bbox, x, y) and
                 not any(inside(box, x, y) for box in boxes)):
             raise ValueError("REVIEW_NATIVE_GRID_UNASSIGNED_TEXT")
-    return {"block_id": "b-" + hashlib.sha256((source_id + "::" + locator).encode()).hexdigest()[:24],
-            "source_id": source_id, "locator": locator, "rows": rows, "merges": merges,
-            "column_widths": [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]}
+    result = {"block_id": "b-" + hashlib.sha256((source_id + "::" + locator).encode()).hexdigest()[:24],
+              "source_id": source_id, "locator": locator, "rows": rows, "merges": merges,
+              "column_widths": [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]}
+    if transformations:
+        result["glyph_transformations"] = transformations
+    return result
 
 
-def _recover_review_source_aggregate(text, source_refs, sources, cache, recover):
+def _recover_review_source_aggregate(text, source_refs, sources, cache, glyph_maps):
     """Compose only uniquely located, source-bound scopes covering the quote.
 
     LF separators are preserved as explicit fragments. An unresolved child grid
@@ -363,7 +410,7 @@ def _recover_review_source_aggregate(text, source_refs, sources, cache, recover)
             fragments.append({"kind": "paragraph", "text": text[cursor:start],
                               "quote_start": cursor, "quote_end": start})
         child_text = text[start:end]
-        child = recover(child_text, [part["source_ref"]], sources, cache)
+        child = recover_review_source_tables(child_text, [part["source_ref"]], sources, cache, glyph_maps=glyph_maps)
         if child["status"] == "failed":
             return fallback("aggregate_child_source_validation_failed", "failed")
         scope_parts.append({**part, "layout_status": child["status"], "layout_reason": child["reason"]})
@@ -402,12 +449,13 @@ def _recover_review_source_aggregate(text, source_refs, sources, cache, recover)
             "hash_work_bytes": hash_bytes,
             "hash_work_byte_budget": _REVIEW_AGGREGATE_HASH_BYTE_BUDGET}
 
-def recover_review_source_tables(text, source_refs, sources, cache=None):
+def recover_review_source_tables(text, source_refs, sources, cache=None, *, glyph_maps=None):
     """Recover exact native PDF row views, or retain the complete quoted text.
 
     ``sources`` is the package SourceRef mapping (or sequence). A caller-owned
-    cache may be shared across appendix entries. No OCR, inference, number
-    correction or source mutation occurs. Returned fragments are ordered and
+    cache may be shared across appendix entries. Optional frozen reading glyph
+    rules select only source-bound PDF symbols. No OCR, number correction or
+    source mutation occurs. Returned fragments are ordered and
     replace only byte-identical TSV intervals. Proofs belong in the controlled
     review index; they establish layout provenance, never business acceptance.
     """
@@ -437,7 +485,7 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
             candidates.append((ref, source))
     if not candidates:
         if len(set(source_refs)) > 1:
-            return _recover_review_source_aggregate(text, source_refs, source_map, cache, recover_review_source_tables)
+            return _recover_review_source_aggregate(text, source_refs, source_map, cache, glyph_maps)
         return fallback("exact_quote_scope_unavailable")
     # Multiple identical quote locations are not interchangeable provenance.
     if len(candidates) != 1:
@@ -455,11 +503,21 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
             if key in fields:
                 return fallback("duplicate_scope_field")
             fields[key] = val
-    if fields.get("basis") not in {"consecutive_mixed_blocks_lf_v1", "frozen_table_rows_tsv_v1",
-                                    "native_table_tsv_v1", "consecutive_table_blocks_lf_v1"}:
+    basis = fields.get("basis")
+    whole_native_table = basis == "table_rows_tsv_v1"
+    if basis not in {"consecutive_mixed_blocks_lf_v1", "frozen_table_rows_tsv_v1", "table_rows_tsv_v1",
+                     "native_table_tsv_v1", "consecutive_table_blocks_lf_v1"}:
         return fallback("unsupported_quote_basis")
     blocks = fields.get("blocks", "").split(",")
     cells = fields.get("cells", "").split(",")
+    if whole_native_table:
+        anchor = locator.split(";", 1)[0]
+        chars = re.findall(r"(?:^|;\s*)chars\[(\d+):(\d+)\](?=;|$)", locator)
+        if (not re.fullmatch(r"pdf/page\[\d+\]/table\[\d+\]", anchor) or fields.get("through") != anchor or
+                len(blocks) != 1 or not re.fullmatch(r"b-[0-9a-f]{24}", blocks[0]) or
+                chars != [("0", str(len(text)))] or any(not re.fullmatch(r"r\d+c\d+", cell) for cell in cells)):
+            return fallback("exact_whole_native_table_scope_required")
+        cells = [f"{blocks[0]}:{cell}" for cell in cells]
     selected = {}
     for cell in cells:
         match = re.fullmatch(r"(b-[0-9a-f]{24}):r(\d+)c(\d+)", cell)
@@ -479,9 +537,14 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
         # package, never reverse engineered from guessed document titles.
         originals = [s for s in source_map.values() if value(s, "sha256") == sha and
                      Path(value(s, "path")).resolve() == path.resolve()]
+        page_numbers = range(min(pages), max(pages) + 1)
+        glyph_rules = _review_glyph_rules(glyph_maps, sha, page_numbers)
+        glyph_key = tuple((n, font, symbol, rule["replacement"], rule["reason"])
+                          for n, glyphs in sorted(glyph_rules.items())
+                          for (font, symbol), rule in sorted(glyphs.items()))
         key = (REVIEW_SOURCE_TABLE_VERSION, _REVIEW_NATIVE_GRID_VERSION, pdfplumber.__version__,
                str(path.resolve()), sha, tuple(pages), tuple(sorted(selected)),
-               tuple(sorted(value(s, "source_id") for s in originals)))
+               tuple(sorted(value(s, "source_id") for s in originals)), glyph_key)
         saved = cache.get(key) if cache is not None else None
         if saved is not None and saved[0] == context_digest(saved[1]):
             import copy
@@ -491,10 +554,12 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
             with pdfplumber.open(path) as pdf:
                 if max(pages) > len(pdf.pages):
                     return fallback("source_page_out_of_range", "failed")
-                for number in range(min(pages), max(pages) + 1):
+                for number in page_numbers:
                     page = pdf.pages[number - 1]
                     for index, table in enumerate(page.find_tables()):
                         table_locator = f"pdf/page[{number}]/table[{index}]"
+                        if whole_native_table and table_locator != anchor:
+                            continue
                         identities = [(s, "b-" + hashlib.sha256((value(s, "source_id") + "::" +
                                       table_locator).encode()).hexdigest()[:24]) for s in originals]
                         matches = [(s, bid) for s, bid in identities if bid in selected]
@@ -503,7 +568,8 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
                         if not matches:
                             continue
                         original, bid = matches[0]
-                        block = _review_native_table(page, table, value(original, "source_id"), table_locator)
+                        block = _review_native_table(page, table, value(original, "source_id"), table_locator,
+                                                     glyphs=glyph_rules.get(number))
                         native.append(block)
             if cache is not None:
                 if len(cache) >= 128:
@@ -534,6 +600,8 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
                     merges.append({**merge, "row": merge["row"] - rows[0]})
             grid = [list(block["rows"][r]) for r in rows]
             tsv = "\n".join("\t".join(row) for row in grid)
+            if whole_native_table and (rows != list(range(len(block["rows"]))) or tsv != text):
+                return fallback("native_whole_table_quote_mismatch")
             if not tsv or text.count(tsv) != 1:
                 return fallback("native_grid_quote_mismatch")
             start = text.index(tsv)
@@ -548,6 +616,9 @@ def recover_review_source_tables(text, source_refs, sources, cache=None):
                                                     "column_widths": block["column_widths"]}),
                      "parser": "pdfplumber", "parser_version": pdfplumber.__version__,
                      "reader_contract": "source_format_rendering._review_native_table", "reader_version": _REVIEW_NATIVE_GRID_VERSION, "start": start, "end": start + len(tsv)}
+            transformations = [item for item in block.get("glyph_transformations", ()) if item["row"] in rows]
+            if transformations:
+                proof["glyph_transformations"] = transformations
             replacements.append((start, start + len(tsv), {"kind": "table", "rows": grid,
                 "column_widths": block["column_widths"], "merges": merges,
                 "header_rows": [], "proof": proof}))

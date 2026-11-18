@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -1524,7 +1525,8 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
         _capture(ctx, "n2-deferred-context-unresolved", {"code": exc.code, "diagnostic_context": exc.diagnostic_context,
                  "status": "not_closed", "semantic_review": "requires_source_review"})
         raise
-    requirements, formats = _merge_results(results)
+    merge_results, source_repairs = _repair_numbered_procedure_spans(windows, results)
+    requirements, formats = _merge_results(merge_results)
     for row in ledger:
         row["window_ids"] = [w["window_id"] for w in windows if row["unit_id"] in w["unit_ids"]]
         _fail(not row["window_ids"], "WINDOW_UNIT_DENOMINATOR_MISMATCH")
@@ -1536,8 +1538,140 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
               "deferred_context_closure": deferred_closure,
               "coverage": {"status": "complete", "semantic_review": "requires_source_review", "tender_unit_count": len(ledger),
                            "window_count": len(windows), "completed_window_count": len(results), "units": ledger}}
+    if source_repairs:
+        output["source_clause_repairs"] = source_repairs
+        _capture(ctx, "n2-source-clause-repairs", {"items": source_repairs})
     _capture(ctx, "n2-coverage-report", output)
     return output
+
+
+_NUMBERED_PROCEDURE = re.compile(r"^([1-9]\d*\.[1-9]\d*)\.([1-9]\d*)(?![\d.])[ \t]*(?=\S)")
+_NATIVE_PROCEDURE_LINE = re.compile(r"pdf/page\[(\d+)\]/line\[(\d+)\]")
+
+
+def _parentheses_closed(text: str) -> bool:
+    balance = 0
+    for char in text:
+        if char in "（(":
+            balance += 1
+        elif char in "）)":
+            balance -= 1
+            if balance < 0:
+                return False
+    return balance == 0
+
+
+def _native_numbered_procedure_span(window, before, after, blocks, positions):
+    first, last = before["citation"], after["citation"]
+    if (first["basis"] != "consecutive_blocks_lf_v1" or last["basis"] != "consecutive_blocks_lf_v1"
+            or first["start"] != 0 or last["start"] != 0):
+        return None
+    head_ids, tail_ids = first["block_ids"], last["block_ids"]
+    if (not 2 <= len(head_ids) <= 6 or not 2 <= len(tail_ids) <= 4
+            or head_ids[-1] != tail_ids[0] or set(head_ids) & set(tail_ids) != {tail_ids[0]}
+            or not set(head_ids + tail_ids) <= positions.keys()):
+        return None
+    member_ids = head_ids + tail_ids[1:]
+    start, stop = positions[member_ids[0]], positions[member_ids[-1]] + 1
+    if start < 1 or stop >= len(blocks):
+        return None
+    # Inspect at most six previous target lines for the preceding sibling.
+    previous = next((n for n in range(start - 1, max(-1, start - 7), -1)
+                     if _NUMBERED_PROCEDURE.match(blocks[n]["text"])
+                     or _heading_level(blocks[n]["text"]) is not None), None)
+    if previous is None:
+        return None
+    line = _NUMBERED_PROCEDURE.match(blocks[start]["text"])
+    prior = _NUMBERED_PROCEDURE.match(blocks[previous]["text"])
+    following = _NUMBERED_PROCEDURE.match(blocks[stop]["text"])
+    if (not line or not prior or not following
+            or not (prior[1] == line[1] == following[1])
+            or int(prior[2]) + 1 != int(line[2]) or int(line[2]) + 1 != int(following[2])
+            or not blocks[start - 1]["text"].endswith("。")
+            or any(_NUMBERED_PROCEDURE.match(block["text"]) or _heading_level(block["text"]) is not None
+                   for block in blocks[start + 1:stop])
+            or [block["block_id"] for block in blocks[start:stop]] != member_ids):
+        return None
+    envelope = blocks[previous:stop + 1]
+    locators = [_NATIVE_PROCEDURE_LINE.fullmatch(block["locator"]) for block in envelope]
+    if (not all(locators) or any(block["kind"] != "paragraph" or block["origin"] != "native"
+            or block.get("read_disposition") or block["source_id"] != window["source_id"]
+            or block["unit_id"] != blocks[start]["unit_id"] or not block["text"].strip()
+            or any(char == "\ufffd" or unicodedata.category(char) in {"Co", "Cc", "Cf", "Cs", "Cn"}
+                   for char in block["text"] if char != "\t")
+            for block in envelope)
+            or any(a[1] != b[1] or int(a[2]) + 1 != int(b[2]) for a, b in zip(locators, locators[1:]))
+            or any(a["ordinal"] + 1 != b["ordinal"] for a, b in zip(envelope, envelope[1:]))):
+        return None
+    head = "\n".join(block["text"] for block in blocks[start:positions[head_ids[-1]] + 1])
+    tail = "\n".join(block["text"] for block in blocks[positions[tail_ids[0]]:stop])
+    full = "\n".join(block["text"] for block in blocks[start:stop])
+    if (first["quote"] != head or last["quote"] != tail or _parentheses_closed(head)
+            or not re.search(r"[（(][^（）()\n]{1,16}$", head)
+            or not tail.endswith("。") or not _parentheses_closed(full)):
+        return None
+    return member_ids, blocks[previous], blocks[stop], line[1] + "." + line[2]
+
+
+def _repair_numbered_procedure_spans(windows: list[dict], results: list[dict]) -> tuple[list, list]:
+    """Use an independently selected proof tail to close a clipped procedure clause.
+
+    Window candidates and validated results remain immutable. N3 reconstructs
+    this merge projection from N1 and the original window results.
+    """
+    projected, proofs = [], []
+    windows_by_id = {window["window_id"]: window for window in windows}
+    for result in results:
+        window = windows_by_id[result["window_id"]]
+        validated = result["validated"]
+        requirements = validated["requirements"]
+        if window["source_format"] != "pdf" or len(requirements) < 2:
+            projected.append(result)
+            continue
+        blocks = sorted(window["blocks"], key=lambda block: block["ordinal"])
+        positions = {block["block_id"]: n for n, block in enumerate(blocks)}
+        replacements = {}
+        for index, (before, after) in enumerate(zip(requirements, requirements[1:])):
+            if (before["category"] != after["category"] or before["category"] != "procedure"
+                    or before["response_mode"] != "procedure" or after["response_mode"] != "attachment"
+                    or not before["mandatory"] or not after["mandatory"]
+                    or before["format_status"] != "not_prescribed" or after["format_status"] != "not_prescribed"
+                    or not after["attachment_keywords"]):
+                continue
+            span = _native_numbered_procedure_span(window, before, after, blocks, positions)
+            if span is not None:
+                replacements[index] = span
+        if not replacements:
+            projected.append(result)
+            continue
+        wire = _wire_candidate(validated)
+        for index, (ids, _, _, _) in replacements.items():
+            citation = wire["requirements"][index]["citation"]
+            del citation["quote"]
+            citation["block_ids"] = list(ids)
+        expanded = _validate_window(wire, window)
+        projected.append({**result, "validated": expanded})
+        for index, (ids, left, right, number) in replacements.items():
+            def evidence(requirement):
+                citation = requirement["citation"]
+                semantics = {key: value for key, value in requirement.items() if key != "citation"}
+                rid = _id("R-", {**semantics, "text": citation["quote"]})
+                return {"requirement_id": rid, "quote_sha256": citation["quote_sha256"],
+                        "block_ids": citation["block_ids"], "locator": citation["locator"],
+                        "end_locator": citation["end_locator"]}
+
+            original = evidence(requirements[index])
+            proof = {"rule": "native_numbered_procedure_with_selected_attachment_tail_v1",
+                     "clause_number": number, "source_id": window["source_id"],
+                     "source_sha256": window["source_sha256"], "window_id": window["window_id"],
+                     "window_result_sha256": _hash(result), "requirement_index": index,
+                     "original": original, "restored": evidence(expanded["requirements"][index]),
+                     "supporting_attachment": evidence(requirements[index + 1]),
+                     "added_block_ids": ids[len(original["block_ids"]):],
+                     "sibling_block_ids": [left["block_id"], right["block_id"]],
+                     "model_candidate_mutation": False, "semantic_review": "requires_source_review"}
+            proofs.append({**proof, "proof_sha256": _hash(proof)})
+    return projected, proofs
 
 
 def _merge_results(results: list) -> tuple[list, list]:

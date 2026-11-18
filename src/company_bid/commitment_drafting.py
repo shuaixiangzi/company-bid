@@ -26,6 +26,8 @@ MODE = "diagnostic_writing_commitment_partition"
 SCHEMA_VERSION = "source-bound-commitment-partition-v1"
 PROFILE = "pending_company_confirmation_v1"
 REVIEW_PACKET_SCHEMA = "source-bound-reviewed-commitments-v1"
+REVIEW_REBIND_V1 = "exact-writing-inputs-v1"
+REVIEW_REBIND_V2 = "exact-writing-inputs-v2"
 REVIEW_INSTRUCTION = "区分验收不合格与质量保证期问题的触发条件及处理动作，不将验收重制义务扩展为质保义务；其余正文和覆盖定位保持原字。"
 ECHO_INSTRUCTION = "仅删除与原请求完全相等的coverage_contract多余回显；正文、步骤和coverage保持原字。"
 ORIGINAL_MERGED_STEP = "纠正复核：对验收不合格或质量保证期内质量问题，按甲方意见免费修改、改正、重新制作或编制，并由项目负责人复核纠正结果。"
@@ -211,27 +213,123 @@ def _review_origin(ctx, spec):
     return ReviewedOrigin()
 
 
+def _review_rebuild_repaired_n2(n1, old_n2):
+    from .extraction import _index, _merge_results, _repair_numbered_procedure_spans, _windows
+
+    _require(n1.keys() <= old_n2.keys() and digest({key: old_n2[key] for key in n1}) == digest(n1),
+             "REVIEW_REBIND_N2_SOURCE_CHANGED")
+    extracted = old_n2["extracted"]
+    _require("source_clause_repairs" not in extracted and extracted["parsed_hash"] == digest(n1["parsed"]),
+             "REVIEW_REBIND_N2_SOURCE_CHANGED")
+    blocks, _, documents = _index(n1["parsed"], n1["manifest"])
+    windows, _ = _windows(documents, blocks, extracted["window_config"])
+    results = extracted["window_results"]
+    _require([window["window_id"] for window in windows] == [result["window_id"] for result in results],
+             "REVIEW_REBIND_N2_WINDOWS_CHANGED")
+    original_requirements, original_formats = _merge_results(results)
+    _require(original_requirements == extracted["requirements"] and original_formats == extracted["format_chapters"],
+             "REVIEW_REBIND_N2_ORIGINAL_MERGE_CHANGED")
+
+    projected, repairs = _repair_numbered_procedure_spans(windows, results)
+    requirements, formats = _merge_results(projected)
+    _require(len(repairs) == 1 and repairs[0]["rule"] == "native_numbered_procedure_with_selected_attachment_tail_v1"
+             and formats == original_formats and len(requirements) == len(original_requirements),
+             "REVIEW_REBIND_N2_REPAIR_UNSUPPORTED")
+    repair = repairs[0]
+    changed = [(old["requirement_id"], new["requirement_id"])
+               for old, new in zip(original_requirements, requirements) if old != new]
+    _require(changed == [(repair["original"]["requirement_id"], repair["restored"]["requirement_id"])],
+             "REVIEW_REBIND_N2_REPAIR_UNSUPPORTED")
+    expected = {**old_n2, "extracted": {**extracted, "requirements": requirements, "source_clause_repairs": repairs}}
+    return expected, windows
+
+
+def _review_n2_window_checkpoints(origin, prior_node, current_node, extracted, windows):
+    from .extraction import extraction_window_payload
+
+    old_units, new_units = prior_node["units"], current_node["units"]
+    results = extracted["window_results"]
+    _require(len(windows) == len(old_units) == len(new_units) and set(old_units) == set(new_units) ==
+             {window["window_id"] for window in windows}, "REVIEW_REBIND_N2_WINDOWS_CHANGED")
+    for window, result in zip(windows, results):
+        uid = window["window_id"]
+        expected_input = extraction_window_payload(window, extracted["window_config"])
+        expected_input_hash, expected_output_hash = digest(expected_input), digest(result)
+        for record in (old_units[uid], new_units[uid]):
+            _require(record["status"] == "succeeded" and record["unit_id"] == uid and
+                     record["input_hash"] == expected_input_hash and record["output_hash"] == expected_output_hash,
+                     "REVIEW_REBIND_N2_WINDOW_CHECKPOINT_CHANGED")
+            source_input = origin.artifact(record["input_ref"])
+            _require(digest(source_input) == expected_input_hash, "REVIEW_REBIND_N2_WINDOW_CHECKPOINT_CHANGED")
+            # The original N4 and its N2 window checkpoint can have different
+            # run IDs when the former inherited the latter from an ancestor.
+            envelope = origin.artifact(record["output_ref"])
+            _require(envelope.get("schema_version") == "m1.checkpoint.v1" and envelope.get("node_key") == "N2" and
+                     envelope.get("unit_id") == uid and envelope.get("producer_version") == record["version"] and
+                     envelope.get("run_id") == record["output_ref"]["path"].split("/")[1] and
+                     envelope.get("input_hash") == expected_input_hash and
+                     envelope.get("output_hash") == expected_output_hash and digest(envelope.get("data")) == expected_output_hash,
+                     "REVIEW_REBIND_N2_WINDOW_CHECKPOINT_CHANGED")
+
+
+def _review_rebind_n2(origin, spec, nodes, original_n3, current_n3):
+    prior_n1, current_n1 = origin.node("N1"), nodes["N1"]
+    _require(prior_n1["status"] == current_n1["status"] == "succeeded" and
+             prior_n1["output_ref"] == current_n1["output_ref"] and
+             prior_n1["output_hash"] == current_n1["output_hash"], "REVIEW_REBIND_SOURCE_CHANGED")
+    prior_n2, current_n2 = origin.node("N2"), nodes["N2"]
+    _require(prior_n2["status"] == current_n2["status"] == "succeeded" and
+             prior_n2["output_hash"] == spec["origin_n2_output_sha256"] and
+             current_n2["output_hash"] == spec["current_n2_output_sha256"] and
+             prior_n2["output_hash"] != current_n2["output_hash"] and
+             prior_n2["input_hash"] == current_n2["input_hash"] == prior_n1["output_hash"] and
+             original_n3["input_hash"] == prior_n2["output_hash"] and
+             current_n3["input_hash"] == current_n2["output_hash"] and current_n3["status"] == "succeeded",
+             "REVIEW_REBIND_N2_BINDING_CHANGED")
+    n1 = origin.checkpoint(prior_n1, "N1")["data"]
+    _require(n1 == origin.checkpoint(current_n1, "N1")["data"], "REVIEW_REBIND_SOURCE_CHANGED")
+    original = origin.checkpoint(prior_n2, "N2")["data"]
+    current = origin.checkpoint(current_n2, "N2")["data"]
+    expected, windows = _review_rebuild_repaired_n2(n1, original)
+    _require(digest(current) == digest(expected), "REVIEW_REBIND_N2_PROJECTION_CHANGED")
+    _review_n2_window_checkpoints(origin, prior_n2, current_n2, original["extracted"], windows)
+    return {"n1_output_ref": prior_n1["output_ref"], "n1_output_sha256": prior_n1["output_hash"],
+            "origin_n2_output_ref": prior_n2["output_ref"], "current_n2_output_ref": current_n2["output_ref"],
+            "n2_source_clause_repair_sha256": expected["extracted"]["source_clause_repairs"][0]["proof_sha256"],
+            "n2_window_count": len(windows), "n2_window_results_sha256": digest(original["extracted"]["window_results"])}
+
+
 def _review_rebind_origin(ctx, origin, binding, current_n3, original_n3, frozen):
     """Explicitly revalidate unchanged writing against a newly assembled N3.
 
-    Only artifact locations may differ. Source reading, constraints, facts,
-    tasks, prompt and the serialized request are still checked separately.
-    Nothing here mutates or upgrades the originating failed run.
+    V1 requires the original N1 and N2. V2 authenticates one independently
+    reconstructed N2 merge repair against the same N1 and window inputs.
+    Constraints, facts, tasks, prompt and serialized requests are checked separately.
     """
     from .project_constraint_runtime import load_project_constraints
     spec = binding.get("source_rebind")
-    _require(isinstance(spec, dict) and set(spec) ==
-        {"version", "origin_n3_output_sha256", "current_n3_output_sha256"}
-        and spec["version"] == "exact-writing-inputs-v1"
+    automatic = ctx.execution_config.get("pipeline", "prepared") == "automatic"
+    fields = {"version", "origin_n3_output_sha256", "current_n3_output_sha256"}
+    version = spec.get("version") if isinstance(spec, dict) else None
+    _require(version in (REVIEW_REBIND_V1, REVIEW_REBIND_V2), "REVIEW_REBIND_INVALID")
+    if version == REVIEW_REBIND_V2:
+        fields |= {"origin_n2_output_sha256", "current_n2_output_sha256"}
+        _require(automatic, "REVIEW_REBIND_N2_AUTOMATIC_REQUIRED")
+    _require(set(spec) == fields and all(isinstance(spec[key], str) and re.fullmatch(r"[0-9a-f]{64}", spec[key])
+                 for key in fields - {"version"})
         and spec["origin_n3_output_sha256"] == original_n3["output_hash"]
         and spec["current_n3_output_sha256"] == current_n3["output_hash"], "REVIEW_REBIND_INVALID")
-    if ctx.execution_config.get("pipeline", "prepared") == "automatic":
+    n2_proof = {}
+    if automatic:
         nodes = {node["key"]: node for node in ctx._state["nodes"]}
-        for key in ("N1", "N2"):
-            old = origin.node(key)
-            _require(old["status"] == nodes[key]["status"] == "succeeded"
-                and old["output_ref"] == nodes[key]["output_ref"], "REVIEW_REBIND_SOURCE_CHANGED")
-            origin.checkpoint(old, key)
+        if version == REVIEW_REBIND_V1:
+            for key in ("N1", "N2"):
+                old = origin.node(key)
+                _require(old["status"] == nodes[key]["status"] == "succeeded"
+                    and old["output_ref"] == nodes[key]["output_ref"], "REVIEW_REBIND_SOURCE_CHANGED")
+                origin.checkpoint(old, key)
+        else:
+            n2_proof = _review_rebind_n2(origin, spec, nodes, original_n3, current_n3)
         plan = original_n3["units"]["plan-assemble"]
         # N3 can be an exact prefix inherited by the originating N4 run.
         # Its envelope belongs to that earlier producer, not origin.run_id.
@@ -243,7 +341,7 @@ def _review_rebind_origin(ctx, origin, binding, current_n3, original_n3, frozen)
         call_event=lambda name, data: ctx.call_event(name, {**data, "origin_run_id": origin.run_id}))
     original_prepared = PreparedBid.model_validate(frozen["prepared"])
     original_constraints = load_project_constraints(origin_ctx, frozen["prepared"])
-    proof = {**spec, "origin_n3_output_ref": original_n3["output_ref"],
+    proof = {**spec, **n2_proof, "origin_n3_output_ref": original_n3["output_ref"],
              "current_n3_output_ref": current_n3["output_ref"]}
     return original_prepared, original_constraints, proof
 
@@ -253,6 +351,28 @@ def _same_writing_input(original, current):
     old.pop("project_constraint_artifact_refs", None)
     new.pop("project_constraint_artifact_refs", None)
     return digest(old) == digest(new)
+
+
+def _review_constraint_rebind(origin, current):
+    """Authenticate the exact consequence of the proved N2 merge repair."""
+    _require(isinstance(origin, dict) and isinstance(current, dict), "REVIEW_REBIND_CONSTRAINT_PLAN_CHANGED")
+    old, new = origin["plan"], current["plan"]
+    derived_key = "requirements_sha256"
+    old_requirements, new_requirements = old[derived_key], new[derived_key]
+    _require(old_requirements != new_requirements and
+             digest({key: value for key, value in old.items() if key != derived_key}) ==
+             digest({key: value for key, value in new.items() if key != derived_key}) and
+             digest(old) == origin["plan_sha256"] and digest(new) == current["plan_sha256"],
+             "REVIEW_REBIND_CONSTRAINT_PLAN_CHANGED")
+    return {"origin_plan_sha256": origin["plan_sha256"], "current_plan_sha256": current["plan_sha256"],
+            "origin_requirements_sha256": old_requirements, "current_requirements_sha256": new_requirements}
+
+
+def _same_writing_input_after_clause_repair(original, current, plan_proof):
+    key = "project_constraint_plan_sha256"
+    _require(original.get(key) == plan_proof["origin_plan_sha256"] and
+             current.get(key) == plan_proof["current_plan_sha256"], "REVIEW_REBIND_CONSTRAINT_PLAN_CHANGED")
+    return _same_writing_input(original, {**current, key: original[key]})
 
 
 def _review_config_rebind(original, current, binding):
@@ -265,7 +385,7 @@ def _review_config_rebind(original, current, binding):
     if digest(original) == digest(current):
         return None
     spec = binding.get("source_rebind")
-    _require(isinstance(spec, dict) and spec.get("version") == "exact-writing-inputs-v1",
+    _require(isinstance(spec, dict) and spec.get("version") in (REVIEW_REBIND_V1, REVIEW_REBIND_V2),
              "REVIEW_ORIGIN_CONFIG_CHANGED")
     old, new = copy.deepcopy(original), copy.deepcopy(current)
     old_planning, new_planning = old.pop("planning", {}), new.pop("planning", {})
@@ -308,6 +428,8 @@ def _prepare_reviewed(ctx, provider, prepared, constraints):
             ctx, origin, binding, current_n3, original_n3, frozen)
         if config_rebind is not None:
             rebind["configuration_rebind"] = config_rebind
+        if rebind["version"] == REVIEW_REBIND_V2:
+            rebind["project_constraint_plan_rebind"] = _review_constraint_rebind(original_constraints, constraints)
     else:
         _require(current_n3["output_ref"] == original_n3["output_ref"], "REVIEW_N3_PREFIX_CHANGED")
         _require(frozen["prepared"] == prepared.model_dump(mode="json"), "REVIEW_PREPARED_CHANGED")
@@ -322,8 +444,11 @@ def _prepare_reviewed(ctx, provider, prepared, constraints):
             base = build_partition_unit_input(original_prepared, section, task, original_options, original_constraints,
                                                frozen["proposals"], original_config)
             current_base = provider._inputs[uid]
-            _require(_same_writing_input(base, current_base) if rebind else digest(base) == digest(current_base),
-                     "REVIEW_CURRENT_INPUT_CHANGED")
+            if rebind and rebind["version"] == REVIEW_REBIND_V2:
+                same_input = _same_writing_input_after_clause_repair(base, current_base, rebind["project_constraint_plan_rebind"])
+            else:
+                same_input = _same_writing_input(base, current_base) if rebind else digest(base) == digest(current_base)
+            _require(same_input, "REVIEW_CURRENT_INPUT_CHANGED")
             entry = packet["entries"][uid]
             _require(set(entry) == {"raw_candidate", "raw_candidate_sha256", "candidate", "candidate_sha256",
                 "operation", "unit_input_hash", "request_sha256", "response_sha256", "call_id", "trace_id", "span_id",

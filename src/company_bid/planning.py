@@ -20,7 +20,7 @@ from .extraction import (
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
     _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid,
     _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result, _close_deferred_context,
-    _chapter_boundary,
+    _chapter_boundary, _repair_numbered_procedure_spans,
 )
 from .table_continuations import build_table_continuations, build_table_row_catalog
 from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
@@ -1170,7 +1170,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         verified_results.append({**result, "validated": validated})
     _fail(extracted.get("deferred_context_closure") != _close_deferred_context(windows, verified_results),
           "EXTRACTION_DEFERRED_CLOSURE_MISMATCH")
-    expected_requirements, expected_formats = _merge_results(verified_results)
+    merge_results, source_repairs = _repair_numbered_procedure_spans(windows, verified_results)
+    _fail(extracted.get("source_clause_repairs", []) != source_repairs, "EXTRACTION_SOURCE_CLAUSE_REPAIRS_MISMATCH")
+    expected_requirements, expected_formats = _merge_results(merge_results)
     _fail(expected_requirements != extracted.get("requirements") or expected_formats != extracted.get("format_chapters"),
           "EXTRACTION_MERGE_MISMATCH")
     clause_by_id = {}

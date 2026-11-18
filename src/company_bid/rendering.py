@@ -747,7 +747,7 @@ def _mark_diagnostic(document, package):
 
 
 def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bool = False,
-                   review_document_mode: str = "full_trace") -> dict:
+                   review_document_mode: str = "full_trace", material_review_report=None, glyph_maps=None) -> dict:
     """Assemble both files completely and exclusively; never overwrite results.
 
     Pagination uses real Word fields. The caller must visually verify the
@@ -771,7 +771,8 @@ def render_package(package: DocumentPackage, output_dir: Path, *, diagnostic: bo
             review_index = None
             if review_document_mode == "task_list":
                 from .review_document import render_task_list
-                issues, review_index = render_task_list(package)
+                issues, review_index = render_task_list(package, material_review_report=material_review_report,
+                                                        glyph_maps=glyph_maps)
             else:
                 issues = _render_issues(package)
             if diagnostic:

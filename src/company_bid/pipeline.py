@@ -476,8 +476,15 @@ def build_executor(root: Path, config: dict) -> Executor:
         package = DocumentPackage.model_validate(package_data)
         diagnostic = ctx.artifact_scope == "diagnostic" or diagnostic_artifact(value)
         review_mode = ctx.execution_config.get("review_document_mode", "full_trace")
+        review_inputs = {}
+        if review_mode == "task_list":
+            from .review_document import material_review_report
+            review_inputs = {
+                "material_review_report": material_review_report(ctx),
+                "glyph_maps": ctx.execution_config.get("reading", {}).get("glyph_maps"),
+            }
         rendered = render_package(package, ctx.artifact_dir / "documents", diagnostic=diagnostic,
-                                  review_document_mode=review_mode)
+                                  review_document_mode=review_mode, **review_inputs)
         review_index = rendered.pop("review_document_index", None)
         review_capture = review_index_ref = None
         if review_index is not None:
@@ -521,8 +528,9 @@ def build_executor(root: Path, config: dict) -> Executor:
                       draft, config_keys=("provider",) + writing_replay_keys),
              NodeSpec("N5", _version(*shared, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", "source_response_audit.py", *commitment_versions), check,
                       config_keys=((("provider",) + writing_replay_keys) if writing_replay_keys else ()) + ("source_response_audit",)),
-             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "review_document.py"), render,
-                      config_keys=("document_style", "review_document_mode"))]
+             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "review_document.py",
+                                     "review_source_context.py", "material_source_review.py", "material_recall.py"), render,
+                      config_keys=("document_style", "review_document_mode", "reading"))]
     if config.get("pipeline", "prepared") == "automatic":
         from .chain import intake_nodes
         nodes = intake_nodes(root, _version, config) + nodes[1:]
