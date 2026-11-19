@@ -416,8 +416,22 @@ def _prepare_reviewed(ctx, provider, prepared, constraints):
     origin = _review_origin(ctx, packet["origin"])
     expected_config = copy.deepcopy(ctx.execution_config)
     expected_config["commitment_drafting"].pop("reviewed_candidates")
-    config_rebind = _review_config_rebind(origin.state["execution_config"], expected_config, binding)
     current_n3 = next(item for item in ctx._state["nodes"] if item["key"] == "N3")
+    if "project_answer_snapshot" in expected_config:
+        # Authenticate the project decision and prove that the ACTUAL two
+        # writing inputs equal those this original reviewed packet consumed.
+        from .project_review import project_review_input
+        effective = project_review_input(ctx, ctx.executor._checkpoint_data(current_n3))
+        checked = PreparedBid.model_validate(effective["prepared"])
+        current_bases = {task.unit_id: build_partition_unit_input(checked, section, task,
+                         provider.options, constraints, effective["proposals"], provider.config)
+                         for section in checked.sections for task in section.writing_tasks
+                         if task.unit_id in provider._inputs}
+        _require(current_bases == provider._inputs, "REVIEW_CURRENT_INPUT_CHANGED")
+        expected_config.pop("project_answer_snapshot")
+    if "review_before_writing" in expected_config and "review_before_writing" not in origin.state["execution_config"]:
+        _require(type(expected_config.pop("review_before_writing")) is bool, "REVIEW_ORIGIN_CONFIG_CHANGED")
+    config_rebind = _review_config_rebind(origin.state["execution_config"], expected_config, binding)
     original_n3 = origin.node("N3")
     _require(original_n3.get("status") == "succeeded", "REVIEW_N3_PREFIX_CHANGED")
     frozen = origin.checkpoint(original_n3, "N3")["data"]

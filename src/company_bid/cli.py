@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .pipeline import build_executor
 from .provider import ProviderFailure
-from .storage import StorageError, atomic_json
+from .storage import LocalStore, atomic_json
 
 
 def read_json(path):
@@ -36,6 +36,14 @@ def parser():
     create.add_argument("--recorded-candidates", type=Path, help="explicit offline JSON candidates bound to request hashes")
     create.add_argument("--stop-after", choices=[*[f"N{i}" for i in range(7)], "LIBRARY"])
     create.add_argument("--queue-only", action="store_true")
+    create.add_argument("--review-before-writing", action="store_true",
+                        help="pause after planning when this tender needs project decisions")
+    actions.add_parser("project-questions").add_argument("run_id")
+    answer = actions.add_parser("apply-project-answers")
+    answer.add_argument("run_id")
+    answer.add_argument("--input", type=Path, required=True, help="completed copy of the exported project questions")
+    answer.add_argument("--payment-proof", type=Path, help="one project-specific original PNG or JPEG")
+    answer.add_argument("--queue-only", action="store_true")
     for action in ("resume", "step"):
         item = actions.add_parser(action)
         item.add_argument("run_id")
@@ -66,6 +74,31 @@ def main(argv=None):
             print(json.dumps({"prepared": str(args.directory / "prepared.json"), "synthetic": True}))
             return 0
         config = read_json(args.config) if args.config else {"provider": {"mode": "prepared"}, "debug_capture": True}
+        if args.command in ("project-questions", "apply-project-answers", "resume", "step"):
+            frozen = LocalStore(args.root).read_state(args.run_id)["execution_config"]
+            if args.config is None:
+                config = frozen
+            else:
+                for key in ("review_before_writing", "project_answer_snapshot"):
+                    if key in frozen:
+                        config.setdefault(key, frozen[key])
+            if args.command in ("project-questions", "apply-project-answers") and config != frozen:
+                raise ProviderFailure("PROJECT_REVIEW_CONFIG_CHANGED")
+        if args.command == "rerun":
+            frozen = LocalStore(args.root).read_state(args.run_id)["execution_config"]
+            if args.config is None:
+                config = dict(frozen)
+            if args.from_node in ("N4", "N5", "N6"):
+                if ("project_answer_snapshot" in config and
+                        config["project_answer_snapshot"] != frozen.get("project_answer_snapshot")):
+                    raise ProviderFailure("PROJECT_REVIEW_STALE_DECISION")
+                for key in ("review_before_writing", "project_answer_snapshot"):
+                    if key in frozen:
+                        config.setdefault(key, frozen[key])
+            else:
+                config.pop("project_answer_snapshot", None)
+        if args.command == "create" and args.review_before_writing:
+            config = {**config, "review_before_writing": True}
         if args.command == "diagnose":
             from .diagnostics import inspect_diagnostics
             report = inspect_diagnostics(args.root, args.run_id)
@@ -89,7 +122,16 @@ def main(argv=None):
             os.environ[auth_env] = secret
         executor = build_executor(args.root, config)
         input_key = {"automatic": "manifest", "library": "library_input"}.get(config.get("pipeline"), "prepared")
-        if args.command == "create":
+        if args.command == "project-questions":
+            from .project_review import export_review
+            print(json.dumps(export_review(executor, args.run_id), ensure_ascii=False))
+            return 0
+        if args.command == "apply-project-answers":
+            from .project_review import submit_answers
+            child_id, config = submit_answers(executor, args.run_id, read_json(args.input), args.payment_proof)
+            executor = build_executor(args.root, config)
+            result = executor.inspect(child_id) if args.queue_only else executor.execute(child_id)
+        elif args.command == "create":
             initial = {input_key: read_json(args.input),
                        "proposals": read_json(args.proposals) if args.proposals else {}}
             if args.recorded_candidates:
@@ -146,7 +188,12 @@ def main(argv=None):
             return 0
         else:
             result = executor.inspect(args.run_id)
-        print(json.dumps(safe_summary(result), ensure_ascii=False))
+        summary = safe_summary(result)
+        if (config.get("review_before_writing") and result.get("status") == "paused_debug"
+                and result.get("cursor") == 4 and args.command in ("create", "resume", "step")):
+            from .project_review import export_review
+            summary.update(export_review(executor, result["run_id"]))
+        print(json.dumps(summary, ensure_ascii=False))
         return 1 if result.get("status") == "failed" else 0
     except Exception as error:
         # Never echo source text, schema inputs, provider bodies or secrets.

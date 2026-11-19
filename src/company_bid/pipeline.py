@@ -68,6 +68,10 @@ def validate_sources(prepared: PreparedBid) -> None:
 
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
+    if ("review_before_writing" in config and type(config["review_before_writing"]) is not bool
+            or (config.get("review_before_writing") or "project_answer_snapshot" in config)
+            and config.get("pipeline") != "automatic"):
+        raise PipelineFailure("PROJECT_REVIEW_REQUIRES_AUTOMATIC_PIPELINE")
     from .material_ocr_budget import validate_pipeline_ocr_budget
     validate_pipeline_ocr_budget(config)
     if config.get("pipeline") == "library":
@@ -97,10 +101,15 @@ def build_executor(root: Path, config: dict) -> Executor:
                 "unimplemented_automatic_nodes": ["N1", "N2", "N3"]}
 
     def draft(ctx, value):
+        from .project_review import project_review_input
+        frozen_prepared = value["prepared"]
+        value = project_review_input(ctx, value)
         prepared = PreparedBid.model_validate(value["prepared"])
         from .project_constraint_runtime import (load_project_constraints, validate_project_constraint_context,
                                                 project_constraint_trace_bindings)
-        project_constraints = load_project_constraints(ctx, prepared.model_dump(mode="json"))
+        # N3 constraint provenance is immutable. Per-unit inputs below come
+        # from the effective plan and must still equal the certified originals.
+        project_constraints = load_project_constraints(ctx, PreparedBid.model_validate(frozen_prepared).model_dump(mode="json"))
         provider_options = ctx.execution_config.get("provider", {"mode": "prepared"})
         if provider_options["mode"] == "prepared":
             provider = PreparedProposalProvider(value["proposals"])
@@ -138,7 +147,7 @@ def build_executor(root: Path, config: dict) -> Executor:
             base_inputs = {task.unit_id: build_writing_unit_input(prepared, plan, task, provider_options,
                            project_constraints, value["proposals"])
                            for plan in prepared.sections for task in plan.writing_tasks}
-            provider.preflight(ctx, prepared.model_dump(mode="json"), base_inputs)
+            provider.preflight(ctx, PreparedBid.model_validate(frozen_prepared).model_dump(mode="json"), base_inputs)
         sections = []
         writing_review = []
         for plan in prepared.sections:
@@ -303,7 +312,37 @@ def build_executor(root: Path, config: dict) -> Executor:
         # layout must not make it authoritative over the frozen plan.
         plan_node = "N3" if any(node["key"] == "N3" for node in ctx._state["nodes"]) else "N0"
         plan_record = next(node for node in ctx._state["nodes"] if node["key"] == plan_node)
-        frozen_plan = ctx.executor._checkpoint_data(plan_record)["prepared"]
+        from .project_review import SNAPSHOT_KEY, project_review_input
+        expected_input = project_review_input(ctx, ctx.executor._checkpoint_data(plan_record))
+        frozen_plan = expected_input["prepared"]
+        if SNAPSHOT_KEY in ctx.execution_config:
+            encoded = package.model_dump(mode="json")
+            if (any(encoded[key] != frozen_plan[key] for key in
+                    ("project", "sources", "requirements", "facts", "attachments", "issues", "review_actions"))
+                    or value["source_artifacts"] != expected_input["source_artifacts"]):
+                raise PipelineFailure("PROJECT_REVIEW_ASSEMBLY_MISMATCH")
+            expected_tables = {item["table_id"]: item for item in frozen_plan["tables"]}
+            if any(block.table.model_dump(mode="json") != expected_tables.get(block.table.table_id)
+                   for section in package.sections for block in section.blocks if isinstance(block, TableBlock)):
+                raise PipelineFailure("PROJECT_REVIEW_TABLE_MISMATCH")
+            by_section = {section.section_id: section for section in package.sections}
+            reviewed_facts = {fact["fact_id"]: fact for fact in frozen_plan["facts"]
+                              if fact["fact_id"].startswith("PROJECT-ANSWER-")}
+            for plan in frozen_plan["sections"]:
+                blocks = by_section[plan["section_id"]].blocks
+                for index, item in enumerate(plan["fixed_content"]):
+                    if item["kind"] == "paragraph" and set(item["fact_refs"]) & reviewed_facts.keys():
+                        block = blocks[index]
+                        if (not isinstance(block, ParagraphBlock) or block.text != item["text"]
+                                or block.fact_refs != item["fact_refs"] or block.source_refs != item["source_refs"]):
+                            raise PipelineFailure("PROJECT_REVIEW_FIXED_PARAGRAPH_CHANGED")
+                for fact_ref in plan["fact_refs"]:
+                    if fact_ref in reviewed_facts:
+                        fact = reviewed_facts[fact_ref]
+                        if sum(isinstance(b, ParagraphBlock) and b.fact_refs == [fact_ref]
+                               and b.source_refs == fact["source_refs"] and b.text == f'{fact["label"]}：{fact["value"]}'
+                               for b in blocks) != 1:
+                            raise PipelineFailure("PROJECT_REVIEW_DECISION_PARAGRAPH_CHANGED")
         expected_native = {section["section_id"]: section["native_format"]
                            for section in frozen_plan["sections"] if section.get("native_format") is not None}
         actual_native = {section.section_id: section.native_format.model_dump(mode="json")
@@ -523,12 +562,13 @@ def build_executor(root: Path, config: dict) -> Executor:
         writing_replay_keys = ("writing_candidate_import", "commitment_drafting", "run_purpose", "debug_capture")
     commitment_versions = (("commitment_drafting.py", "commitment_prompt.py", "commitment_planning.py")
         if config.get("provider", {}).get("mode") == "diagnostic_writing_commitment_partition" else ())
+    review_versions = ("project_review.py", "project_questions.py", "project_answers.py")
     nodes = [NodeSpec("N0", _version(*shared), freeze, config_keys=()),
-             NodeSpec("N4", _version(*shared, "provider.py", "writing_prompt.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", *commitment_versions),
-                      draft, config_keys=("provider",) + writing_replay_keys),
-             NodeSpec("N5", _version(*shared, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", "source_response_audit.py", *commitment_versions), check,
-                      config_keys=((("provider",) + writing_replay_keys) if writing_replay_keys else ()) + ("source_response_audit",)),
-             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "review_document.py",
+             NodeSpec("N4", _version(*shared, *review_versions, "provider.py", "writing_prompt.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", *commitment_versions),
+                      draft, config_keys=("provider", "project_answer_snapshot") + writing_replay_keys),
+             NodeSpec("N5", _version(*shared, *review_versions, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", "source_response_audit.py", *commitment_versions), check,
+                      config_keys=((("provider",) + writing_replay_keys) if writing_replay_keys else ()) + ("source_response_audit", "project_answer_snapshot")),
+             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "project_answers.py", "review_document.py",
                                      "review_source_context.py", "material_source_review.py", "material_recall.py"), render,
                       config_keys=("document_style", "review_document_mode", "reading"))]
     if config.get("pipeline", "prepared") == "automatic":
@@ -536,4 +576,7 @@ def build_executor(root: Path, config: dict) -> Executor:
         nodes = intake_nodes(root, _version, config) + nodes[1:]
     elif config.get("pipeline", "prepared") != "prepared":
         raise PipelineFailure("PIPELINE_MODE_INVALID")
+    if config.get("review_before_writing"):
+        from .project_review import ProjectReviewExecutor
+        return ProjectReviewExecutor(root, nodes, execution_config=config)
     return Executor(root, nodes, execution_config=config)

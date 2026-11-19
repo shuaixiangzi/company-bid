@@ -107,7 +107,7 @@
 复核固定于旧 Git 提交 `b5bb87842f932bf72fad941e6ffbb324328508d8`，范围限于已提交的页面、后端确认、写作及导出入口。旧服务和正式数据库均未运行。以下后端路径相对旧项目的 `apps/api/src/ai_bid_api/`。
 
 - `workflow/pre_draft_checklist.py:118` 实际汇总三类工作：锁定商务目录、按章节选用人员和业绩资料、核对未挂到目录的强制或废标条款。`apps/web/src/views/AutoProcessingView.vue:286` 按类型定位到处理处。材料可选用或登记缺口。勾选目录外条款时保存的是要求编号，单凭勾选无法证明已经响应。
-- `materials/selection_models.py:25` 保存项目、run、操作人、版本和快照 hash。`workflow/routes.py:2318` 校验提交版本并重新检查候选材料。`composition/outline_plan_service.py:996` 在启用 V2 执行计划时将选用快照接到材料路径和 Word 装配计划，写作和导出分别在 `workflow/handler.py:5748` 与 `exports/service.py:332` 加载。另有恢复入口在 `workflow/routes.py:863` 转入响应规划；这些局部接线不能证明旧默认流程已经生成最终 Word。
+- `materials/selection_models.py:25` 保存项目、run、操作人、版本和快照 hash。`workflow/routes.py:2318` 校验提交版本并重新检查候选材料。`composition/outline_plan_service.py:996` 在启用 V2 执行计划时将选用快照接到材料路径与装配计划，导出入口在 `exports/service.py:332` 加载。旧正式流程在响应规划后停止。`workflow/routes.py:863` 将恢复请求转入交接，`workflow/handler.py:5653` 的 Worker 写作入口也在加载后续旧写作实现之前直接拒绝执行。
 - 缺项处理有具体的反例。`workflow/pre_draft_checklist.py:34` 将已记录的数量不足视为操作已处理；`workflow/routes.py:1035` 的目录确认入口仍会因数量不足返回冲突。`composition/project_fact_card.py:44` 声明报价和代理人字段，但核查的两个构造入口没有给这两项赋值。旧确认页的三类工作里也没有正式递交截止或实缴日期的独立录入项。
 
 ### 对新项目的取舍

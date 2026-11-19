@@ -51,7 +51,7 @@ def _fills_blank_rule_right_edge(binding, line, element, index):
             not binding.before_text[line.start:line.end].strip(" \t"))
 
 
-def _native_paragraph(document, section, element, gap, *, paragraph=None):
+def _native_paragraph(document, section, element, gap, *, paragraph=None, package=None):
     from .rendering import _font, _indent
     if paragraph is None:
         paragraph = document.add_paragraph()
@@ -86,9 +86,18 @@ def _native_paragraph(document, section, element, gap, *, paragraph=None):
         paragraph.paragraph_format.line_spacing = Pt(max(paragraph.paragraph_format.line_spacing.pt, element.line_spacing_pt))
     family = native_font(element.font_family)
     bindings = section.native_format.bindings
-    for index in element.fixed_indices:
+    for member, index in enumerate(element.fixed_indices):
         text = section.blocks[index].text
         spans = []
+        answer_span = None
+        agent_span = None
+        agent = None
+        if package is not None and section.blocks[index].fact_refs:
+            from .project_answers import authorization_blank, native_agent_value
+            original = element.source_texts[member]
+            agent = native_agent_value(package, section, index, original)
+            if agent:
+                answer_span = authorization_blank(original)
         for line in [rule for rule in element.underlines if rule.fixed_index == index]:
             if getattr(line,"basis","native_vector_rule") == "native_underscore_glyphs" and not any(
                     binding.fixed_index == index and binding.source_rule == line for binding in bindings):
@@ -118,6 +127,19 @@ def _native_paragraph(document, section, element, gap, *, paragraph=None):
                     if end > binding.start:
                         end = end + delta if end >= binding.end else binding.start + len(binding.replacement)
             spans.append((start, end, line.width_pt))
+            if agent and (line.start, line.end) == answer_span:
+                agent_span = start, end, line.width_pt
+        if agent:
+            if agent_span is None:
+                raise ValueError("NATIVE_PROJECT_AGENT_SLOT_MISSING")
+            start, end, _ = agent_span
+            if not text[start:end] or text[start:end].strip(" \t_＿"):
+                raise ValueError("NATIVE_PROJECT_AGENT_SLOT_CHANGED")
+            text = text[:start] + agent + text[end:]
+            delta = len(agent) - (end - start)
+            spans = [(left, start + len(agent), points) if (left, right, points) == agent_span else
+                     (left + delta, right + delta, points) if left >= end else (left, right, points)
+                     for left, right, points in spans]
         cursor = 0
         for start, end, width in sorted(spans):
             if start < cursor or end > len(text):
@@ -184,7 +206,8 @@ def render_native_section(document, package, section, *, cover=False, append=Fal
         gap = max(0., element.bbox[1] - cursor)
         if element.kind == "paragraph":
             inline = _same_baseline(previous, element)
-            paragraph = _native_paragraph(document, section, element, gap, paragraph=paragraph if inline else None)
+            paragraph = _native_paragraph(document, section, element, gap, paragraph=paragraph if inline else None,
+                                          package=package)
             cursor = max(cursor if inline else 0., element.bbox[1] + element.line_spacing_pt * len(element.fixed_indices))
         else:
             if gap > .5:

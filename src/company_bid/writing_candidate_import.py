@@ -391,7 +391,11 @@ def validate_candidate_import_links(ctx, value, package, *, partition_provider=N
             extra = checked_commitment_partition(prepared, provider.commitment_partition, provenance)
             bases = {uid: base for uid, base in bases.items() if uid not in extra}
         _, tasks, _, _, _ = provider._prepare(ctx, frozen["prepared"], bases)
-        _require(package.requirements == prepared.requirements and package.sources == prepared.sources, "PACKAGE_SOURCES_CHANGED")
+        from .project_review import project_review_input
+        current = project_review_input(ctx, frozen)["prepared"]
+        _require(package.requirements == prepared.requirements and
+                 [source.model_dump(mode="json") for source in package.sources] == current["sources"],
+                 "PACKAGE_SOURCES_CHANGED")
         reviews = value.get("writing_review", [])
         if provider.commitment_partition is not None:
             reviews = [item for item in reviews if item["unit_id"] in tasks]
