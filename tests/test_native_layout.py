@@ -13,6 +13,7 @@ from company_bid.native_layout import NativeLayoutError, read_native_format_layo
 from company_bid.reading import SourceDocument, ReadingConfig, _read_pdf_page
 from company_bid.extraction import _index
 from company_bid.storage import digest
+from test_reading import separator_table_pdf
 
 
 def sha(path):
@@ -97,6 +98,33 @@ def test_measurements_fonts_rules_and_spans_match_same_native_n1_selection(tmp_p
     assert table["text_basis"] == exported["text_basis"] == "table_rows_tsv_v1"
     assert table["text_sha256"] == hashlib.sha256(exported["text"].encode()).hexdigest()
     assert original_table.text == ""  # Neither source view mutates N1's object.
+
+
+@pytest.mark.parametrize("page_origin", [(0, 0), (17, 23)])
+def test_native_table_runs_share_n1_ownership_but_keep_original_glyph_rectangles(tmp_path, page_origin):
+    path = separator_table_pdf(tmp_path / "separator.pdf", page_origin=page_origin)
+    original_sha = sha(path)
+    table, = read_native_format_layout(path, original_sha, [1])["pages"][0]["tables"]
+    cells = {(cell["row"], cell["column"]): cell for cell in table["cells"]}
+    with pdfplumber.open(path) as document:
+        page = document.pages[0]
+        slash = next(char for char in page.chars if char["text"] == "/" and char["x0"] > 150)
+        actual_bbox = [slash[key] for key in ("x0", "top", "x1", "bottom")]
+        assert (actual_bbox[1] + actual_bbox[3]) / 2 > 110 - page_origin[1]
+        source = SourceDocument(source_id="SRC", path=path, sha256=original_sha, role="tender", title="Synthetic")
+        unit = _read_pdf_page(source, page, 1, ReadingConfig(), None)
+    assert table["rows"] == next(block.rows for block in unit.blocks if block.kind == "table")
+    assert cells[0, 1]["text"] == "A/B"
+    assert [run["text"] for run in cells[0, 1]["runs"]] == ["A", "/", "B"]
+    assert cells[0, 1]["runs"][1]["chars"][0]["bbox"] == actual_bbox
+    assert cells[1, 1]["text"] == "" and cells[1, 1]["runs"] == []
+    assert cells[1, 0]["text"] == "/" and sha(path) == original_sha
+
+
+def test_native_layout_keeps_a_cross_row_ownership_conflict_failed(tmp_path):
+    path = separator_table_pdf(tmp_path / "ambiguous.pdf", ambiguous=True)
+    with pytest.raises(NativeLayoutError, match="NATIVE_LAYOUT_TABLE_CELL_OWNERSHIP_AMBIGUOUS"):
+        read_native_format_layout(path, sha(path), [1])
 
 
 @pytest.mark.parametrize("pages", [[], [0], [-1], [1, 1], [True], [1.0], [2], "1", None])

@@ -467,10 +467,116 @@ def _resolve_unread(source, unit, config, ocr, requests):
         unit.coverage.status = "read" if unit.coverage.native_text_chars or unit.coverage.table_count else "empty"
 
 
-def _pdf_table(source, page, table, locator):
+class PdfTableCellOwnershipError(ValueError):
+    """A glyph crossing a table row has conflicting native ownership evidence."""
+
+
+def _horizontal_matrix(char):
+    value = char.get("matrix")
+    if (char.get("upright") is not True or not isinstance(value, (list, tuple)) or len(value) != 6
+            or not all(isinstance(part, (float, int)) and math.isfinite(part) for part in value)):
+        return None
+    a, b, c, d, _, _ = value
+    if a > 0 and d > 0 and abs(b) < .0001 and abs(c) < .0001:
+        return value
+    return None
+
+
+def _separator_adjacent_line(char, matrix, peers):
+    """Use two immediate, independent neighbors on one physical text line."""
+    before, after = [], []
+    gap = char["size"] * .15
+    for peer in peers:
+        other = _horizontal_matrix(peer)
+        if (other is None or not peer["text"].isalnum()
+                or abs(peer["size"] - char["size"]) > .25
+                or any(abs(a - b) > .0001 for a, b in zip(matrix[:4], other[:4]))
+                or abs(matrix[5] - other[5]) > .15):
+            continue
+        if peer["x0"] < char["x0"] and abs(char["x0"] - peer["x1"]) <= gap:
+            before.append(peer)
+        if peer["x1"] > char["x1"] and abs(peer["x0"] - char["x1"]) <= gap:
+            after.append(peer)
+    if len(before) == len(after) == 1 and round(before[0]["top"], 1) == round(after[0]["top"], 1):
+        return before[0]["top"]
+    return None
+
+
+def _pdf_table_cell_characters(page, table, locator, transformations=None):
+    """Share cell membership and the reading order of proven row separators."""
     boxes = [tuple(float(value) for value in box) for box in table.cells if box is not None]
     if not boxes:
         raise ValueError("table has no cells")
+    groups = {box: [] for box in boxes}
+    separator_candidates = []
+    for char in page.chars:
+        x, y = (char["x0"] + char["x1"]) / 2, (char["top"] + char["bottom"]) / 2
+        owners = [box for box in groups if _inside(box, x, y)]
+        if char["text"].strip() and _inside(table.bbox, x, y) and not owners:
+            raise ValueError("unassigned table text")
+        for owner in owners:
+            groups[owner].append(char)
+        # A standalone slash fully within a row keeps its usual ownership.
+        if (len(owners) == 1 and char["text"] in {"/", "／"}
+                and (char["top"] < owners[0][1] or char["bottom"] > owners[0][3])):
+            separator_candidates.append((char, x, owners[0]))
+
+    order_tops = {}
+    if getattr(page, "rotation", None) != 0:
+        return groups, order_tops
+    for char, x, owner in separator_candidates:
+        matrix = _horizontal_matrix(char)
+        if matrix is None:
+            continue
+        # pdfminer applies the MediaBox translation to the text matrix. Use
+        # the page adapter's conversion from that coordinate system to top-left.
+        _, baseline = page.point2coord((matrix[4], matrix[5]))
+        if _inside(owner, x, baseline):
+            continue
+        contenders = [box for box in groups if _inside(box, x, baseline)]
+        if len(contenders) != 1:
+            if contenders:
+                raise PdfTableCellOwnershipError
+            continue
+        target, = contenders
+        border = owner[1] if baseline < owner[1] else owner[3]
+        target_border = target[3] if baseline < owner[1] else target[1]
+        if (not char["top"] < border < char["bottom"] or abs(border - target_border) > .01
+                or not max(owner[0], target[0]) <= char["x0"] <= char["x1"] <= min(owner[2], target[2])):
+            raise PdfTableCellOwnershipError
+        if not any(abs(edge["top"] - border) <= .75 and abs(edge["bottom"] - border) <= .75
+                   and edge["x0"] <= char["x0"] and edge["x1"] >= char["x1"] for edge in page.edges):
+            raise PdfTableCellOwnershipError
+        peers = [peer for peer in groups[target] if target[1] <= peer["top"] <= peer["bottom"] <= target[3]]
+        line_top = _separator_adjacent_line(char, matrix, peers)
+        if line_top is None:
+            raise PdfTableCellOwnershipError
+        groups[owner].remove(char)
+        groups[target].append(char)
+        order_tops[id(char)] = line_top
+        if transformations is not None:
+            transformations.append({"kind": "native_pdf_table_separator_ownership", "locator": locator,
+                "glyph_bbox": [char[key] for key in ("x0", "top", "x1", "bottom")], "baseline_top": baseline,
+                "center_cell_bbox": list(owner), "owning_cell_bbox": list(target)})
+    return groups, order_tops
+
+
+def _table_text(chars, order_tops):
+    # Only the extraction projection uses line tops. Native run rectangles and
+    # the source PDF keep their measured coordinates and every original glyph.
+    extracted = []
+    for char in chars:
+        if id(char) in order_tops:
+            top = order_tops[id(char)]
+            delta = top - char["top"]
+            char = {**char, "top": top, "bottom": char["bottom"] + delta, "doctop": char["doctop"] + delta}
+        extracted.append(char)
+    return (pdfplumber.utils.extract_text(extracted) or "").strip() if extracted else ""
+
+
+def _pdf_table(source, page, table, locator, *, assignment=None, transformations=None):
+    groups, order_tops = assignment if assignment is not None else _pdf_table_cell_characters(page, table, locator, transformations)
+    boxes = list(groups)
     # Native rectangle boundaries preserve horizontal and vertical spans.
     xs = sorted({round(v, 3) for box in boxes for v in (box[0], box[2])})
     ys = sorted({round(v, 3) for box in boxes for v in (box[1], box[3])})
@@ -482,15 +588,9 @@ def _pdf_table(source, page, table, locator):
         left, top, right, bottom = (round(v, 3) for v in box)
         col, row = xs.index(left), ys.index(top)
         span_c, span_r = xs.index(right) - col, ys.index(bottom) - row
-        chars = [char for char in page.chars if _inside(box, (char["x0"] + char["x1"]) / 2, (char["top"] + char["bottom"]) / 2)]
-        text = pdfplumber.utils.extract_text(chars) if chars else ""
-        rows[row][col] = (text or "").strip()
+        rows[row][col] = _table_text(groups[box], order_tops)
         if span_c > 1 or span_r > 1:
             merges.append(Merge(row=row, column=col, row_span=span_r, col_span=span_c))
-    for char in page.chars:
-        x, y = (char["x0"] + char["x1"]) / 2, (char["top"] + char["bottom"]) / 2
-        if str(char.get("text", "")).strip() and _inside(table.bbox, x, y) and not any(_inside(box, x, y) for box in boxes):
-            raise ValueError("unassigned table text")
     return _block(source, locator, "table", rows=rows, merges=merges,
                   column_widths=[xs[i + 1] - xs[i] for i in range(len(xs) - 1)], bbox=list(table.bbox))
 
@@ -528,7 +628,8 @@ def _read_pdf_page(source, page, number, config, ocr):
         tables = page.find_tables(table_settings=config.table_settings)
         table_boxes = [tuple(table.bbox) for table in tables]
         for index, table in enumerate(tables):
-            unit.blocks.append(_pdf_table(source, page, table, locator + f"/table[{index}]"))
+            unit.blocks.append(_pdf_table(source, page, table, locator + f"/table[{index}]",
+                                          transformations=unit.coverage.transformations))
         outside = [word for word in page.extract_words() if not any(
             _inside(box, (word["x0"] + word["x1"]) / 2, (word["top"] + word["bottom"]) / 2) for box in table_boxes)]
         lines: list[list[dict]] = []
@@ -574,6 +675,9 @@ def _read_pdf_page(source, page, number, config, ocr):
         return unit
     except _UnitFailure:
         raise
+    except PdfTableCellOwnershipError:
+        unit.coverage.status, unit.coverage.error_code = "failed", "PDF_TABLE_CELL_OWNERSHIP_AMBIGUOUS"
+        raise _UnitFailure("PDF_TABLE_CELL_OWNERSHIP_AMBIGUOUS", unit) from None
     except Exception:
         unit.coverage.status, unit.coverage.error_code = "failed", "PDF_PAGE_PARSE_FAILED"
         raise _UnitFailure("PDF_PAGE_PARSE_FAILED", unit) from None

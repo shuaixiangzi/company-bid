@@ -12,7 +12,7 @@ from docx.oxml.ns import qn
 from PIL import Image
 import pytest
 from pypdf import PdfWriter
-from pypdf.generic import DictionaryObject, NameObject, NumberObject, DecodedStreamObject
+from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject, DecodedStreamObject, RectangleObject
 
 from company_bid.reading import ReadingConfig, ReadingFailure, SourceDocument, _read_pdf_page, read_documents
 from company_bid.runtime import Executor, NodeSpec
@@ -44,13 +44,27 @@ def source(path, role="tender", source_id="SRC-1"):
             "role": role, "title": "Synthetic input"}
 
 
-def pdf(path, contents, password=None):
+def pdf(path, contents, password=None, *, separator_font=False, page_origin=(0, 0)):
     writer = PdfWriter()
     for content in contents:
         page = writer.add_blank_page(width=300, height=220)
+        origin_x, origin_y = page_origin
+        if page_origin != (0, 0):
+            page.mediabox = RectangleObject((origin_x, origin_y, origin_x + 300, origin_y + 220))
         font = DictionaryObject({NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"),
                                  NameObject("/BaseFont"): NameObject("/Helvetica")})
         page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})})
+        if separator_font:
+            # Different font bounds at the same text matrix baseline reproduce
+            # the ownership conflict without changing the drawing coordinates.
+            descriptor = DictionaryObject({NameObject("/Type"): NameObject("/FontDescriptor"),
+                NameObject("/FontName"): NameObject("/SyntheticSeparator"), NameObject("/Descent"): NumberObject(-1000),
+                NameObject("/FontBBox"): ArrayObject([NumberObject(x) for x in [0, -1000, 500, 0]])})
+            font = DictionaryObject({NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/SyntheticSeparator"), NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+                NameObject("/FirstChar"): NumberObject(47), NameObject("/LastChar"): NumberObject(47),
+                NameObject("/Widths"): ArrayObject([NumberObject(500)]), NameObject("/FontDescriptor"): writer._add_object(descriptor)})
+            page["/Resources"]["/Font"][NameObject("/F2")] = writer._add_object(font)
         if content == "IMAGE":
             image = DecodedStreamObject()
             image.set_data(bytes([100, 140, 180]) * 64 * 64)
@@ -60,7 +74,7 @@ def pdf(path, contents, password=None):
             page["/Resources"][NameObject("/XObject")] = DictionaryObject({NameObject("/Im1"): writer._add_object(image)})
             command = "q 150 0 0 150 20 20 cm /Im1 Do Q"
         else:
-            command = content
+            command = f"q 1 0 0 1 {origin_x} {origin_y} cm\n{content}\nQ" if page_origin != (0, 0) else content
         stream = DecodedStreamObject(); stream.set_data(command.encode("ascii"))
         page[NameObject("/Contents")] = writer._add_object(stream)
     if password:
@@ -88,6 +102,35 @@ def test_pdf_table_grid_and_native_text_are_not_counted_twice(tmp_path):
     assert len(table["column_widths"]) == 2 and all(w > 0 for w in table["column_widths"])
     assert [b["text"] for b in unit["blocks"] if b["kind"] == "paragraph"] == ["Outside"]
     assert unit["page"] == 1 and result["coverage"]["complete"]
+
+
+def separator_table_pdf(path, *, ambiguous=False, page_origin=(0, 0)):
+    edges = "30 70 m 270 70 l S\n30 110 m 270 110 l S\n30 150 m 270 150 l S\n30 70 m 30 150 l S\n150 70 m 150 150 l S\n270 70 m 270 150 l S\n"
+    header = "BT /F1 11 Tf 165 114 Td (A) Tj /F2 11 Tf (/) Tj"
+    if not ambiguous:
+        header += " /F1 11 Tf (B) Tj"
+    return pdf(path, [edges + text("Name", 40, 125) + header + " ET\n" + text("/", 40, 85)],
+               separator_font=True, page_origin=page_origin)
+
+
+@pytest.mark.parametrize("page_origin", [(0, 0), (17, 23)])
+def test_cross_row_separator_follows_bracketing_glyphs_on_its_native_baseline(tmp_path, page_origin):
+    path = separator_table_pdf(tmp_path / "source.pdf", page_origin=page_origin)
+    unit = read_documents(Context(), [source(path)], {})["documents"][0]["units"][0]
+    table = next(block for block in unit["blocks"] if block["kind"] == "table")
+    assert table["rows"] == [["Name", "A/B"], ["/", ""]]
+    decision, = unit["coverage"]["transformations"]
+    assert decision["kind"] == "native_pdf_table_separator_ownership"
+    assert decision["center_cell_bbox"][1] == decision["owning_cell_bbox"][3] == 110 - page_origin[1]
+    assert decision["baseline_top"] == 106 - page_origin[1]
+
+
+def test_cross_row_separator_with_one_unproven_neighbor_fails_required_read(tmp_path):
+    path = separator_table_pdf(tmp_path / "ambiguous.pdf", ambiguous=True)
+    with pytest.raises(ReadingFailure) as failure:
+        read_documents(Context(), [source(path)], {})
+    unresolved, = failure.value.result["coverage"]["required_unresolved_units"]
+    assert unresolved["error_code"] == "PDF_TABLE_CELL_OWNERSHIP_AMBIGUOUS"
 
 
 def test_pdf_horizontal_merge_is_preserved(tmp_path):

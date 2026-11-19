@@ -19,7 +19,7 @@ import unicodedata
 
 import pdfplumber
 
-from .reading import SourceDocument, _inside, _pdf_table
+from .reading import PdfTableCellOwnershipError, SourceDocument, _inside, _pdf_table, _pdf_table_cell_characters
 from .storage import digest
 
 
@@ -79,10 +79,11 @@ def _font(char):
             "bold": bold, "italic": italic, "style_basis": "native_font_name"}
 
 
-def _runs(chars):
+def _runs(chars, *, order_tops=None):
     """Keep native character positions, including spaces, in font-homogeneous runs."""
+    order_tops = order_tops or {}
     result = []
-    for char in sorted(chars, key=lambda value: (round(value["top"], 1), value["x0"])):
+    for char in sorted(chars, key=lambda value: (round(order_tops.get(id(value), value["top"]), 1), value["x0"])):
         font = _font(char)
         box = _char_box(char)
         entry = {"text": char["text"], "bbox": box}
@@ -152,8 +153,13 @@ def _physical_lines(page, table_boxes, number):
 def _table_layout(source, page, table, number, index):
     bbox = _box(list(table.bbox), page.width, page.height)
     locator = f"pdf/page[{number}]/table[{index}]"
-    block = _pdf_table(source, page, table, locator)
-    boxes = [tuple(float(value) for value in box) for box in table.cells if box is not None]
+    try:
+        assignment = _pdf_table_cell_characters(page, table, locator)
+    except PdfTableCellOwnershipError as exc:
+        raise NativeLayoutError("NATIVE_LAYOUT_TABLE_CELL_OWNERSHIP_AMBIGUOUS") from exc
+    block = _pdf_table(source, page, table, locator, assignment=assignment)
+    groups, order_tops = assignment
+    boxes = list(groups)
     xs = sorted({round(value, 3) for box in boxes for value in (box[0], box[2])})
     ys = sorted({round(value, 3) for box in boxes for value in (box[1], box[3])})
     cells = []
@@ -161,10 +167,10 @@ def _table_layout(source, page, table, number, index):
         cell_box = _box(list(raw_box), page.width, page.height)
         left, top, right, bottom = (round(value, 3) for value in raw_box)
         column, row = xs.index(left), ys.index(top)
-        chars = _selected_chars(page.chars, cell_box)
+        chars = groups[raw_box]
         cells.append({"row": row, "column": column,
             "row_span": ys.index(bottom) - row, "col_span": xs.index(right) - column,
-            "bbox": cell_box, "text": block.rows[row][column], "runs": _runs(chars),
+            "bbox": cell_box, "text": block.rows[row][column], "runs": _runs(chars, order_tops=order_tops),
             "alignment_evidence": _alignment(chars, cell_box)})
     heights = [ys[index + 1] - ys[index] for index in range(len(ys) - 1)]
     _require(all(value > 0 for value in heights) and
