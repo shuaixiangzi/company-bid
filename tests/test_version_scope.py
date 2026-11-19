@@ -24,6 +24,8 @@ from company_bid.pipeline import build_executor
     ("material_content_matching.py", {"N3"}),
     ("material_content_index.py", {"N3"}),
     ("review_document.py", {"N6"}),
+    ("operator_summary.py", {"N6"}),
+    ("project_questions.py", {"N4", "N5", "N6"}),
     ("review_source_context.py", {"N6"}),
     ("writing_candidate_import.py", {"N4", "N5"}),
     ("plan_component_controls.py", {"N3"}),

@@ -2,6 +2,7 @@
 from copy import deepcopy
 from zipfile import ZipFile
 import hashlib
+from xml.etree import ElementTree as ET
 
 from docx import Document
 import pytest
@@ -88,6 +89,49 @@ def test_mode_is_explicit_default_full_trace_and_bid_content_unchanged(tmp_path)
     with pytest.raises(ValueError,match='REVIEW_DOCUMENT_MODE_INVALID'):
         render_package(package,tmp_path/'bad',review_document_mode='omit_everything')
     assert not (tmp_path/'bad').exists()
+
+
+@pytest.mark.parametrize("mode", ["task_list", "full_trace"])
+def test_operator_links_land_on_the_exact_issue_action_and_source(tmp_path, monkeypatch, mode):
+    from company_bid import operator_summary
+    package = review_package(tmp_path)
+    issue, action = package.issues[0], package.review_actions[0]
+    quote = task_list_catalog(package)["quote_ids"][issue.source_requirement]
+    item = {"title": "核对本次经办事项", "available": ["样例依据"], "next_steps": ["样例操作"],
+            "destinations": ["样例表"], "issue_ids": [issue.issue_id], "action_ids": [action.action_id],
+            "primary_quote_ids": [quote]}
+    summary = {"items": [item], "details_note": "逐项来源在详情中列出。"}
+    monkeypatch.setattr(operator_summary, "build_operator_summary", lambda *_: summary)
+    result = render_package(package, tmp_path / mode, review_document_mode=mode)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    w = "{" + ns["w"] + "}"
+    with ZipFile(result["issues_docx"]["path"]) as archive:
+        xml = ET.fromstring(archive.read("word/document.xml"))
+    paragraphs = xml.findall("./w:body/w:p", ns)
+    visible = lambda p: "".join(t.text or "" for t in p.findall(".//w:t", ns))
+    links = {visible(link): link.get(w + "anchor") for p in paragraphs for link in p.findall("w:hyperlink", ns)}
+    anchors = {start.get(w + "name"): visible(p) for p in paragraphs for start in p.findall("w:bookmarkStart", ns)}
+    assert visible(paragraphs[0]) == "经办摘要"
+    assert len(anchors) == len(links) == (3 if mode == "task_list" else 2)
+    assert anchors[links[issue.issue_id]].startswith(issue.issue_id + " " + issue.title)
+    assert anchors[links["办理001"]].startswith("办理001 " if mode == "task_list" else action.action_id + " ")
+    if mode == "task_list":
+        assert anchors[links[quote]] == quote
+        assert result["review_document_index"]["operator_summary"] == summary
+
+
+def test_summary_ranges_never_hide_holes_or_switch_target_kinds(tmp_path):
+    from company_bid.review_document import write_operator_summary
+
+    package = review_package(tmp_path)
+    ids = [f"M-{index:03d}" for index in (1, 2, 3, 5, 6, 7, 8)]
+    item = {"title": "办理分组", "available": [], "next_steps": [], "destinations": [],
+            "issue_ids": ids, "action_ids": [package.review_actions[0].action_id], "primary_quote_ids": []}
+    doc = Document()
+    bookmarks = write_operator_summary(doc, package, {"items": [item], "details_note": "查看编号。"}, link_quotes=True)
+    label = "".join(doc.element.xpath(".//w:p[w:hyperlink]//w:t/text()"))
+    assert label == "查阅　M-001、M-002、M-003、M-005 至 M-008、办理001"
+    assert set(bookmarks) == {("issue", ident) for ident in [*ids[:4], ids[-1]]} | {("action", item["action_ids"][0])}
 
 
 def test_shared_full_quote_keeps_exact_child_offsets_not_only_an_abbreviated_summary(tmp_path):

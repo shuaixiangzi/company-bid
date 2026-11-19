@@ -6,6 +6,8 @@ import re
 from collections import OrderedDict
 
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Pt
 
 from .storage import digest
@@ -431,6 +433,88 @@ def task_list_catalog(package):
             "sources":sources,"requirement_quote_ids":{r.requirement_id:ids[owner[r.text]] for r in package.requirements}}
 
 
+def mark_summary_target(paragraph, bookmarks, kind, key):
+    number = bookmarks.get((kind, key))
+    if number is None:
+        return
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), str(number))
+    start.set(qn("w:name"), f"bid_review_{number}")
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), str(number))
+    paragraph._p.insert_element_before(start, "w:r")
+    paragraph._p.append(end)
+
+
+def _summary_link(paragraph, label, number, style):
+    from .rendering import _font
+    link = OxmlElement("w:hyperlink")
+    link.set(qn("w:anchor"), f"bid_review_{number}")
+    run = _font(paragraph.add_run(label), name=style.font_family, size=style.body_pt)
+    run.underline = True
+    link.append(run._r)
+    paragraph._p.append(link)
+
+
+def _summary_link_ranges(targets):
+    """Only abbreviate a run of three or more consecutive printed numbers of the same kind."""
+    groups = []
+    previous = None
+    for kind, key, label in targets:
+        match = re.fullmatch(r"(.*?)([0-9]+)", label)
+        identity = (kind, match[1], len(match[2])) if match else None
+        ordinal = int(match[2]) if match else None
+        if identity and previous == (identity, ordinal - 1):
+            groups[-1].append((kind, key, label))
+        else:
+            groups.append([(kind, key, label)])
+        previous = (identity, ordinal)
+    return groups
+
+
+def write_operator_summary(document, package, summary, *, link_quotes):
+    """Keep the original detailed list on its own page; bookmarks survive repagination."""
+    from .rendering import _font, _plain
+    bookmarks = {}
+    if not summary["items"]:
+        return bookmarks
+    style = package.style
+    document.add_paragraph("经办摘要", "Heading 1")
+    _plain(document, package.project.name, style, keep_next=True)
+    if package.synthetic:
+        _plain(document, "合成测试样本，仅用于系统验证。", style, keep_next=True)
+    _plain(document, summary["details_note"], style)
+    action_labels = {a.action_id: f"办理{n:03d}" for n, a in enumerate(package.review_actions, 1)}
+    for item in summary["items"]:
+        document.add_paragraph(item["title"], "Heading 2")
+        if item.get("contact"):
+            _plain(document, "可联系　" + item["contact"], style, keep_next=True)
+        for label, values in (("已有依据", item["available"]), ("需要办理", item["next_steps"]),
+                              ("办理位置", item["destinations"])):
+            if values:
+                p = _plain(document, label + "　", style, keep_next=True)
+                p.runs[0].bold = True
+                separator = "、" if label == "办理位置" else ""
+                _font(p.add_run(separator.join(values)), name=style.font_family, size=style.body_pt)
+        p = _plain(document, "查阅　", style)
+        targets = [("issue", key, key) for key in item["issue_ids"]]
+        targets.extend(("action", key, action_labels[key]) for key in item["action_ids"])
+        if link_quotes:
+            targets.extend(("quote", key, key) for key in item["primary_quote_ids"])
+        for pos, group in enumerate(_summary_link_ranges(targets)):
+            if pos:
+                p.add_run("、")
+            for offset, (kind, key, label) in enumerate(group):
+                if len(group) > 3 and 0 < offset < len(group) - 1:
+                    continue
+                if offset:
+                    p.add_run(" 至 " if len(group) > 3 else "、")
+                number = bookmarks.setdefault((kind, key), len(bookmarks) + 1)
+                _summary_link(p, label, number, style)
+    document.add_page_break()
+    return bookmarks
+
+
 def render_task_list(package, *, material_review_report=None, glyph_maps=None):
     from .rendering import _base_document, _font, _indent, _page_furniture, _render_table, _render_section_content, RenderingError
     from .review_source_context import material_stage_display
@@ -484,6 +568,9 @@ def render_task_list(package, *, material_review_report=None, glyph_maps=None):
         return p
     def locations(refs):return list(dict.fromkeys(_location(sources[ref]) for ref in refs))
     def original(text):return catalog["quote_ids"][text]
+    from .operator_summary import build_operator_summary
+    index["operator_summary"] = build_operator_summary(package, catalog)
+    bookmarks = write_operator_summary(doc, package, index["operator_summary"], link_quotes=True)
     doc.add_paragraph("待补与办理清单","Title")
     paragraph("项目："+package.project.name)
     paragraph("按编号核对待补资料、待确认事实和办理事项。原文集中列于后面的原文附录；已附材料不代表资格或评分已通过。")
@@ -502,7 +589,8 @@ def render_task_list(package, *, material_review_report=None, glyph_maps=None):
         if section.document_role=="review":paragraph("位置：配套核对内容；不作为已完成的投标响应。")
         for issue in issues:
             row=issue_rows[issue.issue_id]
-            paragraph(f"{issue.issue_id} {issue.title}（{row['status']}）",bold=True,keep_next=True)
+            heading = paragraph(f"{issue.issue_id} {issue.title}（{row['status']}）",bold=True,keep_next=True)
+            mark_summary_target(heading, bookmarks, "issue", issue.issue_id)
             for number,segment in enumerate(row["rendered_reason_segments"]):
                 paragraph(("原因：" if number==0 else "")+segment["text"])
             paragraph("动作："+row["display_action"])
@@ -517,7 +605,8 @@ def render_task_list(package, *, material_review_report=None, glyph_maps=None):
         section_ids=[sid for sid in sections if set(action.requirement_refs)&set(sections[sid].requirement_refs)]
         positions=list(dict.fromkeys(sections[sid].title for sid in section_ids
             if sections[sid].document_role=="response" and sections[sid].render_body)) or ["配套办理事项"]
-        paragraph(f"{display} {kind}（{status}）",bold=True,keep_next=True)
+        heading = paragraph(f"{display} {kind}（{status}）",bold=True,keep_next=True)
+        mark_summary_target(heading, bookmarks, "action", action.action_id)
         paragraph("动作："+action.instruction)
         if action.source_scope_status!="not_applicable":paragraph("适用范围尚待确认，不据此判定正文、报价或资格。")
         paragraph("对应章节："+"；".join(positions))
@@ -558,7 +647,8 @@ def render_task_list(package, *, material_review_report=None, glyph_maps=None):
     table_cache={}
     table_options = {} if glyph_maps is None else {"glyph_maps": glyph_maps}
     for entry in catalog["entries"]:
-        paragraph(entry["display_id"],bold=True,keep_next=True)
+        heading = paragraph(entry["display_id"],bold=True,keep_next=True)
+        mark_summary_target(heading, bookmarks, "quote", entry["display_id"])
         paragraph("；".join(entry["locations"]),keep_next=True)
         compositions = quote_compositions.get(entry["text"], ())
         options = {**table_options, "issue_components": next(iter(compositions))} if len(compositions) == 1 else table_options

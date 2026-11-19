@@ -568,8 +568,8 @@ def build_executor(root: Path, config: dict) -> Executor:
                       draft, config_keys=("provider", "project_answer_snapshot") + writing_replay_keys),
              NodeSpec("N5", _version(*shared, *review_versions, "provider.py", "writing_replay.py", "writing_candidate_import.py", "diagnostic_replay.py", "diagnostics.py", "source_response_audit.py", *commitment_versions), check,
                       config_keys=((("provider",) + writing_replay_keys) if writing_replay_keys else ()) + ("source_response_audit", "project_answer_snapshot")),
-             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "project_answers.py", "review_document.py",
-                                     "review_source_context.py", "material_source_review.py", "material_recall.py"), render,
+             NodeSpec("N6", _version(*shared, "rendering.py", "source_format_rendering.py", "project_answers.py", "project_questions.py", "review_document.py",
+                                     "operator_summary.py", "review_source_context.py", "material_source_review.py", "material_recall.py"), render,
                       config_keys=("document_style", "review_document_mode", "reading"))]
     if config.get("pipeline", "prepared") == "automatic":
         from .chain import intake_nodes

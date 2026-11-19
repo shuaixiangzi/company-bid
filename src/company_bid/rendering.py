@@ -655,10 +655,14 @@ def _trace_appendix(document, package, source_quote_catalog=None):
 
 
 def _render_issues(package):
+    from .review_document import mark_summary_target, task_list_catalog, write_operator_summary
+    from .operator_summary import build_operator_summary
     title = f"{package.project.name} 待补清单"
     document = _base_document(package, title)
     style = package.style
     _page_furniture(document.sections[0], style, numbered=True, start=1)
+    summary = build_operator_summary(package, task_list_catalog(package))
+    bookmarks = write_operator_summary(document, package, summary, link_quotes=False)
     heading = document.add_paragraph(title, "Title")
     _font(heading.runs[0], name=style.font_family, size=18, bold=True)
     heading.paragraph_format.space_after = Pt(12)
@@ -679,6 +683,7 @@ def _render_issues(package):
     source_quotes = _source_quote_catalog(package)
     for issue in package.issues:
         heading = document.add_paragraph(f"{issue.issue_id} {issue.title}", "Heading 2")
+        mark_summary_target(heading, bookmarks, "issue", issue.issue_id)
         heading.paragraph_format.space_before = Pt(12)
         if roles[issue.section_id] == "review":
             _plain(document, f"配套清单位置：{titles[issue.section_id]}（{issue.section_id}）。在本清单中搜索同编号即可定位。", style)
@@ -695,7 +700,8 @@ def _render_issues(package):
         for action in package.review_actions:
             label = "商业约束待核验" if action.kind == "commercial_constraint" else "程序事项待办理"
             status = "尚未核验" if action.status == "not_checked" else "待线下办理"
-            document.add_paragraph(f"{action.action_id} {label}", "Heading 2")
+            heading = document.add_paragraph(f"{action.action_id} {label}", "Heading 2")
+            mark_summary_target(heading, bookmarks, "action", action.action_id)
             _plain(document, f"状态：{status}；尚未认定满足。", style)
             _plain(document, f"对应要求：{'、'.join(action.requirement_refs)}", style)
             _plain(document, f"来源要求：{source_quotes['links'][action.source_requirement]}", style)
