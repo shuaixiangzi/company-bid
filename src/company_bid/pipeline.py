@@ -85,6 +85,10 @@ def build_executor(root: Path, config: dict) -> Executor:
     review_keys = {"response_review_table_source_resolution", "failed_response_review_table_replay"}
     letter_keys = {"response_letter_source_resolution", "failed_response_letter_replay"}
     reflow_keys = {"response_cell_reflow_source_resolution", "failed_response_cell_reflow_replay"}
+    illustration_keys = {"illustration_source_resolution", "failed_illustration_replay"}
+    if isinstance(extraction, dict) and illustration_keys.intersection(extraction):
+        if not (illustration_keys | reflow_keys).issubset(extraction):
+            raise PipelineFailure("FAILED_ILLUSTRATION_CONFIG_INVALID")
     if isinstance(extraction, dict) and reflow_keys.intersection(extraction):
         if not (reflow_keys | letter_keys).issubset(extraction):
             raise PipelineFailure("FAILED_RESPONSE_CELL_REFLOW_CONFIG_INVALID")

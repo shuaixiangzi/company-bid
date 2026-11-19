@@ -6,6 +6,32 @@ from company_bid.pipeline import build_executor
 
 
 @pytest.mark.parametrize("keys", [
+    ("illustration_source_resolution",),
+    ("failed_illustration_replay",),
+    ("illustration_source_resolution", "failed_illustration_replay"),
+])
+def test_illustration_recovery_requires_its_proof_and_authenticated_predecessor(tmp_path, keys):
+    from company_bid.pipeline import PipelineFailure
+
+    with pytest.raises(PipelineFailure, match="FAILED_ILLUSTRATION_CONFIG_INVALID"):
+        build_executor(tmp_path, {"pipeline": "automatic", "extraction": {key: {} for key in keys}})
+
+
+def test_complete_illustration_history_config_requires_diagnostic_mode(tmp_path):
+    from company_bid.pipeline import PipelineFailure
+
+    keys = {"failed_cell_wrap_replay", "price_scoring_source_resolution", "failed_scoring_replay",
+            "scoring_row_source_resolution", "failed_scoring_rows_replay",
+            "response_cover_source_resolution", "failed_response_cover_replay",
+            "response_review_table_source_resolution", "failed_response_review_table_replay",
+            "response_letter_source_resolution", "failed_response_letter_replay",
+            "response_cell_reflow_source_resolution", "failed_response_cell_reflow_replay",
+            "illustration_source_resolution", "failed_illustration_replay"}
+    with pytest.raises(PipelineFailure, match="FAILED_SCORING_REPLAY_MODE_REQUIRED"):
+        build_executor(tmp_path, {"pipeline": "automatic", "extraction": dict.fromkeys(keys, {})})
+
+
+@pytest.mark.parametrize("keys", [
     ("response_cell_reflow_source_resolution",),
     ("failed_response_cell_reflow_replay",),
     ("response_cell_reflow_source_resolution", "failed_response_cell_reflow_replay"),

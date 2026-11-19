@@ -6,6 +6,7 @@ import hashlib
 import re
 
 from .diagnostic_replay import _id, _one, _require
+from .extraction_illustrations import ILLUSTRATION_SOURCE_CONFIG_KEY
 from .provider import ProviderFailure
 from .response_cell_reflow_sources import RESPONSE_CELL_REFLOW_CONFIG_KEY as RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY
 from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY as RESPONSE_COVER_SOURCE_CONFIG_KEY
@@ -20,6 +21,7 @@ RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY = "response_review_table_source_resoluti
 FAILED_RESPONSE_LETTER_REPLAY = "failed_response_letter_replay"
 RESPONSE_LETTER_SOURCE_CONFIG_KEY = "response_letter_source_resolution"
 FAILED_RESPONSE_CELL_REFLOW_REPLAY = "failed_response_cell_reflow_replay"
+FAILED_ILLUSTRATION_REPLAY = "failed_illustration_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -33,6 +35,7 @@ _COVER_CONFIG = "FAILED_RESPONSE_COVER_CONFIG_INVALID"
 _REVIEW_TABLE_KEYS = {FAILED_RESPONSE_REVIEW_TABLE_REPLAY, RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY}
 _LETTER_KEYS = {FAILED_RESPONSE_LETTER_REPLAY, RESPONSE_LETTER_SOURCE_CONFIG_KEY}
 _CELL_REFLOW_KEYS = {FAILED_RESPONSE_CELL_REFLOW_REPLAY, RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY}
+_ILLUSTRATION_KEYS = {FAILED_ILLUSTRATION_REPLAY, ILLUSTRATION_SOURCE_CONFIG_KEY}
 
 
 class FailedScoringReplay:
@@ -63,7 +66,7 @@ class FailedScoringReplay:
                                   if key not in {FAILED_SCORING_REPLAY, PRICE_SCORING_CONFIG_KEY,
                                                  FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                                  FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
-                                                 *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS}}
+                                                 *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS, *_ILLUSTRATION_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -88,6 +91,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in letter.actual_units(replay))
         if cell := getattr(replay, "_failed_response_cell_reflow", None):
             expected_bindings.update(_TASK + unit for unit in cell.actual_units(replay))
+        if illustration := getattr(replay, "_failed_illustration", None):
+            expected_bindings.update(_TASK + unit for unit in illustration.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -254,7 +259,7 @@ class FailedScoringRowsReplay:
         source_extraction = {key: value for key, value in replay._target_extraction.items()
                              if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                             FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
-                                            *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS}}
+                                            *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS, *_ILLUSTRATION_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -495,7 +500,7 @@ class _StoppedResponseReplay:
         except Exception as error:
             raise ProviderFailure("DIAGNOSTIC_REPLAY_VALIDATION_FAILED") from error
         _require(isinstance(proof, dict) and proof.get("raw_candidate_sha256") == digest(raw), self.proof_error)
-        self.check_proof_context(proof, context)
+        self.verify_source_resolution(proof, context)
         terminal = call["terminal"]
         self.window = window
         origin = {"source_alias": run.alias, "run_id": run.run_id, "node_key": "N2", "unit_id": unit_id,
@@ -514,6 +519,9 @@ class _StoppedResponseReplay:
 
     def enriched_windows(self):
         return {**self.predecessor_windows(), self.unit_id: self.window}
+
+    def verify_source_resolution(self, proof, context):
+        self.check_proof_context(proof, context)
 
     def allow_candidate(self, replay, ctx, task_type, unit_id):
         _allow_cold_candidate(self, replay, ctx, task_type, unit_id, self.enriched_windows(), self.cold_error,
@@ -669,6 +677,10 @@ class FailedResponseCellReflowReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_response_letter
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_illustration", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(len(order) == 59 and order[10] == self.predecessor.unit_id and order[11] == self.unit_id and
@@ -687,6 +699,59 @@ class FailedResponseCellReflowReplay(_StoppedResponseReplay):
                  digest(proof.get("original_error")) ==
                  digest({"error_code": self.historical_failure, "diagnostic_context": context}),
                  self.proof_error)
+
+    def predecessor_windows(self):
+        return self.predecessor.enriched_windows()
+
+
+class FailedIllustrationReplay(_StoppedResponseReplay):
+    """Authenticate the unchanged fourteen-window prefix and W15's first response."""
+
+    replay_key = FAILED_ILLUSTRATION_REPLAY
+    proof_key = ILLUSTRATION_SOURCE_CONFIG_KEY
+    config_error = "FAILED_ILLUSTRATION_CONFIG_INVALID"
+    source_error = "FAILED_ILLUSTRATION_SOURCE_INVALID"
+    proof_error = "FAILED_ILLUSTRATION_PROOF_MISMATCH"
+    cold_error = "FAILED_ILLUSTRATION"
+    historical_failure = "ILLUSTRATION_CONTEXT_NOT_CITABLE"
+    lineage_basis = "authenticated_illustration_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_response_cell_reflow
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[11] == self.predecessor.unit_id and order[14] == self.unit_id and
+                 all(replay.windows[unit]["blocks"] for unit in order[12:15]), self.config_error)
+        return order[12:15]
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_illustration_resolution
+
+        return _verified_illustration_resolution(raw, window)
+
+    def check_proof_context(self, proof, context):
+        _require(isinstance(context, dict) and context.get("candidate_type") == "requirement" and
+                 type(context.get("candidate_index")) is int and context["candidate_index"] >= 0 and
+                 digest(proof.get("original_error")) ==
+                 digest({"error_code": self.historical_failure, "diagnostic_context": context}),
+                 self.proof_error)
+
+    def verify_source_resolution(self, proof, context):
+        from .extraction import PlanningError, verify_illustration_predecessor
+
+        self.check_proof_context(proof, context)
+        preceding_unit = self.prefix[-2]
+        _require(proof["proof"]["predecessor"]["window_id"] == preceding_unit, self.proof_error)
+        # This checkpoint's original call and complete output are authenticated
+        # by verify_success regardless of the configured binding iteration order.
+        _, _, _, data, _ = self.run.unit("N2", preceding_unit)
+        try:
+            verify_illustration_predecessor(data, proof)
+        except PlanningError as error:
+            raise ProviderFailure("DIAGNOSTIC_REPLAY_" + self.proof_error) from error
 
     def predecessor_windows(self):
         return self.predecessor.enriched_windows()

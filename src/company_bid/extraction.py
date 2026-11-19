@@ -18,10 +18,14 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .extraction_illustrations import (
     CONFIG_KEY as _ILLUSTRATIVE_OCR_REGIONS,
+    ILLUSTRATION_SOURCE_CONFIG_KEY,
     IllustrationError,
+    build_illustration_context_proof,
     illustration_source_uses,
     is_context_only,
+    normalize_illustration_context_scope,
     normalize_regions,
+    verify_context_proof,
 )
 from .source_clauses import build_clause_catalog
 from .response_authority_tail import authority_tail_proof
@@ -370,7 +374,7 @@ def _model_window(window: dict) -> dict:
     view = copy.deepcopy({key: value for key, value in window.items()
                           if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY,
                                          RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
-                                         RESPONSE_CELL_REFLOW_CONFIG_KEY}})
+                                         RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -559,6 +563,11 @@ def extraction_window_config(config: dict) -> dict:
             frozen[RESPONSE_CELL_REFLOW_CONFIG_KEY] = normalize_response_cell_reflow_config(config[RESPONSE_CELL_REFLOW_CONFIG_KEY])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    if ILLUSTRATION_SOURCE_CONFIG_KEY in config:
+        try:
+            frozen[ILLUSTRATION_SOURCE_CONFIG_KEY] = normalize_illustration_context_scope(config[ILLUSTRATION_SOURCE_CONFIG_KEY])
+        except IllustrationError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -716,6 +725,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_response_letter_source(windows, config[RESPONSE_LETTER_CONFIG_KEY])
     if RESPONSE_CELL_REFLOW_CONFIG_KEY in config:
         _bind_response_cell_reflow_source(windows, documents, config[RESPONSE_CELL_REFLOW_CONFIG_KEY])
+    if ILLUSTRATION_SOURCE_CONFIG_KEY in config:
+        _bind_illustration_context_source(windows, documents, blocks, footer_skips, config[ILLUSTRATION_SOURCE_CONFIG_KEY])
     return windows, ledger
 
 
@@ -856,6 +867,23 @@ def _bind_response_cell_reflow_source(windows, documents, config):
           "RESPONSE_CELL_REFLOW_SOURCE_PAGE_NOT_NATIVE_COMPLETE")
     window[RESPONSE_CELL_REFLOW_CONFIG_KEY] = config
     _response_cell_reflow_target(window, config)
+
+
+def _bind_illustration_context_source(windows, documents, blocks, footer_skips, config):
+    index = next((i for i, item in enumerate(windows) if item["window_id"] == config["window_id"]), 0)
+    matching = [doc for doc in documents if doc["source_id"] == config["source_id"]
+                and doc["sha256"] == config["source_sha256"] and doc.get("format") == "pdf"]
+    _fail(index == 0 or len(matching) != 1, "ILLUSTRATION_CONTEXT_SOURCE_PROOF_MISMATCH")
+    window, predecessor = windows[index], windows[index - 1]
+    _fail(any(key in window for key in (PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY,
+          RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY, RESPONSE_CELL_REFLOW_CONFIG_KEY)),
+          "ILLUSTRATION_CONTEXT_SOURCE_PROOF_MISMATCH")
+    try:
+        proof = build_illustration_context_proof(config, window, predecessor, matching[0], blocks, footer_skips)
+        verify_context_proof(config, proof, window)
+    except (IllustrationError, KeyError, TypeError):
+        raise PlanningError("ILLUSTRATION_CONTEXT_SOURCE_PROOF_MISMATCH") from None
+    window[ILLUSTRATION_SOURCE_CONFIG_KEY] = {"config": config, "proof": proof}
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -2001,6 +2029,58 @@ def _verified_response_cell_reflow_resolution(raw: dict, window: dict) -> dict |
             "authority_tail": reviewed_authority_tail(window, raw)}
 
 
+def _verified_illustration_resolution(raw: dict, window: dict) -> dict | None:
+    binding = window.get(ILLUSTRATION_SOURCE_CONFIG_KEY)
+    if binding is None:
+        return None
+    try:
+        config, proof = binding["config"], binding["proof"]
+        verify_context_proof(config, proof, window)
+    except (IllustrationError, KeyError, TypeError):
+        raise PlanningError("ILLUSTRATION_CONTEXT_SOURCE_PROOF_MISMATCH") from None
+    _fail(not isinstance(raw, dict) or _hash(raw) != config["raw_candidate_sha256"],
+          "ILLUSTRATION_CONTEXT_RAW_RESPONSE_MISMATCH")
+    original_window = {key: value for key, value in window.items() if key != ILLUSTRATION_SOURCE_CONFIG_KEY}
+    try:
+        validate_live_window(raw, original_window)
+    except PlanningError as exc:
+        original_error = {"error_code": exc.code, "diagnostic_context": exc.diagnostic_context}
+    else:
+        raise PlanningError("ILLUSTRATION_CONTEXT_HISTORICAL_FAILURE_MISMATCH")
+    selected = config["candidate_block_ids"]
+    original_context = {"candidate_type": "requirement", "candidate_index": 0, "source_id": config["source_id"],
+                        "block_id": selected[0], "block_ids": selected, "locator": proof["selection"][0]["locator"]}
+    _fail(original_error != {"error_code": "ILLUSTRATION_CONTEXT_NOT_CITABLE", "diagnostic_context": original_context},
+          "ILLUSTRATION_CONTEXT_HISTORICAL_FAILURE_MISMATCH")
+    expected = {"citation": {"block_ids": selected}, "category": "procedure", "response_mode": "procedure",
+                "format_status": "not_prescribed", "format_title": None, "mandatory": False, "confidence": "low",
+                "required_fact_labels": [], "attachment_keywords": [], "reference_keywords": []}
+    _fail(raw["requirements"] != [expected] or raw["format_chapters"] or raw["unresolved_block_ids"] or
+          raw["format_status"] != "none_verified", "ILLUSTRATION_CONTEXT_RAW_SELECTION_MISMATCH")
+    return {"proof": proof, "original_error": original_error, "raw_candidate_sha256": config["raw_candidate_sha256"],
+            "disposition": {"kind": "reviewed_illustration_context_only", "candidate_index": 0,
+                            "candidate": copy.deepcopy(raw["requirements"][0]),
+                            "standalone_requirement": False, "company_evidence": False}}
+
+
+def verify_illustration_predecessor(predecessor_result: dict, resolution: dict) -> None:
+    """Ensure the independent tender obligation survives in its own validated window."""
+    proof = resolution["proof"]
+    prior = proof["predecessor"]
+    _fail(predecessor_result.get("window_id") != prior["window_id"] or predecessor_result.get("status") != "complete",
+          "ILLUSTRATION_CONTEXT_PREDECESSOR_MISMATCH")
+    matches = [row for row in predecessor_result.get("validated", {}).get("requirements", []) if
+               row.get("citation", {}).get("block_ids") == prior["block_ids"]]
+    _fail(len(matches) != 1, "ILLUSTRATION_CONTEXT_PREDECESSOR_MISMATCH")
+    requirement = matches[0]
+    citation = requirement["citation"]
+    _fail(_hash(requirement) != prior["requirement_sha256"] or requirement["category"] != "qualification" or
+          requirement["response_mode"] != "attachment" or not requirement["mandatory"] or not requirement["attachment_keywords"] or
+          citation["source_id"] != proof["source_id"] or citation["quote_sha256"] != prior["quote_sha256"] or
+          citation["locator"] != prior["start_locator"] or citation["end_locator"] != prior["end_locator"],
+          "ILLUSTRATION_CONTEXT_PREDECESSOR_MISMATCH")
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2032,6 +2112,8 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     # This is application normalization from frozen input,
     # not repaired model-reported IDs. Recorded/internal v1-v4 remains strict.
     internal = {key: data[key] for key in ("requirements", "format_chapters", "format_status")}
+    if _verified_illustration_resolution(raw, window) is not None:
+        internal["requirements"] = []
     if cover is not None:
         internal["format_status"] = "specified"
     row_resolution = _verified_scoring_row_resolution(raw, window)
@@ -2109,6 +2191,9 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     cell_reflow = _verified_response_cell_reflow_resolution(raw, window)
     _fail((RESPONSE_CELL_REFLOW_CONFIG_KEY in result) != (cell_reflow is not None) or
           result.get(RESPONSE_CELL_REFLOW_CONFIG_KEY) != cell_reflow, "EXTRACTION_RESPONSE_CELL_REFLOW_RESOLUTION_MISMATCH")
+    illustration = _verified_illustration_resolution(raw, window)
+    _fail((ILLUSTRATION_SOURCE_CONFIG_KEY in result) != (illustration is not None) or
+          result.get(ILLUSTRATION_SOURCE_CONFIG_KEY) != illustration, "EXTRACTION_ILLUSTRATION_CONTEXT_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2277,7 +2362,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
     model_config = {key: value for key, value in window_config.items()
                     if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                    RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
-                                   RESPONSE_CELL_REFLOW_CONFIG_KEY}}
+                                   RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -2379,6 +2464,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
         if cell_reflow is not None:
             supplement[RESPONSE_CELL_REFLOW_CONFIG_KEY] = cell_reflow
             _capture(ctx, "n2-response-cell-reflow-source-resolution", cell_reflow)
+        illustration = _verified_illustration_resolution(raw_model_candidate, window)
+        if illustration is not None:
+            supplement[ILLUSTRATION_SOURCE_CONFIG_KEY] = illustration
+            _capture(ctx, "n2-illustration-source-resolution", illustration)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2591,6 +2680,8 @@ def _merge_results(results: list) -> tuple[list, list]:
     for result_index, result in enumerate(results):
         data = result["validated"]
         local_ids = []
+        if illustration := result.get(ILLUSTRATION_SOURCE_CONFIG_KEY):
+            verify_illustration_predecessor(results[result_index - 1] if result_index else {}, illustration)
         resolution = result.get(PRICE_SCORING_CONFIG_KEY)
         review_table = result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY)
         letter = result.get(RESPONSE_LETTER_CONFIG_KEY)
