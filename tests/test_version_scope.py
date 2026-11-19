@@ -52,6 +52,7 @@ from company_bid.pipeline import build_executor
     ("extraction_failed_scoring_replay.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("price_scoring_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("scoring_row_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
+    ("response_cover_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("source_clauses.py", {"N2", "N3"}),
     ("table_continuations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("material_matching.py", {"N3"}),

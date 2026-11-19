@@ -9,8 +9,9 @@ from contextvars import ContextVar
 
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
-    FAILED_SCORING_REPLAY, FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
-    FailedScoringReplay, FailedScoringRowsReplay,
+    FAILED_RESPONSE_COVER_REPLAY, FAILED_SCORING_REPLAY, FAILED_SCORING_ROWS_REPLAY,
+    RESPONSE_COVER_SOURCE_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
+    FailedResponseCoverReplay, FailedScoringReplay, FailedScoringRowsReplay,
 )
 from .extraction_illustrations import CONFIG_KEY
 from .provider import ProviderFailure
@@ -45,6 +46,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_cell_wrap = None
     _failed_scoring = None
     _failed_scoring_rows = None
+    _failed_response_cover = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -52,6 +54,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_cell_wrap = None
         self._failed_scoring = None
         self._failed_scoring_rows = None
+        self._failed_response_cover = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -65,6 +68,10 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  (FAILED_SCORING_ROWS_REPLAY in self._target_extraction), "FAILED_SCORING_ROWS_CONFIG_INVALID")
         if FAILED_SCORING_ROWS_REPLAY in self._target_extraction:
             self._failed_scoring_rows = FailedScoringRowsReplay(self, ctx)
+        _require((RESPONSE_COVER_SOURCE_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_RESPONSE_COVER_REPLAY in self._target_extraction), "FAILED_RESPONSE_COVER_CONFIG_INVALID")
+        if FAILED_RESPONSE_COVER_REPLAY in self._target_extraction:
+            self._failed_response_cover = FailedResponseCoverReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
             return super().preflight(ctx, value)
 
@@ -97,6 +104,21 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        cover = self._failed_response_cover
+        if cover is not None:
+            cover.verify_history(self)
+            unit_id = binding["unit_id"]
+            if unit_id == cover.unit_id:
+                return cover.read_failure(self, binding, task, full_window)
+            if unit_id in cover.predecessor.prefix:
+                entry = self._read_before_response_cover(binding, task, full_window)
+            else:
+                entry = super()._read_entry(binding, task, full_window)
+            cover.verify_success(self, binding, entry, full_window)
+            return entry
+        return self._read_before_response_cover(binding, task, full_window)
+
+    def _read_before_response_cover(self, binding, task, full_window):
         rows = self._failed_scoring_rows
         if rows is None:
             return self._read_preceding_entry(binding, task, full_window)
@@ -160,7 +182,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_scoring_rows is not None:
+        if self._failed_response_cover is not None:
+            self._failed_response_cover.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_scoring_rows is not None:
             self._failed_scoring_rows.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_scoring is not None:
             self._failed_scoring.allow_candidate(self, ctx, task_type, unit_id)

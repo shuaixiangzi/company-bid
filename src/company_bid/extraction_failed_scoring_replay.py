@@ -1,4 +1,4 @@
-"""Authenticate the stopped N2 prefix before a price-scoring continuation."""
+"""Authenticate stopped N2 prefixes before allowing the next serial request."""
 from __future__ import annotations
 
 import copy
@@ -7,11 +7,13 @@ import re
 
 from .diagnostic_replay import _id, _one, _require
 from .provider import ProviderFailure
+from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY as RESPONSE_COVER_SOURCE_CONFIG_KEY
 from .storage import digest
 
 
 FAILED_SCORING_REPLAY = "failed_scoring_replay"
 FAILED_SCORING_ROWS_REPLAY = "failed_scoring_rows_replay"
+FAILED_RESPONSE_COVER_REPLAY = "failed_response_cover_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -20,6 +22,8 @@ _TASK = "extract_requirements:"
 _ROWS_FAILURE = "TABLE_CONTINUATION_NOT_PROVEN"
 _ROWS_INVALID = "FAILED_SCORING_ROWS_SOURCE_INVALID"
 _ROWS_CONFIG = "FAILED_SCORING_ROWS_CONFIG_INVALID"
+_COVER_INVALID = "FAILED_RESPONSE_COVER_SOURCE_INVALID"
+_COVER_CONFIG = "FAILED_RESPONSE_COVER_CONFIG_INVALID"
 
 
 class FailedScoringReplay:
@@ -48,7 +52,8 @@ class FailedScoringReplay:
         self.source_binding = binding
         self.source_extraction = {key: value for key, value in extraction.items()
                                   if key not in {FAILED_SCORING_REPLAY, PRICE_SCORING_CONFIG_KEY,
-                                                 FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY}}
+                                                 FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
+                                                 FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -65,6 +70,8 @@ class FailedScoringReplay:
         expected_bindings = {_TASK + unit for unit in prefix}
         if rows := getattr(replay, "_failed_scoring_rows", None):
             expected_bindings.add(_TASK + rows.unit_id)
+        if cover := getattr(replay, "_failed_response_cover", None):
+            expected_bindings.update(_TASK + unit for unit in cover.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -229,7 +236,8 @@ class FailedScoringRowsReplay:
                  run.state.get("parent_run_id") == self.predecessor.run.run_id, _ROWS_INVALID)
         historical = run.state["execution_config"]
         source_extraction = {key: value for key, value in replay._target_extraction.items()
-                             if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY}}
+                             if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
+                                            FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -239,7 +247,7 @@ class FailedScoringRowsReplay:
         _require(n1["output_hash"] == digest(replay.current) and
                  n1["output_ref"] == self.predecessor.n1["output_ref"], "SCOPE_MISMATCH")
         current_n1 = [node for node in self.ctx._state.get("nodes", []) if node["key"] == "N1"]
-        if current_n1:
+        if current_n1 and getattr(replay, "_failed_response_cover", None) is None:
             target = _one(current_n1)
             _require(self.ctx._state.get("parent_run_id") == run.run_id and self.ctx._state.get("fork_from_node") == "N2" and
                      target.get("output_ref") == n1["output_ref"] and target.get("output_hash") == n1["output_hash"],
@@ -263,35 +271,9 @@ class FailedScoringRowsReplay:
         self.prefix, self.run, self.n1, self.preflight = prefix, run, n1, preflight
 
     def verify_success(self, replay, binding, entry, full_window):
-        from .extraction import _validate_normalized_window_result
-
         unit_id = binding["unit_id"]
-        node, unit, payload, data, attempt = self.run.unit("N2", unit_id)
-        replay._source_window(self.run, payload, unit_id)
-        origin = entry["origin"]
-        known_origin = _one((row for row in self.preflight["origins"] if row.get("unit_id") == unit_id), _ROWS_INVALID)
-        _require(digest(known_origin) == digest(origin) and
-                 digest(data.get("raw_model_candidate")) == origin["candidate_sha256"] and data.get("status") == "complete" and
-                 data.get("window_id") == unit_id and
-                 digest({**payload, "task_type": "extract_requirements"}) == origin["base_request_sha256"], _ROWS_INVALID)
         window = self.predecessor.window if unit_id == self.predecessor.unit_id else full_window
-        _validate_normalized_window_result(data, window)
-        captures = self.run.captures(node, unit_id, attempt)
-        _require(not any(record["name"].startswith(("request-", "validation-repair-")) for record in captures), _ROWS_INVALID)
-        staged = self.run.capture(captures, "diagnostic-replay-candidate")
-        validated = self.run.capture(captures, "diagnostic-replay-validation")
-        _require(staged == {"diagnostic_only": True, "origin": origin, "candidate": entry["candidate"], "external_call": False} and
-                 validated == {"diagnostic_only": True, "status": "passed", "origin": origin,
-                               "validated_output": data["validated"], "new_external_calls": 0}, _ROWS_INVALID)
-        span = _one((span for span in self.run.spans if span["name"] == "candidate.revalidation" and
-                     span.get("parent_span_id") == attempt["span_id"] and span["trace_id"] == attempt["trace_id"]), _ROWS_INVALID)
-        _require(span["status"] != "ERROR" and span["attributes"].get("input_hash") == origin["base_request_sha256"] and
-                 span["attributes"].get("output_hash") == origin["candidate_sha256"] and
-                 span["links"] == [{"trace_id": call["trace_id"], "span_id": call["span_id"]} for call in origin["calls"]],
-                 "SOURCE_TRACE_MISMATCH")
-        self.prior_checkpoint_hashes[unit_id] = unit["output_hash"]
-        origin.setdefault("lineage_notes", []).append({"historical_successful_replay_run_id": self.run.run_id,
-                                                        "historical_checkpoint_sha256": unit["output_hash"]})
+        self.prior_checkpoint_hashes[unit_id] = _verify_replayed_checkpoint(self, replay, unit_id, entry, window, _ROWS_INVALID)
 
     def read_failure(self, replay, binding, task, full_window):
         from .extraction import (PlanningError, _index, _verified_scoring_row_resolution, _windows,
@@ -349,6 +331,207 @@ class FailedScoringRowsReplay:
                               self.prior_checkpoint_hashes)
 
 
+class FailedResponseCoverReplay:
+    """Authenticate six replayed units and three actual calls in the stopped parent."""
+
+    def __init__(self, replay, ctx):
+        extraction = ctx.execution_config["extraction"]
+        options = extraction[FAILED_RESPONSE_COVER_REPLAY]
+        _require(isinstance(options, dict) and set(options) == {"unit_id", "call_id", "source_state_sha256"} and
+                 isinstance(options["unit_id"], str) and _id(options["call_id"]) and
+                 isinstance(options["source_state_sha256"], str) and
+                 re.fullmatch(r"[0-9a-f]{64}", options["source_state_sha256"]), _COVER_CONFIG)
+        self.predecessor = replay._failed_scoring_rows
+        bindings = replay.config.get("bindings") if isinstance(replay.config, dict) else None
+        self.source_binding = bindings.get(_TASK + options["unit_id"]) if isinstance(bindings, dict) else None
+        provider = ctx.execution_config.get("structured_provider") or ctx.execution_config.get("provider", {})
+        _require(self.predecessor is not None and isinstance(self.source_binding, dict) and
+                 set(self.source_binding) == {"alias", "run_id", "node_key", "unit_id"} and
+                 self.source_binding.get("node_key") == "N2" and self.source_binding.get("unit_id") == options["unit_id"] and
+                 self.source_binding.get("alias") == self.predecessor.source_binding["alias"] and
+                 provider.get("mode") == "diagnostic_mixed" and type(extraction.get("window_concurrency")) is int and
+                 extraction["window_concurrency"] == 1 and type(provider.get("validation_repair_attempts")) is int and
+                 provider["validation_repair_attempts"] == 0 and replay.provider_config.max_attempts == 1, _COVER_CONFIG)
+        self.unit_id = options["unit_id"]
+        self.call_id = options["call_id"]
+        self.state_sha256 = options["source_state_sha256"]
+        self.ctx = ctx
+        self.prefix = ()
+        self.run = None
+        self.window = None
+        self.prior_checkpoint_hashes = {}
+        self.checkpoints_verified = False
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[5] == self.predecessor.unit_id and order[8] == self.unit_id and
+                 all(replay.windows[unit]["blocks"] for unit in order[:9]), _COVER_CONFIG)
+        return order[6:9]
+
+    def verify_history(self, replay):
+        if self.run is not None:
+            return
+        actual = self.actual_units(replay)
+        self.predecessor.verify_history(replay)
+        prefix = self.predecessor.prefix + actual
+        bindings = replay.config["bindings"]
+        _require(prefix == tuple(replay.windows)[:9] and set(bindings) == {_TASK + unit for unit in prefix} and
+                 all(bindings[_TASK + unit] == {**self.source_binding, "unit_id": unit} for unit in actual), _COVER_CONFIG)
+        run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
+        _require(run.mixed_source and run.state.get("status") == "failed" and run.state.get("error_code") == _FAILURE and
+                 hashlib.sha256(run.state_raw).hexdigest() == self.state_sha256 and run.state.get("fork_from_node") == "N2" and
+                 run.state.get("parent_run_id") == self.predecessor.run.run_id, _COVER_INVALID)
+        historical = run.state["execution_config"]
+        source_extraction = {key: value for key, value in replay._target_extraction.items()
+                             if key not in {FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY}}
+        source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
+        source_replay = {**replay.config, "bindings": source_bindings}
+        _require(run.state.get("config_hash") == digest(historical) and
+                 digest(historical.get("extraction", {})) == digest(source_extraction) and
+                 digest(historical.get("diagnostic_replay")) == digest(source_replay), _COVER_INVALID)
+        _, n1 = replay._n1(run)
+        _require(n1["output_hash"] == digest(replay.current) and
+                 n1["output_ref"] == self.predecessor.n1["output_ref"], "SCOPE_MISMATCH")
+        current_n1 = [node for node in self.ctx._state.get("nodes", []) if node["key"] == "N1"]
+        if current_n1:
+            target = _one(current_n1)
+            _require(self.ctx._state.get("parent_run_id") == run.run_id and self.ctx._state.get("fork_from_node") == "N2" and
+                     target.get("output_ref") == n1["output_ref"] and target.get("output_hash") == n1["output_hash"],
+                     "SCOPE_MISMATCH")
+        node = run.node("N2")
+        _require(set(node["units"]) == set(prefix) and all(len(node["units"][unit]["attempts"]) == 1 and
+                 node["units"][unit]["status"] == ("failed" if unit == self.unit_id else "succeeded")
+                 for unit in prefix), _COVER_INVALID)
+        started = [event for event in run.events if event["event"] == "unit.started" and event.get("node_key") == "N2"]
+        calls = [event for event in run.events if event["event"] == "call.started" and event.get("node_key") == "N2"]
+        fees = [row for row in run.state["call_budget"]["reservations"] if row.get("node_key") == "N2"]
+        _require(tuple(event.get("unit_id") for event in started) == prefix and
+                 tuple(event.get("unit_id") for event in calls) == tuple(row.get("unit_id") for row in fees) == actual and
+                 len({event.get("call_id") for event in calls}) == len(actual) and
+                 calls[-1].get("call_id") == self.call_id, _COVER_INVALID)
+        for event, fee in zip(calls, fees, strict=True):
+            _require(event.get("operation") == "extract_requirements" and _id(event.get("call_id")) and
+                     event.get("call_id") == fee.get("call_id") and fee.get("settlement_status") == "known_usage_cost_estimate" and
+                     type(event.get("call_attempt")) is type(fee.get("call_attempt")) is int and
+                     event["call_attempt"] == fee["call_attempt"] == 1, _COVER_INVALID)
+        attempt = _one(node["attempts"], _COVER_INVALID)
+        preflight = run.capture(attempt["captures"], "diagnostic-replay-preflight")
+        _require(preflight.get("binding_count") == preflight.get("verified_binding_count") == len(source_bindings) and
+                 len(preflight.get("origins", [])) == len(source_bindings), _COVER_INVALID)
+        self.prefix, self.run, self.n1, self.preflight = prefix, run, n1, preflight
+
+    def verify_success(self, replay, binding, entry, full_window):
+        from .extraction import _validate_normalized_window_result
+
+        unit_id = binding["unit_id"]
+        if unit_id in self.predecessor.prefix:
+            window = self.enriched_windows().get(unit_id, full_window)
+            output_hash = _verify_replayed_checkpoint(self, replay, unit_id, entry, window, _COVER_INVALID)
+        else:
+            node, unit, _, data, attempt = self.run.unit("N2", unit_id)
+            captures = self.run.captures(node, unit_id, attempt)
+            calls = entry["origin"]["calls"]
+            _require(len(calls) == 1 and calls[0]["run_id"] == self.run.run_id and
+                     [row["name"] for row in captures if row["name"].startswith("request-")] ==
+                     [f"request-{calls[0]['call_id']}-1"] and
+                     not any(row["name"].startswith("validation-repair-") for row in captures), _COVER_INVALID)
+            _validate_normalized_window_result(data, full_window)
+            output_hash = unit["output_hash"]
+            entry["origin"].setdefault("lineage_notes", []).append({"historical_actual_checkpoint_sha256": output_hash})
+        self.prior_checkpoint_hashes[unit_id] = output_hash
+
+    def read_failure(self, replay, binding, task, full_window):
+        from .extraction import (PlanningError, _index, _verified_response_cover_resolution, _windows,
+                                 extraction_window_config, extraction_window_payload, validate_live_window)
+
+        run, unit_id = self.run, binding["unit_id"]
+        unit, call = _read_failed_call(replay, run, self.n1, unit_id, self.call_id, task, _FAILURE, _COVER_INVALID)
+        raw = call["candidate"]
+        context = call["validation"].get("diagnostic_context")
+        try:
+            validate_live_window(copy.deepcopy(raw), full_window)
+        except PlanningError as error:
+            _require(error.code == _FAILURE and error.diagnostic_context == context, _COVER_INVALID)
+        else:
+            _require(False, _COVER_INVALID)
+
+        value = replay.current
+        blocks, _, docs = _index(value["parsed"], value["manifest"])
+        window_config = extraction_window_config(replay._target_extraction)
+        windows, _ = _windows(docs, blocks, window_config, manifest=value["manifest"])
+        _require(tuple(window["window_id"] for window in windows) == tuple(replay.windows) and
+                 [window["window_id"] for window in windows if RESPONSE_COVER_SOURCE_CONFIG_KEY in window] == [unit_id],
+                 "FAILED_RESPONSE_COVER_PROOF_MISMATCH")
+        window = _one(window for window in windows if window["window_id"] == unit_id)
+        _require(digest({key: value for key, value in window.items() if key != RESPONSE_COVER_SOURCE_CONFIG_KEY}) == digest(full_window) and
+                 digest({**extraction_window_payload(window, window_config), "task_type": "extract_requirements"}) == digest(task),
+                 "REQUEST_MISMATCH")
+        try:
+            proof = _verified_response_cover_resolution(copy.deepcopy(raw), window)
+            validate_live_window(copy.deepcopy(raw), window)
+        except Exception as error:
+            raise ProviderFailure("DIAGNOSTIC_REPLAY_VALIDATION_FAILED") from error
+        _require(isinstance(proof, dict) and isinstance(context, dict) and
+                 context.get("field") == "unresolved_block_ids" and len(context.get("block_ids", [])) == 1 and
+                 proof.get("resolved_block_ids") == context["block_ids"] and
+                 proof.get("raw_candidate_sha256") == digest(raw), "FAILED_RESPONSE_COVER_PROOF_MISMATCH")
+        terminal = call["terminal"]
+        self.window = window
+        origin = {"source_alias": run.alias, "run_id": run.run_id, "node_key": "N2", "unit_id": unit_id,
+                  "historical_producer_version": unit["version"], "candidate_sha256": digest(raw),
+                  "base_request_sha256": digest(task), "actual_final_wire_sha256": digest(call["request"]),
+                  "external_call": False, "calls": [{
+                      "source_alias": run.alias, "run_id": run.run_id, "call_id": self.call_id, "call_attempt": 1,
+                      "trace_id": terminal["trace_id"], "span_id": terminal["span_id"],
+                      "request_sha256": digest(call["request"]), "response_sha256": digest(call["response"])}],
+                  "lineage_notes": [{"basis": "authenticated_response_cover_source_resolution",
+                                     "historical_status": "failed", "historical_candidate_modified": False,
+                                     "historical_error_code": _FAILURE, "historical_diagnostic_context": context,
+                                     "source_N1_output_hash": self.n1["output_hash"],
+                                     "source_state_sha256": self.state_sha256, "source_resolution_sha256": digest(proof)}]}
+        return {"candidate": copy.deepcopy(raw), "request_sha256": digest(task), "origin": origin}
+
+    def enriched_windows(self):
+        scoring = self.predecessor.predecessor
+        return {scoring.unit_id: scoring.window, self.predecessor.unit_id: self.predecessor.window,
+                self.unit_id: self.window}
+
+    def allow_candidate(self, replay, ctx, task_type, unit_id):
+        _allow_cold_candidate(self, replay, ctx, task_type, unit_id, self.enriched_windows(), "FAILED_RESPONSE_COVER",
+                              self.prior_checkpoint_hashes, verify_cold_identity=True)
+
+
+def _verify_replayed_checkpoint(gate, replay, unit_id, entry, window, invalid):
+    from .extraction import _validate_normalized_window_result
+
+    run = gate.run
+    node, unit, payload, data, attempt = run.unit("N2", unit_id)
+    replay._source_window(run, payload, unit_id)
+    origin = entry["origin"]
+    known_origin = _one((row for row in gate.preflight["origins"] if row.get("unit_id") == unit_id), invalid)
+    _require(digest(known_origin) == digest(origin) and
+             digest(data.get("raw_model_candidate")) == origin["candidate_sha256"] and data.get("status") == "complete" and
+             data.get("window_id") == unit_id and
+             digest({**payload, "task_type": "extract_requirements"}) == origin["base_request_sha256"], invalid)
+    _validate_normalized_window_result(data, window)
+    captures = run.captures(node, unit_id, attempt)
+    _require(not any(record["name"].startswith(("request-", "validation-repair-")) for record in captures), invalid)
+    staged = run.capture(captures, "diagnostic-replay-candidate")
+    validated = run.capture(captures, "diagnostic-replay-validation")
+    _require(staged == {"diagnostic_only": True, "origin": origin, "candidate": entry["candidate"], "external_call": False} and
+             validated == {"diagnostic_only": True, "status": "passed", "origin": origin,
+                           "validated_output": data["validated"], "new_external_calls": 0}, invalid)
+    span = _one((span for span in run.spans if span["name"] == "candidate.revalidation" and
+                 span.get("parent_span_id") == attempt["span_id"] and span["trace_id"] == attempt["trace_id"]), invalid)
+    _require(span["status"] != "ERROR" and span["attributes"].get("input_hash") == origin["base_request_sha256"] and
+             span["attributes"].get("output_hash") == origin["candidate_sha256"] and
+             span["links"] == [{"trace_id": call["trace_id"], "span_id": call["span_id"]} for call in origin["calls"]],
+             "SOURCE_TRACE_MISMATCH")
+    origin.setdefault("lineage_notes", []).append({"historical_successful_replay_run_id": run.run_id,
+                                                    "historical_checkpoint_sha256": unit["output_hash"]})
+    return unit["output_hash"]
+
+
 def _read_failed_call(replay, run, n1, unit_id, call_id, task, failure, invalid):
     from .extraction_replay_scope import _failed_unit_attempt
 
@@ -369,7 +552,8 @@ def _read_failed_call(replay, run, n1, unit_id, call_id, task, failure, invalid)
     return unit, call
 
 
-def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_windows, error_prefix, prior_hashes=None):
+def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_windows, error_prefix, prior_hashes=None,
+                          *, verify_cold_identity=False):
     _require(replay._ready == (ctx.run_id, ctx.attempt_id, digest(ctx.execution_config)), "PREFLIGHT_REQUIRED")
     if task_type + ":" + unit_id in replay._entries:
         return
@@ -388,6 +572,13 @@ def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_window
         _require(set(prior_hashes) == set(gate.prefix[:-1]) and
                  [row.get("unit_id") for row in reservations] == fresh_preceding and
                  all(type(row.get("call_attempt")) is int and row["call_attempt"] == 1 for row in reservations), required)
+    if verify_cold_identity:
+        _require(len({row.get("call_id") for row in reservations}) == len(reservations), required)
+        for row in reservations:
+            unit = row["unit_id"]
+            attempt = _one((item for item in units[unit].get("attempts", []) if item.get("status") == "succeeded"), required)
+            _require(_id(row.get("call_id")) and row.get("unit_attempt_id") == attempt.get("attempt_id") and
+                     row.get("input_hash") == replay.current_wires[_TASK + unit], required)
     if not gate.checkpoints_verified:
         from .extraction import _validate_normalized_window_result
 
@@ -396,5 +587,7 @@ def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_window
             entry = replay._entries[_TASK + unit]
             _require(digest(checkpoint.get("raw_model_candidate")) == entry["origin"]["candidate_sha256"], required)
             _require(prior_hashes is None or unit not in prior_hashes or digest(checkpoint) == prior_hashes[unit], required)
+            if verify_cold_identity:
+                _require(checkpoint.get("status") == "complete" and checkpoint.get("window_id") == unit, required)
             _validate_normalized_window_result(checkpoint, enriched_windows.get(unit, replay.windows[unit]))
         gate.checkpoints_verified = True

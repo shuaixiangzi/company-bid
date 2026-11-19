@@ -879,6 +879,33 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
         body.sort(key=lambda block: block["ordinal"])
         positions = {block["block_id"]: i for i, block in enumerate(body)}
         source_roles = _format_source_roles(document, body)
+        cover_regions = []
+        for chapter in formats:
+            proof = chapter.get("source_derivation", {})
+            if proof.get("rule") != "native_split_response_cover_v1" or proof.get("source_id") != document["source_id"]:
+                continue
+            member_ids = chapter["content_block_ids"]
+            members = [member for member in proof["members"] if member["role"] != "page_footer"]
+            indices = [positions[key] for key in member_ids if key in positions]
+            start = positions.get(chapter["citation"]["block_id"])
+            if (start is None or len(members) != 8 or proof["source_sha256"] != document["sha256"] or
+                    chapter["source_derivation_sha256"] != proof["proof_sha256"] or
+                    member_ids != [member["block_id"] for member in members] or
+                    indices != list(range(start, start + len(members))) or any(
+                        member["text_sha256"] != hashlib.sha256(body[index]["text"].encode()).hexdigest() or
+                        any(member[key] != body[index][key] for key in ("locator", "unit_id", "bbox", "page", "ordinal"))
+                        for member, index in zip(members, indices, strict=True))):
+                errors.append({"reason": "prescribed_cover_source_incomplete", "block_id": chapter["citation"]["block_id"]})
+                continue
+            role_proof = {"rule": "native_split_response_cover_role_v1", "source_id": proof["source_id"],
+                          "source_sha256": proof["source_sha256"], "members": members,
+                          "source_proof_sha256": proof["proof_sha256"], "role": "prescribed_cover"}
+            for key in member_ids:
+                source_roles[key] = {"source_role": "prescribed_cover", "role_proof": role_proof,
+                                     "role_proof_sha256": _hash(role_proof), "scope_block_ids": []}
+            cover_regions.append((start, start + len(members), "source_proven_prescribed_cover"))
+            for key in set(member_ids[1:]) & set(anchors):
+                errors.append({"reason": "ambiguous_prescribed_cover_source", "block_id": key, "format_id": anchors[key]["format_id"]})
         auxiliary = {key for key, role in source_roles.items()
                      if role["source_role"] != "prescribed_cover"}
         for anchor in set(anchors) & auxiliary:
@@ -890,7 +917,7 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
         def structural_level(block):
             return None if block["block_id"] in continuation_items else _heading_level(block.get("text", ""))
 
-        regions = []
+        regions = list(cover_regions)
         for i, block in enumerate(body):
             text = block.get("text", "").strip()
             if (block["kind"] == "paragraph" and _heading_level(text) == 0 and

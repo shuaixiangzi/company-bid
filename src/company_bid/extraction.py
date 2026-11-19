@@ -25,6 +25,7 @@ from .extraction_illustrations import (
 )
 from .source_clauses import build_clause_catalog
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
+from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY, build_response_cover_proof, normalize_response_cover_config
 from .scoring_row_sources import (
     SCORING_ROW_SOURCE_CONFIG_KEY, build_scoring_row_source_proof, normalize_scoring_row_source_config, resolve_scoring_row_selectors,
 )
@@ -354,7 +355,7 @@ def _model_reference_packet(packet: dict) -> dict:
 
 def _model_window(window: dict) -> dict:
     view = copy.deepcopy({key: value for key, value in window.items()
-                          if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY}})
+                          if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -523,6 +524,11 @@ def extraction_window_config(config: dict) -> dict:
             frozen[SCORING_ROW_SOURCE_CONFIG_KEY] = normalize_scoring_row_source_config(config[SCORING_ROW_SOURCE_CONFIG_KEY])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    if RESPONSE_COVER_CONFIG_KEY in config:
+        try:
+            frozen[RESPONSE_COVER_CONFIG_KEY] = normalize_response_cover_config(config[RESPONSE_COVER_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -672,6 +678,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_price_scoring_source(windows, documents, blocks, footer_skips, config[PRICE_SCORING_CONFIG_KEY])
     if SCORING_ROW_SOURCE_CONFIG_KEY in config:
         _bind_scoring_row_source(windows, blocks, footer_skips, config[SCORING_ROW_SOURCE_CONFIG_KEY])
+    if RESPONSE_COVER_CONFIG_KEY in config:
+        _bind_response_cover_source(windows, documents, blocks, footer_skips, config[RESPONSE_COVER_CONFIG_KEY])
     return windows, ledger
 
 
@@ -719,6 +727,34 @@ def _bind_scoring_row_source(windows, blocks, footer_skips, config):
                "footer_proof": copy.deepcopy(footer_skips.get(native[-2]["block_id"]))}
     owner[SCORING_ROW_SOURCE_CONFIG_KEY] = context
     _scoring_row_proof(owner)
+
+
+def _bind_response_cover_source(windows, documents, blocks, footer_skips, config):
+    config = extraction_window_config({RESPONSE_COVER_CONFIG_KEY: config})[RESPONSE_COVER_CONFIG_KEY]
+    document = next((item for item in documents if item["source_id"] == config["source_id"]), {})
+    page = config["physical_page"]
+    cover_units = [unit for unit in document.get("units", []) if unit.get("page") == page]
+    _fail(document.get("format") != "pdf" or document.get("sha256") != config["source_sha256"] or
+          len(cover_units) != 1, "RESPONSE_COVER_SOURCE_DOCUMENT_MISMATCH")
+    coverage = cover_units[0].get("coverage", {})
+    _fail(coverage.get("status") != "read" or coverage.get("origin") != "native" or
+          any(coverage.get(key) for key in ("unread_objects", "unmapped_glyphs", "error_code", "ignored_objects")),
+          "RESPONSE_COVER_SOURCE_PAGE_NOT_NATIVE_COMPLETE")
+    native = [block for block in blocks.values() if block["source_id"] == config["source_id"] and block.get("page") == page]
+    tender = [block for block in blocks.values() if block["source_id"] == config["source_id"] and block.get("page") == 1 and
+              block["locator"] in {f"pdf/page[1]/line[{index}]" for index in range(4)}]
+    _fail(len(native) != 9, "RESPONSE_COVER_SOURCE_PAGE_NOT_NATIVE_COMPLETE")
+    indexes = {window["window_id"]: index for index, window in enumerate(windows)}
+    index = indexes.get(config["window_id"])
+    _fail(index is None or indexes.get(config["continuation_owner_window_id"]) != index + 1,
+          "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
+    owner, continuation = windows[index:index + 2]
+    _fail([block["block_id"] for block in owner["blocks"][-2:]] != [block["block_id"] for block in native[:2]] or
+          [block["block_id"] for block in continuation["blocks"] if block.get("page") == page] !=
+          [block["block_id"] for block in native[2:]], "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
+    owner[RESPONSE_COVER_CONFIG_KEY] = {"config": config, "native_blocks": copy.deepcopy(native),
+        "tender_blocks": copy.deepcopy(tender), "footer_proof": copy.deepcopy(footer_skips.get(native[-1]["block_id"]))}
+    _response_cover_proof(owner)
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -1288,7 +1324,7 @@ def _window_source_catalogs(window: dict):
     return targets, available, safe_skips, clause_catalog, table_continuations, table_rows
 
 
-def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=()) -> dict:
+def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=(), response_cover=None) -> dict:
     data = _validate_response_schema(raw, _WindowResponse)
     targets, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
     table_rows.extend(reviewed_scoring_rows)
@@ -1351,7 +1387,8 @@ def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=()) -> di
           any(r["format_status"] == "not_prescribed" and r["response_mode"] == "writing" for r in data["requirements"]),
           "FORMAT_UNREAD_CANNOT_BECOME_FREE_WRITING")
     _fail(bool(data["format_chapters"]) and data["format_status"] == "none_verified", "FORMAT_STATUS_CONFLICT")
-    _fail(data["format_status"] == "specified" and not data["format_chapters"], "FORMAT_STATUS_WITHOUT_CHAPTER")
+    _fail(data["format_status"] == "specified" and not data["format_chapters"] and response_cover is None,
+          "FORMAT_STATUS_WITHOUT_CHAPTER")
     return data
 
 
@@ -1539,6 +1576,56 @@ def _verified_scoring_row_resolution(raw: dict, window: dict) -> dict | None:
     return resolution
 
 
+def _response_cover_proof(window: dict) -> tuple[dict, dict]:
+    context = window[RESPONSE_COVER_CONFIG_KEY]
+    _fail(not isinstance(context, dict) or set(context) != {"config", "native_blocks", "tender_blocks", "footer_proof"},
+          "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
+    try:
+        config = normalize_response_cover_config(context["config"])
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    _fail(window.get("source_format") != "pdf" or any(window.get(key) != config[key]
+          for key in ("source_id", "source_sha256", "window_id")), "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
+    native = context["native_blocks"]
+    proof = build_response_cover_proof(config, native, context["tender_blocks"], context["footer_proof"])
+    _fail(proof is None or proof["proof_sha256"] != config["source_proof_sha256"], "RESPONSE_COVER_SOURCE_PROOF_MISMATCH")
+    targets = {block["block_id"]: block for block in window["blocks"]}
+    adjacent = {block["block_id"]: block for block in window.get("adjacent_context", [])}
+    _fail(any(view.get(block["block_id"]) != {key: value for key, value in block.items() if key not in {"bbox", "image_ref"}}
+              for view, members in ((targets, native[:2]), (adjacent, native[2:-1])) for block in members) or
+          any(block["block_id"] in targets for block in native[2:]), "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
+    return config, proof
+
+
+def _verified_response_cover_resolution(raw: dict, window: dict) -> dict | None:
+    if RESPONSE_COVER_CONFIG_KEY not in window:
+        return None
+    config, proof = _response_cover_proof(window)
+    native = window[RESPONSE_COVER_CONFIG_KEY]["native_blocks"]
+    anchor = native[0]
+    first_line = native[1]["block_id"]
+    _fail(not isinstance(raw, dict) or raw.get("window_id") != config["window_id"] or
+          _hash(raw) != config["raw_candidate_sha256"] or raw.get("unresolved_block_ids") != [first_line] or
+          raw.get("format_status") != "unread" or raw.get("format_chapters") != [], "RESPONSE_COVER_SOURCE_RAW_RESPONSE_MISMATCH")
+    preceding = {block["block_id"] for block in [*window["blocks"], *window.get("adjacent_context", [])]
+                 if block.get("page", config["physical_page"]) < config["physical_page"]}
+    _fail(any(not set(item["citation"]["block_ids"]) <= preceding for item in raw["requirements"]),
+          "RESPONSE_COVER_SOURCE_REQUIREMENT_SCOPE_MISMATCH")
+    citation = _citation({key: anchor[key] for key in ("source_id", "block_id", "locator")}, {anchor["block_id"]: anchor})
+    chapter = {"title": anchor["text"], "level": 1, "status": "prescribed", "citation": citation,
+               "content_block_ids": proof["content_block_ids"], "requirement_indices": [],
+               "source_derivation": proof, "source_derivation_sha256": proof["proof_sha256"]}
+    title_block = native[4]
+    title_id = title_block["block_id"]
+    alternate = _citation(_validate_response_schema({key: title_block[key] for key in ("source_id", "block_id", "locator")} |
+                          {"block_ids": [title_id]}, _Citation), {title_id: title_block})
+    return {"proof": proof, "raw_candidate_sha256": config["raw_candidate_sha256"], "resolved_block_ids": [first_line],
+            "continuation_owner_window_id": config["continuation_owner_window_id"], "format_chapter": chapter,
+            "original_title_citation": alternate,
+            "original_format_status": "unread", "format_scope": "independent_prescribed_cover_only",
+            "model_candidate_mutation": False}
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -1562,11 +1649,16 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     processing = _window_processing_ledger(window, unresolved)
     critical = [row["block_id"] for row in processing["blocks"] if row["status"] == "supplied" and row["self_reported_unresolved"]]
     resolution = _verified_price_scoring_resolution(raw, window)
-    if critical and (resolution is None or critical != resolution["resolved_block_ids"]):
+    cover = _verified_response_cover_resolution(raw, window)
+    _fail(resolution is not None and cover is not None, "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
+    resolved = resolution or cover
+    if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
     # not repaired model-reported IDs. Recorded/internal v1-v4 remains strict.
     internal = {key: data[key] for key in ("requirements", "format_chapters", "format_status")}
+    if cover is not None:
+        internal["format_status"] = "specified"
     row_resolution = _verified_scoring_row_resolution(raw, window)
     reviewed_rows = []
     if row_resolution is not None:
@@ -1578,7 +1670,7 @@ def validate_live_window(raw: dict, window: dict) -> dict:
         if requirement["response_mode"] != "writing":
             requirement["reference_keywords"] = []
     internal["reviewed_block_ids"] = [block["block_id"] for block in window["blocks"]]
-    return _validate_window(internal, window, reviewed_scoring_rows=reviewed_rows)
+    return _validate_window(internal, window, reviewed_scoring_rows=reviewed_rows, response_cover=cover)
 
 
 def _validate_normalized_window_result(result: dict, window: dict) -> dict:
@@ -1614,6 +1706,9 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     rows = _verified_scoring_row_resolution(raw, window)
     _fail((SCORING_ROW_SOURCE_CONFIG_KEY in result) != (rows is not None) or result.get(SCORING_ROW_SOURCE_CONFIG_KEY) != rows,
           "EXTRACTION_SCORING_ROW_RESOLUTION_MISMATCH")
+    cover = _verified_response_cover_resolution(raw, window)
+    _fail((RESPONSE_COVER_CONFIG_KEY in result) != (cover is not None) or result.get(RESPONSE_COVER_CONFIG_KEY) != cover,
+          "EXTRACTION_RESPONSE_COVER_RESOLUTION_MISMATCH")
     return validated
 
 
@@ -1702,12 +1797,15 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                   deferred["locator"] != block["locator"], "DEFERRED_CONTEXT_OWNER_SOURCE_MISMATCH", **context,
                   expected_source_id=block["source_id"], actual_source_id=deferred["source_id"])
             owner_result = by_result[owner["window_id"]]
-            guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"],
+            cover = owner_result.get(RESPONSE_COVER_CONFIG_KEY)
+            source_resolved = cover is not None and deferred["block_id"] in cover["resolved_block_ids"]
+            guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
                   "DEFERRED_CONTEXT_OWNER_TARGET_UNRESOLVED", **context)
             items.append({"block_id": block["block_id"], "source_id": block["source_id"], "locator": block["locator"],
                           "source_sha256": by_window[owner["window_id"]]["source_sha256"],
                           "deferred_from_window_id": identity, "owner_window_id": owner["window_id"],
-                          "resolution": "owner_target_structurally_processed", "semantic_review": "requires_source_review"})
+                          "resolution": "owner_target_source_proven_cover" if source_resolved else "owner_target_structurally_processed",
+                          "semantic_review": "requires_source_review"})
     return {"schema_version": "deferred-context-closure-v1", "status": "structurally_closed",
             "basis": "all_frozen_target_windows_processed_v1", "semantic_review": "requires_source_review",
             "target_window_count": len(windows), "completed_target_window_count": len(results), "items": items}
@@ -1774,7 +1872,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
             any(packet.get("illustration_source_uses") for packet in window.get("reference_context", {}).get("packets", []))):
         instructions += _ILLUSTRATION_INSTRUCTIONS
     model_config = {key: value for key, value in window_config.items()
-                    if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY}}
+                    if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -1848,8 +1946,9 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
             # fields so the same check works with either caller convention.
             candidate = _wire_candidate(candidate)
         row_resolution = _verified_scoring_row_resolution(raw_model_candidate, window)
+        cover = _verified_response_cover_resolution(raw_model_candidate, window)
         reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
-        validated = _validate_window(candidate, window, reviewed_scoring_rows=reviewed_rows)
+        validated = _validate_window(candidate, window, reviewed_scoring_rows=reviewed_rows, response_cover=cover)
         resolution = _verified_price_scoring_resolution(raw_model_candidate, window)
         supplement = {PRICE_SCORING_CONFIG_KEY: resolution} if resolution is not None else {}
         if resolution is not None:
@@ -1857,6 +1956,9 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
         if row_resolution is not None:
             supplement[SCORING_ROW_SOURCE_CONFIG_KEY] = row_resolution
             _capture(ctx, "n2-scoring-row-source-resolution", row_resolution)
+        if cover is not None:
+            supplement[RESPONSE_COVER_CONFIG_KEY] = cover
+            _capture(ctx, "n2-response-cover-source-resolution", cover)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2028,7 +2130,8 @@ def _repair_numbered_procedure_spans(windows: list[dict], results: list[dict]) -
             citation["block_ids"] = list(ids)
         row_resolution = result.get(SCORING_ROW_SOURCE_CONFIG_KEY)
         reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
-        expanded = _validate_window(wire, window, reviewed_scoring_rows=reviewed_rows)
+        expanded = _validate_window(wire, window, reviewed_scoring_rows=reviewed_rows,
+                                    response_cover=result.get(RESPONSE_COVER_CONFIG_KEY))
         projected.append({**result, "validated": expanded})
         for index, (ids, left, right, number) in replacements.items():
             def evidence(requirement):
@@ -2055,6 +2158,7 @@ def _repair_numbered_procedure_spans(windows: list[dict], results: list[dict]) -
 
 def _merge_results(results: list) -> tuple[list, list]:
     requirements, formats, by_key = [], [], {}
+    source_covers = {}
     for result in results:
         data = result["validated"]
         local_ids = []
@@ -2076,8 +2180,21 @@ def _merge_results(results: list) -> tuple[list, list]:
                 requirement["window_ids"].append(result["window_id"])
             local_ids.append(requirement["requirement_id"])
         for chapter in data["format_chapters"]:
-            formats.append({**chapter, "format_id": _id("FMT-", [chapter["title"], chapter["citation"]]),
-                            "requirement_refs": list(dict.fromkeys(local_ids[i] for i in chapter["requirement_indices"]))})
+            refs = list(dict.fromkeys(local_ids[i] for i in chapter["requirement_indices"]))
+            source_cover = source_covers.get(result["window_id"])
+            if source_cover is not None:
+                cover, source_chapter = source_cover
+                if (chapter["status"] == "prescribed" and chapter["citation"] == cover["original_title_citation"] and
+                        chapter["title"] == cover["original_title_citation"]["quote"] and
+                        set(chapter["content_block_ids"]) <= set(source_chapter["content_block_ids"])):
+                    source_chapter["requirement_refs"] = list(dict.fromkeys([*source_chapter["requirement_refs"], *refs]))
+                    continue
+            formats.append({**chapter, "format_id": _id("FMT-", [chapter["title"], chapter["citation"]]), "requirement_refs": refs})
+        if cover := result.get(RESPONSE_COVER_CONFIG_KEY):
+            chapter = cover["format_chapter"]
+            source_chapter = {**chapter, "format_id": _id("FMT-", [chapter["title"], chapter["citation"]]), "requirement_refs": []}
+            source_covers[cover["continuation_owner_window_id"]] = (cover, source_chapter)
+            formats.append(source_chapter)
     return requirements, formats
 
 

@@ -59,6 +59,18 @@ def test_scoring_row_review_requires_both_the_source_and_prior_prefix(tmp_path, 
     assert not (tmp_path / "runtime").exists()
 
 
+@pytest.mark.parametrize("missing", ["response_cover_source_resolution", "failed_response_cover_replay",
+                                    "scoring_row_source_resolution", "failed_scoring_rows_replay"])
+def test_cover_review_requires_history_and_source(tmp_path, missing):
+    options = {"response_cover_source_resolution": {}, "failed_response_cover_replay": {},
+               "scoring_row_source_resolution": {}, "failed_scoring_rows_replay": {},
+               "failed_scoring_replay": {}, "price_scoring_source_resolution": {}, "failed_cell_wrap_replay": {}}
+    del options[missing]
+    with pytest.raises(PipelineFailure, match="FAILED_RESPONSE_COVER_CONFIG_INVALID"):
+        build_executor(tmp_path / "runtime", {**config(), "extraction": options})
+    assert not (tmp_path / "runtime").exists()
+
+
 @pytest.mark.parametrize("change", ["missing_purpose", "ordinary_purpose", "missing_mapping", "mixed_mapping", "mixed_writer"])
 def test_mixed_mode_cannot_accidentally_apply_to_writing_or_inherited_mapping(tmp_path, change):
     settings = config()
