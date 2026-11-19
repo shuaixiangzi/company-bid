@@ -26,6 +26,9 @@ from .extraction_illustrations import (
 from .source_clauses import build_clause_catalog
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
 from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY, build_response_cover_proof, normalize_response_cover_config
+from .response_letter_sources import (
+    RESPONSE_LETTER_CONFIG_KEY, build_response_letter_proof, normalize_response_letter_config,
+)
 from .response_review_table_sources import (
     RESPONSE_REVIEW_TABLE_CONFIG_KEY, build_response_review_table_proof, normalize_response_review_table_config,
     response_review_native_blocks,
@@ -361,7 +364,7 @@ def _model_reference_packet(packet: dict) -> dict:
 def _model_window(window: dict) -> dict:
     view = copy.deepcopy({key: value for key, value in window.items()
                           if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY,
-                                         RESPONSE_REVIEW_TABLE_CONFIG_KEY}})
+                                         RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -540,6 +543,11 @@ def extraction_window_config(config: dict) -> dict:
             frozen[RESPONSE_REVIEW_TABLE_CONFIG_KEY] = normalize_response_review_table_config(config[RESPONSE_REVIEW_TABLE_CONFIG_KEY])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    if RESPONSE_LETTER_CONFIG_KEY in config:
+        try:
+            frozen[RESPONSE_LETTER_CONFIG_KEY] = normalize_response_letter_config(config[RESPONSE_LETTER_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -693,6 +701,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_response_cover_source(windows, documents, blocks, footer_skips, config[RESPONSE_COVER_CONFIG_KEY])
     if RESPONSE_REVIEW_TABLE_CONFIG_KEY in config:
         _bind_response_review_table_source(windows, documents, blocks, footer_skips, config[RESPONSE_REVIEW_TABLE_CONFIG_KEY])
+    if RESPONSE_LETTER_CONFIG_KEY in config:
+        _bind_response_letter_source(windows, config[RESPONSE_LETTER_CONFIG_KEY])
     return windows, ledger
 
 
@@ -801,6 +811,18 @@ def _bind_response_review_table_source(windows, documents, blocks, footer_skips,
         "footer_proofs": {block["block_id"]: copy.deepcopy(footer_skips[block["block_id"]]) for block in native
                           if block["block_id"] in footer_skips}}
     _response_review_table_proof(owner)
+
+
+def _bind_response_letter_source(windows, config):
+    owners = {window["window_id"]: index for index, window in enumerate(windows)}
+    index = owners.get(config["window_id"])
+    owner_index = owners.get(config["owner_window_id"])
+    _fail(index is None or owner_index is None or owner_index + 1 != index or
+          RESPONSE_REVIEW_TABLE_CONFIG_KEY not in windows[owner_index], "RESPONSE_LETTER_WINDOW_SCOPE_MISMATCH")
+    window = windows[index]
+    window[RESPONSE_LETTER_CONFIG_KEY] = {
+        "config": config, "owner_context": copy.deepcopy(windows[owner_index][RESPONSE_REVIEW_TABLE_CONFIG_KEY])}
+    _response_letter_proof(window)
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -1374,7 +1396,7 @@ def _window_source_catalogs(window: dict):
 
 
 def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=(), response_cover=None,
-                     response_review_table=None) -> dict:
+                     response_review_table=None, response_letter=None) -> dict:
     data = _validate_response_schema(raw, _WindowResponse)
     targets, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
     table_rows.extend(reviewed_scoring_rows)
@@ -1426,7 +1448,11 @@ def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=(), respo
             chapter["citation"] = _citation(chapter["citation"], available, safe_skips, table_continuations=reviewed_continuation)
             anchor_ids = chapter["citation"]["block_ids"] or [chapter["citation"]["block_id"]]
             _fail(any(available[key].get("illustration_source_use") for key in anchor_ids), "ILLUSTRATION_FORMAT_NOT_ALLOWED")
-            if chapter["title"] not in chapter["citation"]["quote"]:
+            proven_letter_tail = (response_letter is not None and index == response_letter["format_index"] and
+                                  chapter["title"] == response_letter["title"] and chapter["level"] == 2 and
+                                  chapter["status"] == "prescribed" and chapter["requirement_indices"] == [0] and
+                                  anchor_ids == chapter["content_block_ids"] == response_letter["proof"]["selected_block_ids"])
+            if chapter["title"] not in chapter["citation"]["quote"] and not proven_letter_tail:
                 raise PlanningError("FORMAT_HEADING_NOT_GROUNDED", {"field": "title"})
             ids = chapter["content_block_ids"]
             _fail(len(set(ids)) != len(ids) or any(key not in targets for key in ids), "FORMAT_CONTENT_REFERENCE_INVALID")
@@ -1751,6 +1777,63 @@ def _verified_response_review_table_resolution(raw: dict, window: dict) -> dict 
             "model_candidate_mutation": False}
 
 
+def _response_letter_proof(window):
+    context = window[RESPONSE_LETTER_CONFIG_KEY]
+    _fail(not isinstance(context, dict) or set(context) != {"config", "owner_context"},
+          "RESPONSE_LETTER_WINDOW_SCOPE_MISMATCH")
+    owner = context["owner_context"]
+    _fail(not isinstance(owner, dict) or set(owner) != {"config", "native_blocks", "footer_proofs"},
+          "RESPONSE_LETTER_WINDOW_SCOPE_MISMATCH")
+    try:
+        config = normalize_response_letter_config(context["config"])
+        owner_config = normalize_response_review_table_config(owner["config"])
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    _fail(window.get("source_format") != "pdf" or any(window.get(key) != config[key]
+          for key in ("source_id", "source_sha256", "window_id")) or
+          owner_config["window_id"] != config["owner_window_id"] or
+          owner_config["letter_continuation_owner_window_id"] != window["window_id"],
+          "RESPONSE_LETTER_WINDOW_SCOPE_MISMATCH")
+    native = owner["native_blocks"]
+    review = build_response_review_table_proof(owner_config, native, owner["footer_proofs"])
+    _fail(review is None or review["proof_sha256"] != owner_config["source_proof_sha256"],
+          "RESPONSE_LETTER_OWNER_PROOF_MISMATCH")
+    proof = build_response_letter_proof(config, review)
+    _fail(proof is None or proof["proof_sha256"] != config["source_proof_sha256"],
+          "RESPONSE_LETTER_SOURCE_PROOF_MISMATCH")
+    expected = native[30:38]
+    _fail(window["blocks"][:len(expected)] != [
+        {key: value for key, value in block.items() if key not in {"bbox", "image_ref"}} for block in expected],
+        "RESPONSE_LETTER_WINDOW_SCOPE_MISMATCH")
+    skip_id = proof["letter_footer"]["block_id"]
+    _fail(owner["footer_proofs"][skip_id] != next((skip for skip in window["safe_skip_blocks"]
+          if skip["block_id"] == skip_id), None), "RESPONSE_LETTER_WINDOW_FOOTER_MISMATCH")
+    return config, proof, native[18]["text"]
+
+
+def _verified_response_letter_resolution(raw: dict, window: dict) -> dict | None:
+    """Authenticate the continuation title while retaining the original selectors."""
+    if RESPONSE_LETTER_CONFIG_KEY not in window:
+        return None
+    config, proof, title = _response_letter_proof(window)
+    _fail(not isinstance(raw, dict) or raw.get("window_id") != config["window_id"] or
+          _hash(raw) != config["raw_candidate_sha256"] or raw.get("unresolved_block_ids") != [] or
+          raw.get("format_status") != "specified" or not isinstance(raw.get("requirements"), list) or
+          len(raw["requirements"]) != 7 or not isinstance(raw.get("format_chapters"), list) or
+          len(raw["format_chapters"]) != 4, "RESPONSE_LETTER_RAW_RESPONSE_MISMATCH")
+    selected = proof["selected_block_ids"]
+    citation = {"block_ids": selected}
+    chapter = {"title": title, "level": 2, "status": "prescribed", "citation": citation,
+               "content_block_ids": selected, "requirement_indices": [0]}
+    first = raw["requirements"][0]
+    _fail(raw["format_chapters"][0] != chapter or not isinstance(first, dict) or first.get("citation") != citation or
+          first.get("format_title") != title or first.get("format_status") != "prescribed" or
+          first.get("category") != "commercial" or first.get("response_mode") != "fixed_text",
+          "RESPONSE_LETTER_RAW_SELECTION_MISMATCH")
+    return {"format_index": 0, "title": title, "owner_window_id": config["owner_window_id"], "proof": proof,
+            "raw_candidate_sha256": config["raw_candidate_sha256"], "model_candidate_mutation": False}
+
+
 def _response_review_table_merge_projection(validated, window, resolution):
     if resolution is None:
         return None
@@ -1826,6 +1909,7 @@ def validate_live_window(raw: dict, window: dict) -> dict:
             requirement = internal["requirements"][change["requirement_index"]]
             requirement.update(citation=copy.deepcopy(change["citation"]), category=change["category"])
     review_table = _verified_response_review_table_resolution(raw, window)
+    letter = _verified_response_letter_resolution(raw, window)
     if review_table is not None:
         for change in review_table["row_changes"]:
             internal["requirements"][change["requirement_index"]]["citation"] = copy.deepcopy(change["citation"])
@@ -1840,7 +1924,7 @@ def validate_live_window(raw: dict, window: dict) -> dict:
             requirement["reference_keywords"] = []
     internal["reviewed_block_ids"] = [block["block_id"] for block in window["blocks"]]
     validated = _validate_window(internal, window, reviewed_scoring_rows=reviewed_rows, response_cover=cover,
-                                 response_review_table=review_table)
+                                 response_review_table=review_table, response_letter=letter)
     _response_review_table_merge_projection(validated, window, review_table)
     return validated
 
@@ -1884,6 +1968,9 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     review_table = _verified_response_review_table_resolution(raw, window)
     _fail((RESPONSE_REVIEW_TABLE_CONFIG_KEY in result) != (review_table is not None) or
           result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY) != review_table, "EXTRACTION_RESPONSE_REVIEW_TABLE_RESOLUTION_MISMATCH")
+    letter = _verified_response_letter_resolution(raw, window)
+    _fail((RESPONSE_LETTER_CONFIG_KEY in result) != (letter is not None) or
+          result.get(RESPONSE_LETTER_CONFIG_KEY) != letter, "EXTRACTION_RESPONSE_LETTER_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2051,7 +2138,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
         instructions += _ILLUSTRATION_INSTRUCTIONS
     model_config = {key: value for key, value in window_config.items()
                     if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
-                                   RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY}}
+                                   RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -2127,9 +2214,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
         row_resolution = _verified_scoring_row_resolution(raw_model_candidate, window)
         cover = _verified_response_cover_resolution(raw_model_candidate, window)
         review_table = _verified_response_review_table_resolution(raw_model_candidate, window)
+        letter = _verified_response_letter_resolution(raw_model_candidate, window)
         reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
         validated = _validate_window(candidate, window, reviewed_scoring_rows=reviewed_rows, response_cover=cover,
-                                     response_review_table=review_table)
+                                     response_review_table=review_table, response_letter=letter)
         resolution = _verified_price_scoring_resolution(raw_model_candidate, window)
         supplement = {PRICE_SCORING_CONFIG_KEY: resolution} if resolution is not None else {}
         if resolution is not None:
@@ -2144,6 +2232,9 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
             supplement[RESPONSE_REVIEW_TABLE_CONFIG_KEY] = review_table
             supplement[_RESPONSE_REVIEW_MERGE_PROJECTION] = _response_review_table_merge_projection(validated, window, review_table)
             _capture(ctx, "n2-response-review-table-source-resolution", review_table)
+        if letter is not None:
+            supplement[RESPONSE_LETTER_CONFIG_KEY] = letter
+            _capture(ctx, "n2-response-letter-source-resolution", letter)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2317,7 +2408,8 @@ def _repair_numbered_procedure_spans(windows: list[dict], results: list[dict]) -
         reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
         expanded = _validate_window(wire, window, reviewed_scoring_rows=reviewed_rows,
                                     response_cover=result.get(RESPONSE_COVER_CONFIG_KEY),
-                                    response_review_table=result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY))
+                                    response_review_table=result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY),
+                                    response_letter=result.get(RESPONSE_LETTER_CONFIG_KEY))
         projected.append({**result, "validated": expanded})
         for index, (ids, left, right, number) in replacements.items():
             def evidence(requirement):
@@ -2344,12 +2436,13 @@ def _repair_numbered_procedure_spans(windows: list[dict], results: list[dict]) -
 
 def _merge_results(results: list) -> tuple[list, list]:
     requirements, formats, by_key = [], [], {}
-    source_covers = {}
+    source_covers, source_letters = {}, {}
     for result in results:
         data = result["validated"]
         local_ids = []
         resolution = result.get(PRICE_SCORING_CONFIG_KEY)
         review_table = result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY)
+        letter = result.get(RESPONSE_LETTER_CONFIG_KEY)
         if review_table is not None:
             _fail(_RESPONSE_REVIEW_MERGE_PROJECTION not in result, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
             data = result[_RESPONSE_REVIEW_MERGE_PROJECTION]["validated"]
@@ -2371,6 +2464,20 @@ def _merge_results(results: list) -> tuple[list, list]:
             local_ids.append(requirement["requirement_id"])
         for index, chapter in enumerate(data["format_chapters"]):
             refs = list(dict.fromkeys(local_ids[i] for i in chapter["requirement_indices"]))
+            if letter is not None and index == letter["format_index"]:
+                owner = source_letters.get((result["window_id"], letter["owner_window_id"]))
+                proof = letter["proof"]
+                _fail(owner is None or owner["title"] != letter["title"] or
+                      owner["citation"]["block_id"] != proof["heading_block_id"] or
+                      owner["source_derivation_sha256"] != proof["owner_source_proof_sha256"] or
+                      owner["content_block_ids"] != proof["owner_block_ids"] or
+                      chapter["content_block_ids"] != proof["selected_block_ids"] or
+                      owner["citation"]["block_ids"] != proof["owner_block_ids"] + proof["selected_block_ids"],
+                      "RESPONSE_LETTER_OWNER_CHECKPOINT_MISMATCH")
+                owner["content_block_ids"] = [*owner["content_block_ids"], *chapter["content_block_ids"]]
+                owner["requirement_refs"] = list(dict.fromkeys([*owner["requirement_refs"], *refs]))
+                owner["source_continuation_derivation"] = proof
+                continue
             source_cover = source_covers.get(result["window_id"])
             if source_cover is not None:
                 cover, source_chapter = source_cover
@@ -2383,7 +2490,10 @@ def _merge_results(results: list) -> tuple[list, list]:
                 _fail(index == review_table["cover"]["format_index"], "RESPONSE_REVIEW_TABLE_COVER_CHECKPOINT_MISMATCH")
                 proof = review_table["proof"]
                 chapter = {**chapter, "source_derivation": proof, "source_derivation_sha256": proof["proof_sha256"]}
-            formats.append({**chapter, "format_id": _id("FMT-", [chapter["title"], chapter["citation"]]), "requirement_refs": refs})
+            merged = {**chapter, "format_id": _id("FMT-", [chapter["title"], chapter["citation"]]), "requirement_refs": refs}
+            formats.append(merged)
+            if review_table is not None and chapter["content_block_ids"] == review_table["letter"]["target_block_ids"]:
+                source_letters[(review_table["letter"]["continuation_owner_window_id"], result["window_id"])] = merged
         if cover := result.get(RESPONSE_COVER_CONFIG_KEY):
             chapter = cover["format_chapter"]
             source_chapter = {**chapter, "format_id": _id("FMT-", [chapter["title"], chapter["citation"]]), "requirement_refs": []}

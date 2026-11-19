@@ -16,6 +16,8 @@ FAILED_SCORING_ROWS_REPLAY = "failed_scoring_rows_replay"
 FAILED_RESPONSE_COVER_REPLAY = "failed_response_cover_replay"
 FAILED_RESPONSE_REVIEW_TABLE_REPLAY = "failed_response_review_table_replay"
 RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY = "response_review_table_source_resolution"
+FAILED_RESPONSE_LETTER_REPLAY = "failed_response_letter_replay"
+RESPONSE_LETTER_SOURCE_CONFIG_KEY = "response_letter_source_resolution"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -27,6 +29,7 @@ _ROWS_CONFIG = "FAILED_SCORING_ROWS_CONFIG_INVALID"
 _COVER_INVALID = "FAILED_RESPONSE_COVER_SOURCE_INVALID"
 _COVER_CONFIG = "FAILED_RESPONSE_COVER_CONFIG_INVALID"
 _REVIEW_TABLE_KEYS = {FAILED_RESPONSE_REVIEW_TABLE_REPLAY, RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY}
+_LETTER_KEYS = {FAILED_RESPONSE_LETTER_REPLAY, RESPONSE_LETTER_SOURCE_CONFIG_KEY}
 
 
 class FailedScoringReplay:
@@ -57,7 +60,7 @@ class FailedScoringReplay:
                                   if key not in {FAILED_SCORING_REPLAY, PRICE_SCORING_CONFIG_KEY,
                                                  FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                                  FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
-                                                 *_REVIEW_TABLE_KEYS}}
+                                                 *_REVIEW_TABLE_KEYS, *_LETTER_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -78,6 +81,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in cover.actual_units(replay))
         if table := getattr(replay, "_failed_response_review_table", None):
             expected_bindings.update(_TASK + unit for unit in table.actual_units(replay))
+        if letter := getattr(replay, "_failed_response_letter", None):
+            expected_bindings.update(_TASK + unit for unit in letter.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -244,7 +249,7 @@ class FailedScoringRowsReplay:
         source_extraction = {key: value for key, value in replay._target_extraction.items()
                              if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                             FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
-                                            *_REVIEW_TABLE_KEYS}}
+                                            *_REVIEW_TABLE_KEYS, *_LETTER_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -380,7 +385,13 @@ class _StoppedResponseReplay:
         prefix = self.predecessor.prefix + actual
         bindings = replay.config["bindings"]
         successor = self.successor_gate(replay)
-        declared = prefix + (successor.actual_units(replay) if successor is not None else ())
+        declared = prefix
+        later_keys = set()
+        later = successor
+        while later is not None:
+            declared += later.actual_units(replay)
+            later_keys.update((later.replay_key, later.proof_key))
+            later = later.successor_gate(replay)
         _require(prefix == tuple(replay.windows)[:len(prefix)] and set(bindings) == {_TASK + unit for unit in declared} and
                  all(bindings[_TASK + unit] == {**self.source_binding, "unit_id": unit} for unit in actual), self.config_error)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -389,7 +400,6 @@ class _StoppedResponseReplay:
                  hashlib.sha256(run.state_raw).hexdigest() == self.state_sha256 and run.state.get("fork_from_node") == "N2" and
                  run.state.get("parent_run_id") == self.predecessor.run.run_id, self.source_error)
         historical = run.state["execution_config"]
-        later_keys = {successor.replay_key, successor.proof_key} if successor is not None else set()
         source_extraction = {key: value for key, value in replay._target_extraction.items()
                              if key not in {self.replay_key, self.proof_key, *later_keys}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
@@ -563,6 +573,10 @@ class FailedResponseReviewTableReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_response_cover
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_response_letter", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(len(order) == 59 and order[8] == self.predecessor.unit_id and order[9] == self.unit_id and
@@ -581,6 +595,49 @@ class FailedResponseReviewTableReplay(_StoppedResponseReplay):
                  type(context.get("candidate_index")) is int and
                  context["candidate_index"] == proof.get("whole_form_requirement_index") and
                  isinstance(selection, dict) and selection.get("content_block_ids") == context.get("block_ids"),
+                 self.proof_error)
+
+    def predecessor_windows(self):
+        return self.predecessor.enriched_windows()
+
+
+class FailedResponseLetterReplay(_StoppedResponseReplay):
+    """Authenticate the unchanged ten-window prefix and W11's first response."""
+
+    replay_key = FAILED_RESPONSE_LETTER_REPLAY
+    proof_key = RESPONSE_LETTER_SOURCE_CONFIG_KEY
+    config_error = "FAILED_RESPONSE_LETTER_CONFIG_INVALID"
+    source_error = "FAILED_RESPONSE_LETTER_SOURCE_INVALID"
+    proof_error = "FAILED_RESPONSE_LETTER_PROOF_MISMATCH"
+    cold_error = "FAILED_RESPONSE_LETTER"
+    historical_failure = "FORMAT_HEADING_NOT_GROUNDED"
+    lineage_basis = "authenticated_response_letter_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_response_review_table
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[9] == self.predecessor.unit_id and order[10] == self.unit_id and
+                 replay.windows[self.unit_id]["blocks"], self.config_error)
+        return (self.unit_id,)
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_response_letter_resolution
+
+        return _verified_response_letter_resolution(raw, window)
+
+    def check_proof_context(self, proof, context):
+        selection = proof.get("proof")
+        selected = selection.get("selected_block_ids") if isinstance(selection, dict) else None
+        _require(isinstance(context, dict) and context.get("candidate_type") == "format_chapter" and
+                 context.get("field") == "title" and type(context.get("candidate_index")) is int and
+                 type(proof.get("format_index")) is int and context["candidate_index"] == proof["format_index"] and
+                 proof.get("owner_window_id") == self.predecessor.unit_id and
+                 isinstance(selected, list) and bool(selected) and selected == context.get("block_ids") and
+                 selected[0] == context.get("block_id"),
                  self.proof_error)
 
     def predecessor_windows(self):

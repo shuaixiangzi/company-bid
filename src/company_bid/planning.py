@@ -16,6 +16,7 @@ from .models import (PreparedBid, SourceRef, SourceContextProof, RequirementSour
 from .slots import has_fill_marker, whole_cell_slot
 from .source_clauses import build_clause_catalog
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY
+from .response_letter_sources import build_response_letter_proof
 from .response_review_table_sources import (
     RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_REVIEW_TABLE_RULE, build_response_review_table_proof,
     response_review_native_blocks,
@@ -901,8 +902,17 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                     continue
                 form_ids = proof["content_block_ids"]
                 letter_ids = [member["block_id"] for member in proof["letter_members"]]
+                owned_letter_ids = letter_ids[:12]
+                continuation = chapter.get("source_continuation_derivation")
+                if continuation is not None:
+                    rebuilt_letter = build_response_letter_proof(continuation, rebuilt_reviews[page])
+                    if (anchor != letter_ids[0] or rebuilt_letter != continuation or
+                            continuation["heading_block_id"] != anchor):
+                        errors.append({"reason": "reviewed_letter_continuation_mismatch", "block_id": anchor})
+                        continue
+                    owned_letter_ids = letter_ids
                 scopes = {form_ids[0]: (form_ids, form_ids, letter_ids[0]),
-                          letter_ids[0]: (letter_ids, letter_ids[:12], proof["following_heading"]["block_id"])}
+                          letter_ids[0]: (letter_ids, owned_letter_ids, proof["following_heading"]["block_id"])}
                 scope = scopes.get(anchor)
                 if (scope is None or chapter["status"] != "prescribed" or chapter["content_block_ids"] != scope[1] or
                         chapter["citation"]["block_ids"] != scope[0] or not set([*scope[0], scope[2]]) <= positions.keys() or
@@ -1361,7 +1371,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     def assemble():
         planned_formats, format_ledger, format_errors = _format_plan(extracted, blocks, documents)
         source_format_derivations = [{"format_id": f["format_id"], "source_proof": f["source_derivation"],
-            "source_proof_sha256": f["source_derivation_sha256"], "requirement_refs": f["requirement_refs"]}
+            "source_proof_sha256": f["source_derivation_sha256"], "requirement_refs": f["requirement_refs"],
+            **({"source_continuation": f["source_continuation_derivation"]} if "source_continuation_derivation" in f else {})}
             for f in planned_formats if f.get("source_derivation")]
         _capture(ctx, "n3-source-format-derivations", {"items": source_format_derivations,
             "n2_candidate_mutation": False, "n2_formats_sha256": _hash(extracted["format_chapters"])})
