@@ -109,7 +109,9 @@ def test_operator_links_land_on_the_exact_issue_action_and_source(tmp_path, monk
         xml = ET.fromstring(archive.read("word/document.xml"))
     paragraphs = xml.findall("./w:body/w:p", ns)
     visible = lambda p: "".join(t.text or "" for t in p.findall(".//w:t", ns))
-    links = {visible(link): link.get(w + "anchor") for p in paragraphs for link in p.findall("w:hyperlink", ns)}
+    local_links = [link for p in paragraphs for link in p.findall("w:hyperlink", ns)]
+    assert all(link.get(w + "history") == "1" for link in local_links)
+    links = {visible(link): link.get(w + "anchor") for link in local_links}
     anchors = {start.get(w + "name"): visible(p) for p in paragraphs for start in p.findall("w:bookmarkStart", ns)}
     assert visible(paragraphs[0]) == "经办摘要"
     assert len(anchors) == len(links) == (3 if mode == "task_list" else 2)

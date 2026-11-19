@@ -450,6 +450,8 @@ def _summary_link(paragraph, label, number, style):
     from .rendering import _font
     link = OxmlElement("w:hyperlink")
     link.set(qn("w:anchor"), f"bid_review_{number}")
+    # WPS also uses the explicit history flag when importing a local bookmark.
+    link.set(qn("w:history"), "1")
     run = _font(paragraph.add_run(label), name=style.font_family, size=style.body_pt)
     run.underline = True
     link.append(run._r)
@@ -457,7 +459,7 @@ def _summary_link(paragraph, label, number, style):
 
 
 def _summary_link_ranges(targets):
-    """Only abbreviate a run of three or more consecutive printed numbers of the same kind."""
+    """Group consecutive displayed numbers that refer to the same kind of entry."""
     groups = []
     previous = None
     for kind, key, label in targets:
