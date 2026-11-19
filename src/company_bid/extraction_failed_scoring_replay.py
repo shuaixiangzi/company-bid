@@ -14,6 +14,8 @@ from .storage import digest
 FAILED_SCORING_REPLAY = "failed_scoring_replay"
 FAILED_SCORING_ROWS_REPLAY = "failed_scoring_rows_replay"
 FAILED_RESPONSE_COVER_REPLAY = "failed_response_cover_replay"
+FAILED_RESPONSE_REVIEW_TABLE_REPLAY = "failed_response_review_table_replay"
+RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY = "response_review_table_source_resolution"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -24,6 +26,7 @@ _ROWS_INVALID = "FAILED_SCORING_ROWS_SOURCE_INVALID"
 _ROWS_CONFIG = "FAILED_SCORING_ROWS_CONFIG_INVALID"
 _COVER_INVALID = "FAILED_RESPONSE_COVER_SOURCE_INVALID"
 _COVER_CONFIG = "FAILED_RESPONSE_COVER_CONFIG_INVALID"
+_REVIEW_TABLE_KEYS = {FAILED_RESPONSE_REVIEW_TABLE_REPLAY, RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY}
 
 
 class FailedScoringReplay:
@@ -53,7 +56,8 @@ class FailedScoringReplay:
         self.source_extraction = {key: value for key, value in extraction.items()
                                   if key not in {FAILED_SCORING_REPLAY, PRICE_SCORING_CONFIG_KEY,
                                                  FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
-                                                 FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY}}
+                                                 FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
+                                                 *_REVIEW_TABLE_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -72,6 +76,8 @@ class FailedScoringReplay:
             expected_bindings.add(_TASK + rows.unit_id)
         if cover := getattr(replay, "_failed_response_cover", None):
             expected_bindings.update(_TASK + unit for unit in cover.actual_units(replay))
+        if table := getattr(replay, "_failed_response_review_table", None):
+            expected_bindings.update(_TASK + unit for unit in table.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -237,7 +243,8 @@ class FailedScoringRowsReplay:
         historical = run.state["execution_config"]
         source_extraction = {key: value for key, value in replay._target_extraction.items()
                              if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
-                                            FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY}}
+                                            FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
+                                            *_REVIEW_TABLE_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -331,17 +338,16 @@ class FailedScoringRowsReplay:
                               self.prior_checkpoint_hashes)
 
 
-class FailedResponseCoverReplay:
-    """Authenticate six replayed units and three actual calls in the stopped parent."""
-
+class _StoppedResponseReplay:
+    """Authenticate an immutable failed parent and its ordered N2 prefix."""
     def __init__(self, replay, ctx):
         extraction = ctx.execution_config["extraction"]
-        options = extraction[FAILED_RESPONSE_COVER_REPLAY]
+        options = extraction[self.replay_key]
         _require(isinstance(options, dict) and set(options) == {"unit_id", "call_id", "source_state_sha256"} and
                  isinstance(options["unit_id"], str) and _id(options["call_id"]) and
                  isinstance(options["source_state_sha256"], str) and
-                 re.fullmatch(r"[0-9a-f]{64}", options["source_state_sha256"]), _COVER_CONFIG)
-        self.predecessor = replay._failed_scoring_rows
+                 re.fullmatch(r"[0-9a-f]{64}", options["source_state_sha256"]), self.config_error)
+        self.predecessor = self.previous_gate(replay)
         bindings = replay.config.get("bindings") if isinstance(replay.config, dict) else None
         self.source_binding = bindings.get(_TASK + options["unit_id"]) if isinstance(bindings, dict) else None
         provider = ctx.execution_config.get("structured_provider") or ctx.execution_config.get("provider", {})
@@ -351,7 +357,7 @@ class FailedResponseCoverReplay:
                  self.source_binding.get("alias") == self.predecessor.source_binding["alias"] and
                  provider.get("mode") == "diagnostic_mixed" and type(extraction.get("window_concurrency")) is int and
                  extraction["window_concurrency"] == 1 and type(provider.get("validation_repair_attempts")) is int and
-                 provider["validation_repair_attempts"] == 0 and replay.provider_config.max_attempts == 1, _COVER_CONFIG)
+                 provider["validation_repair_attempts"] == 0 and replay.provider_config.max_attempts == 1, self.config_error)
         self.unit_id = options["unit_id"]
         self.call_id = options["call_id"]
         self.state_sha256 = options["source_state_sha256"]
@@ -362,11 +368,9 @@ class FailedResponseCoverReplay:
         self.prior_checkpoint_hashes = {}
         self.checkpoints_verified = False
 
-    def actual_units(self, replay):
-        order = tuple(replay.windows)
-        _require(len(order) == 59 and order[5] == self.predecessor.unit_id and order[8] == self.unit_id and
-                 all(replay.windows[unit]["blocks"] for unit in order[:9]), _COVER_CONFIG)
-        return order[6:9]
+    @staticmethod
+    def successor_gate(replay):
+        return None
 
     def verify_history(self, replay):
         if self.run is not None:
@@ -375,25 +379,29 @@ class FailedResponseCoverReplay:
         self.predecessor.verify_history(replay)
         prefix = self.predecessor.prefix + actual
         bindings = replay.config["bindings"]
-        _require(prefix == tuple(replay.windows)[:9] and set(bindings) == {_TASK + unit for unit in prefix} and
-                 all(bindings[_TASK + unit] == {**self.source_binding, "unit_id": unit} for unit in actual), _COVER_CONFIG)
+        successor = self.successor_gate(replay)
+        declared = prefix + (successor.actual_units(replay) if successor is not None else ())
+        _require(prefix == tuple(replay.windows)[:len(prefix)] and set(bindings) == {_TASK + unit for unit in declared} and
+                 all(bindings[_TASK + unit] == {**self.source_binding, "unit_id": unit} for unit in actual), self.config_error)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
-        _require(run.mixed_source and run.state.get("status") == "failed" and run.state.get("error_code") == _FAILURE and
+        _require(run.mixed_source and run.state.get("status") == "failed" and
+                 run.state.get("error_code") == self.historical_failure and
                  hashlib.sha256(run.state_raw).hexdigest() == self.state_sha256 and run.state.get("fork_from_node") == "N2" and
-                 run.state.get("parent_run_id") == self.predecessor.run.run_id, _COVER_INVALID)
+                 run.state.get("parent_run_id") == self.predecessor.run.run_id, self.source_error)
         historical = run.state["execution_config"]
+        later_keys = {successor.replay_key, successor.proof_key} if successor is not None else set()
         source_extraction = {key: value for key, value in replay._target_extraction.items()
-                             if key not in {FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY}}
+                             if key not in {self.replay_key, self.proof_key, *later_keys}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
                  digest(historical.get("extraction", {})) == digest(source_extraction) and
-                 digest(historical.get("diagnostic_replay")) == digest(source_replay), _COVER_INVALID)
+                 digest(historical.get("diagnostic_replay")) == digest(source_replay), self.source_error)
         _, n1 = replay._n1(run)
         _require(n1["output_hash"] == digest(replay.current) and
                  n1["output_ref"] == self.predecessor.n1["output_ref"], "SCOPE_MISMATCH")
         current_n1 = [node for node in self.ctx._state.get("nodes", []) if node["key"] == "N1"]
-        if current_n1:
+        if current_n1 and successor is None:
             target = _one(current_n1)
             _require(self.ctx._state.get("parent_run_id") == run.run_id and self.ctx._state.get("fork_from_node") == "N2" and
                      target.get("output_ref") == n1["output_ref"] and target.get("output_hash") == n1["output_hash"],
@@ -401,23 +409,23 @@ class FailedResponseCoverReplay:
         node = run.node("N2")
         _require(set(node["units"]) == set(prefix) and all(len(node["units"][unit]["attempts"]) == 1 and
                  node["units"][unit]["status"] == ("failed" if unit == self.unit_id else "succeeded")
-                 for unit in prefix), _COVER_INVALID)
+                 for unit in prefix), self.source_error)
         started = [event for event in run.events if event["event"] == "unit.started" and event.get("node_key") == "N2"]
         calls = [event for event in run.events if event["event"] == "call.started" and event.get("node_key") == "N2"]
         fees = [row for row in run.state["call_budget"]["reservations"] if row.get("node_key") == "N2"]
         _require(tuple(event.get("unit_id") for event in started) == prefix and
                  tuple(event.get("unit_id") for event in calls) == tuple(row.get("unit_id") for row in fees) == actual and
                  len({event.get("call_id") for event in calls}) == len(actual) and
-                 calls[-1].get("call_id") == self.call_id, _COVER_INVALID)
+                 calls[-1].get("call_id") == self.call_id, self.source_error)
         for event, fee in zip(calls, fees, strict=True):
             _require(event.get("operation") == "extract_requirements" and _id(event.get("call_id")) and
                      event.get("call_id") == fee.get("call_id") and fee.get("settlement_status") == "known_usage_cost_estimate" and
                      type(event.get("call_attempt")) is type(fee.get("call_attempt")) is int and
-                     event["call_attempt"] == fee["call_attempt"] == 1, _COVER_INVALID)
-        attempt = _one(node["attempts"], _COVER_INVALID)
+                     event["call_attempt"] == fee["call_attempt"] == 1, self.source_error)
+        attempt = _one(node["attempts"], self.source_error)
         preflight = run.capture(attempt["captures"], "diagnostic-replay-preflight")
         _require(preflight.get("binding_count") == preflight.get("verified_binding_count") == len(source_bindings) and
-                 len(preflight.get("origins", [])) == len(source_bindings), _COVER_INVALID)
+                 len(preflight.get("origins", [])) == len(source_bindings), self.source_error)
         self.prefix, self.run, self.n1, self.preflight = prefix, run, n1, preflight
 
     def verify_success(self, replay, binding, entry, full_window):
@@ -425,8 +433,8 @@ class FailedResponseCoverReplay:
 
         unit_id = binding["unit_id"]
         if unit_id in self.predecessor.prefix:
-            window = self.enriched_windows().get(unit_id, full_window)
-            output_hash = _verify_replayed_checkpoint(self, replay, unit_id, entry, window, _COVER_INVALID)
+            window = self.predecessor_windows().get(unit_id, full_window)
+            output_hash = _verify_replayed_checkpoint(self, replay, unit_id, entry, window, self.source_error)
         else:
             node, unit, _, data, attempt = self.run.unit("N2", unit_id)
             captures = self.run.captures(node, unit_id, attempt)
@@ -434,47 +442,45 @@ class FailedResponseCoverReplay:
             _require(len(calls) == 1 and calls[0]["run_id"] == self.run.run_id and
                      [row["name"] for row in captures if row["name"].startswith("request-")] ==
                      [f"request-{calls[0]['call_id']}-1"] and
-                     not any(row["name"].startswith("validation-repair-") for row in captures), _COVER_INVALID)
+                     not any(row["name"].startswith("validation-repair-") for row in captures), self.source_error)
             _validate_normalized_window_result(data, full_window)
             output_hash = unit["output_hash"]
             entry["origin"].setdefault("lineage_notes", []).append({"historical_actual_checkpoint_sha256": output_hash})
         self.prior_checkpoint_hashes[unit_id] = output_hash
 
     def read_failure(self, replay, binding, task, full_window):
-        from .extraction import (PlanningError, _index, _verified_response_cover_resolution, _windows,
-                                 extraction_window_config, extraction_window_payload, validate_live_window)
+        from .extraction import (PlanningError, _index, _windows, extraction_window_config,
+                                 extraction_window_payload, validate_live_window)
 
         run, unit_id = self.run, binding["unit_id"]
-        unit, call = _read_failed_call(replay, run, self.n1, unit_id, self.call_id, task, _FAILURE, _COVER_INVALID)
+        unit, call = _read_failed_call(replay, run, self.n1, unit_id, self.call_id, task,
+                                       self.historical_failure, self.source_error)
         raw = call["candidate"]
         context = call["validation"].get("diagnostic_context")
         try:
             validate_live_window(copy.deepcopy(raw), full_window)
         except PlanningError as error:
-            _require(error.code == _FAILURE and error.diagnostic_context == context, _COVER_INVALID)
+            _require(error.code == self.historical_failure and error.diagnostic_context == context, self.source_error)
         else:
-            _require(False, _COVER_INVALID)
+            _require(False, self.source_error)
 
         value = replay.current
         blocks, _, docs = _index(value["parsed"], value["manifest"])
         window_config = extraction_window_config(replay._target_extraction)
         windows, _ = _windows(docs, blocks, window_config, manifest=value["manifest"])
         _require(tuple(window["window_id"] for window in windows) == tuple(replay.windows) and
-                 [window["window_id"] for window in windows if RESPONSE_COVER_SOURCE_CONFIG_KEY in window] == [unit_id],
-                 "FAILED_RESPONSE_COVER_PROOF_MISMATCH")
+                 [window["window_id"] for window in windows if self.proof_key in window] == [unit_id], self.proof_error)
         window = _one(window for window in windows if window["window_id"] == unit_id)
-        _require(digest({key: value for key, value in window.items() if key != RESPONSE_COVER_SOURCE_CONFIG_KEY}) == digest(full_window) and
+        _require(digest({key: value for key, value in window.items() if key != self.proof_key}) == digest(full_window) and
                  digest({**extraction_window_payload(window, window_config), "task_type": "extract_requirements"}) == digest(task),
                  "REQUEST_MISMATCH")
         try:
-            proof = _verified_response_cover_resolution(copy.deepcopy(raw), window)
+            proof = self.verified_proof(copy.deepcopy(raw), window)
             validate_live_window(copy.deepcopy(raw), window)
         except Exception as error:
             raise ProviderFailure("DIAGNOSTIC_REPLAY_VALIDATION_FAILED") from error
-        _require(isinstance(proof, dict) and isinstance(context, dict) and
-                 context.get("field") == "unresolved_block_ids" and len(context.get("block_ids", [])) == 1 and
-                 proof.get("resolved_block_ids") == context["block_ids"] and
-                 proof.get("raw_candidate_sha256") == digest(raw), "FAILED_RESPONSE_COVER_PROOF_MISMATCH")
+        _require(isinstance(proof, dict) and proof.get("raw_candidate_sha256") == digest(raw), self.proof_error)
+        self.check_proof_context(proof, context)
         terminal = call["terminal"]
         self.window = window
         origin = {"source_alias": run.alias, "run_id": run.run_id, "node_key": "N2", "unit_id": unit_id,
@@ -484,21 +490,101 @@ class FailedResponseCoverReplay:
                       "source_alias": run.alias, "run_id": run.run_id, "call_id": self.call_id, "call_attempt": 1,
                       "trace_id": terminal["trace_id"], "span_id": terminal["span_id"],
                       "request_sha256": digest(call["request"]), "response_sha256": digest(call["response"])}],
-                  "lineage_notes": [{"basis": "authenticated_response_cover_source_resolution",
+                  "lineage_notes": [{"basis": self.lineage_basis,
                                      "historical_status": "failed", "historical_candidate_modified": False,
-                                     "historical_error_code": _FAILURE, "historical_diagnostic_context": context,
+                                     "historical_error_code": self.historical_failure, "historical_diagnostic_context": context,
                                      "source_N1_output_hash": self.n1["output_hash"],
                                      "source_state_sha256": self.state_sha256, "source_resolution_sha256": digest(proof)}]}
         return {"candidate": copy.deepcopy(raw), "request_sha256": digest(task), "origin": origin}
 
     def enriched_windows(self):
-        scoring = self.predecessor.predecessor
-        return {scoring.unit_id: scoring.window, self.predecessor.unit_id: self.predecessor.window,
-                self.unit_id: self.window}
+        return {**self.predecessor_windows(), self.unit_id: self.window}
 
     def allow_candidate(self, replay, ctx, task_type, unit_id):
-        _allow_cold_candidate(self, replay, ctx, task_type, unit_id, self.enriched_windows(), "FAILED_RESPONSE_COVER",
+        _allow_cold_candidate(self, replay, ctx, task_type, unit_id, self.enriched_windows(), self.cold_error,
                               self.prior_checkpoint_hashes, verify_cold_identity=True)
+
+
+class FailedResponseCoverReplay(_StoppedResponseReplay):
+    """Authenticate six replayed units and three actual calls in the stopped parent."""
+
+    replay_key = FAILED_RESPONSE_COVER_REPLAY
+    proof_key = RESPONSE_COVER_SOURCE_CONFIG_KEY
+    config_error = _COVER_CONFIG
+    source_error = _COVER_INVALID
+    proof_error = "FAILED_RESPONSE_COVER_PROOF_MISMATCH"
+    cold_error = "FAILED_RESPONSE_COVER"
+    historical_failure = _FAILURE
+    lineage_basis = "authenticated_response_cover_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_scoring_rows
+
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_response_review_table", None)
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[5] == self.predecessor.unit_id and order[8] == self.unit_id and
+                 all(replay.windows[unit]["blocks"] for unit in order[:9]), _COVER_CONFIG)
+        return order[6:9]
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_response_cover_resolution
+
+        return _verified_response_cover_resolution(raw, window)
+
+    def check_proof_context(self, proof, context):
+        _require(isinstance(context, dict) and context.get("field") == "unresolved_block_ids" and
+                 len(context.get("block_ids", [])) == 1 and
+                 proof.get("resolved_block_ids") == context["block_ids"], self.proof_error)
+
+    def predecessor_windows(self):
+        scoring = self.predecessor.predecessor
+        return {scoring.unit_id: scoring.window, self.predecessor.unit_id: self.predecessor.window}
+
+
+class FailedResponseReviewTableReplay(_StoppedResponseReplay):
+    """Authenticate nine unchanged checkpoints and the first review-table response."""
+
+    replay_key = FAILED_RESPONSE_REVIEW_TABLE_REPLAY
+    proof_key = RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY
+    config_error = "FAILED_RESPONSE_REVIEW_TABLE_CONFIG_INVALID"
+    source_error = "FAILED_RESPONSE_REVIEW_TABLE_SOURCE_INVALID"
+    proof_error = "FAILED_RESPONSE_REVIEW_TABLE_PROOF_MISMATCH"
+    cold_error = "FAILED_RESPONSE_REVIEW_TABLE"
+    historical_failure = _ROWS_FAILURE
+    lineage_basis = "authenticated_response_review_table_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_response_cover
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[8] == self.predecessor.unit_id and order[9] == self.unit_id and
+                 replay.windows[self.unit_id]["blocks"], self.config_error)
+        return (self.unit_id,)
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_response_review_table_resolution
+
+        return _verified_response_review_table_resolution(raw, window)
+
+    def check_proof_context(self, proof, context):
+        selection = proof.get("proof")
+        _require(isinstance(context, dict) and context.get("candidate_type") == "requirement" and
+                 type(context.get("candidate_index")) is int and
+                 context["candidate_index"] == proof.get("whole_form_requirement_index") and
+                 isinstance(selection, dict) and selection.get("content_block_ids") == context.get("block_ids"),
+                 self.proof_error)
+
+    def predecessor_windows(self):
+        return self.predecessor.enriched_windows()
 
 
 def _verify_replayed_checkpoint(gate, replay, unit_id, entry, window, invalid):

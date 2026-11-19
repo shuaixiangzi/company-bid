@@ -5,6 +5,18 @@ import pytest
 from company_bid.pipeline import build_executor
 
 
+@pytest.mark.parametrize("keys", [
+    ("response_review_table_source_resolution",),
+    ("failed_response_review_table_replay",),
+    ("response_review_table_source_resolution", "failed_response_review_table_replay"),
+])
+def test_review_table_recovery_requires_source_proof_and_prior_cover_replay(tmp_path, keys):
+    from company_bid.pipeline import PipelineFailure
+
+    with pytest.raises(PipelineFailure, match="FAILED_RESPONSE_REVIEW_TABLE_CONFIG_INVALID"):
+        build_executor(tmp_path, {"pipeline": "automatic", "extraction": {key: {} for key in keys}})
+
+
 @pytest.mark.parametrize("changed_file, affected", [
     ("unit_concurrency.py", {"N0", "N1", "N2", "N3", "N4", "N5", "N6"}),
     ("writing_prompt.py", {"N4"}),
@@ -53,6 +65,7 @@ from company_bid.pipeline import build_executor
     ("price_scoring_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("scoring_row_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("response_cover_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
+    ("response_review_table_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("source_clauses.py", {"N2", "N3"}),
     ("table_continuations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("material_matching.py", {"N3"}),

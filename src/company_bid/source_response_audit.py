@@ -12,6 +12,7 @@ import re
 from collections import Counter, defaultdict
 
 from .extraction import _index, _pdf_footer_skips, _raw_grid
+from .response_review_table_sources import RESPONSE_REVIEW_TABLE_TITLE, build_response_review_table_proof, response_review_native_blocks
 from .storage import digest
 from .table_continuations import build_table_continuations, build_table_row_catalog
 
@@ -43,7 +44,7 @@ def _pieces(block):
     return result
 
 
-def _scope(source, quote, blocks, documents, row_catalog, footers):
+def _scope(source, quote, blocks, documents, row_catalog, footers, reviewed_rows=None):
     """Rebind the frozen N3 scope to actual N1 text, with no fuzzy matches."""
     locator = source["locator"]
     first_locator = locator.split(";", 1)[0]
@@ -77,7 +78,12 @@ def _scope(source, quote, blocks, documents, row_catalog, footers):
     tag = "selected_row_view_chars" if row_view else "chars"
     a, b = map(int, _one(r"(?:^|;\s*)" + tag + r"\[(\d+):(\d+)\](?=;|$)", locator))
     if row_view:
-        matches = [row for row in row_catalog if row["source_id"] == first["source_id"] and
+        catalog = row_catalog
+        if re.search(r"(?:^|;\s*)reviewed_row_proof_sha256=", locator):
+            proof_hash = _one(r"(?:^|;\s*)reviewed_row_proof_sha256=([a-f0-9]{64})(?=;|$)", locator)
+            selected = (reviewed_rows or {}).get(proof_hash)
+            catalog = [selected] if selected is not None else []
+        matches = [row for row in catalog if row["source_id"] == first["source_id"] and
                    row["block_ids"] == ids and row["quote"] == quote]
         if basis != "frozen_table_rows_tsv_v1" or len(matches) != 1 or a != 0 or b != len(quote):
             raise ValueError("SOURCE_AUDIT_ROW_SCOPE_INVALID")
@@ -168,6 +174,21 @@ def build_source_response_audit(parsed: dict, manifest: dict, package: dict) -> 
     sources = {s["source_id"]: s for s in package["sources"]}
     if len(sources) != len(package["sources"]):
         raise ValueError("SOURCE_AUDIT_DUPLICATE_SOURCE")
+    reviewed_rows = {}
+    if any("; reviewed_row_proof_sha256=" in (item.get("locator") or "") for item in sources.values()):
+        for document in documents:
+            if document.get("format") != "pdf":
+                continue
+            for heading in blocks.values():
+                if (heading["source_id"] != document["source_id"] or heading["text"] != RESPONSE_REVIEW_TABLE_TITLE or
+                        type(page := heading.get("page")) is not int or page < 2):
+                    continue
+                native = response_review_native_blocks(blocks.values(), document["source_id"], page)
+                proof = build_response_review_table_proof({"source_id": document["source_id"], "source_sha256": document["sha256"],
+                                                          "physical_page": page}, native, footers)
+                if proof is not None:
+                    reviewed_rows.update((row["proof_sha256"], row)
+                                         for row in [*proof["independent_requirement_rows"], proof["rows"][-1]])
     mapped, context_mapped = defaultdict(list), defaultdict(list)
     requirement_rows = []
     for requirement in package["requirements"]:
@@ -179,7 +200,7 @@ def build_source_response_audit(parsed: dict, manifest: dict, package: dict) -> 
             source = sources.get(ref)
             if source is None or source["kind"] != "tender":
                 raise ValueError("SOURCE_AUDIT_SOURCE_INVALID")
-            for key, row, column, start, end in _scope(source, quote, blocks, documents, row_catalog, footers):
+            for key, row, column, start, end in _scope(source, quote, blocks, documents, row_catalog, footers, reviewed_rows):
                 target = mapped if role == "requirement" else context_mapped
                 target[(key, row, column)].append({"requirement_id": rid, "source_ref": ref,
                                                   "start": start, "end": end})

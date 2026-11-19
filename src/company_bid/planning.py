@@ -16,6 +16,10 @@ from .models import (PreparedBid, SourceRef, SourceContextProof, RequirementSour
 from .slots import has_fill_marker, whole_cell_slot
 from .source_clauses import build_clause_catalog
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY
+from .response_review_table_sources import (
+    RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_REVIEW_TABLE_RULE, build_response_review_table_proof,
+    response_review_native_blocks,
+)
 from .scoring_row_sources import SCORING_ROW_SOURCE_CONFIG_KEY
 from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
@@ -880,8 +884,34 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
         positions = {block["block_id"]: i for i, block in enumerate(body)}
         source_roles = _format_source_roles(document, body)
         cover_regions = []
+        reviewed_regions = {}
+        reviewed_body = set()
+        rebuilt_reviews = {}
         for chapter in formats:
             proof = chapter.get("source_derivation", {})
+            if proof.get("rule") == RESPONSE_REVIEW_TABLE_RULE and proof.get("source_id") == document["source_id"]:
+                anchor = chapter["citation"]["block_id"]
+                page = proof["physical_page"]
+                if page not in rebuilt_reviews:
+                    native = response_review_native_blocks(blocks.values(), document["source_id"], page)
+                    config = {"source_id": document["source_id"], "source_sha256": document["sha256"], "physical_page": page}
+                    rebuilt_reviews[page] = build_response_review_table_proof(config, native, footer_skips)
+                if rebuilt_reviews[page] != proof or chapter["source_derivation_sha256"] != proof["proof_sha256"]:
+                    errors.append({"reason": "reviewed_format_source_mismatch", "block_id": anchor})
+                    continue
+                form_ids = proof["content_block_ids"]
+                letter_ids = [member["block_id"] for member in proof["letter_members"]]
+                scopes = {form_ids[0]: (form_ids, form_ids, letter_ids[0]),
+                          letter_ids[0]: (letter_ids, letter_ids[:12], proof["following_heading"]["block_id"])}
+                scope = scopes.get(anchor)
+                if (scope is None or chapter["status"] != "prescribed" or chapter["content_block_ids"] != scope[1] or
+                        chapter["citation"]["block_ids"] != scope[0] or not set([*scope[0], scope[2]]) <= positions.keys() or
+                        [positions[key] for key in scope[0]] != list(range(positions[anchor], positions[scope[2]]))):
+                    errors.append({"reason": "reviewed_format_scope_mismatch", "block_id": anchor})
+                    continue
+                reviewed_regions[anchor] = (positions[anchor], positions[scope[2]], scope[0])
+                reviewed_body.update(scope[0][1:])
+                continue
             if proof.get("rule") != "native_split_response_cover_v1" or proof.get("source_id") != document["source_id"]:
                 continue
             member_ids = chapter["content_block_ids"]
@@ -915,9 +945,10 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
         continuation_items = _fixed_letter_items(body, anchors) | _fixed_native_table_notes(body, anchors)
 
         def structural_level(block):
-            return None if block["block_id"] in continuation_items else _heading_level(block.get("text", ""))
+            return None if block["block_id"] in continuation_items or block["block_id"] in reviewed_body else _heading_level(block.get("text", ""))
 
         regions = list(cover_regions)
+        regions.extend((start, end, "source_proven_response_form") for start, end, _ in reviewed_regions.values())
         for i, block in enumerate(body):
             text = block.get("text", "").strip()
             if (block["kind"] == "paragraph" and _heading_level(text) == 0 and
@@ -1020,6 +1051,9 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
                     "reason": "next_grounded_format" if boundary < len(body) and body[boundary]["block_id"] in anchors else
                               "source_heading_or_region_end" if boundary < len(body) else "source_end"}
             ledger.append(row)
+        for anchor, (_, _, ids) in reviewed_regions.items():
+            if anchors[anchor]["content_block_ids"] != ids:
+                errors.append({"reason": "reviewed_format_source_incomplete", "block_id": anchor})
     covers = [row for row in ledger if row.get("source_role") == "prescribed_cover" and
               row["block_id"] == row["role_proof"]["members"][0]["block_id"]]
     if len(covers) > 1:
@@ -1308,11 +1342,16 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         [proof for proof in table_continuations if proof["source_id"] == document["source_id"]])]
     # The source-resolution proof was reconstructed above with the full N1.
     # It is available for citation verification without becoming a model row.
-    price_continuations = {proof["proof_sha256"]: proof for result in verified_results
-                           if PRICE_SCORING_CONFIG_KEY in result
-                           for proof in [result[PRICE_SCORING_CONFIG_KEY]["proof"]["table_continuation"]]}
+    reviewed_continuations = {proof["proof_sha256"]: proof for result in verified_results
+                              for key in (PRICE_SCORING_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY) if key in result
+                              for proof in [result[key]["proof"]["table_continuation"]]}
     table_rows.extend(row for result in verified_results if SCORING_ROW_SOURCE_CONFIG_KEY in result
                       for row in result[SCORING_ROW_SOURCE_CONFIG_KEY]["proof"]["rows"])
+    review_rows = [row for result in verified_results if RESPONSE_REVIEW_TABLE_CONFIG_KEY in result
+                   for proof in [result[RESPONSE_REVIEW_TABLE_CONFIG_KEY]["proof"]]
+                   for row in [*proof["independent_requirement_rows"], proof["rows"][-1]]]
+    table_rows.extend(review_rows)
+    reviewed_row_hashes = {row["proof_sha256"] for row in review_rows}
 
     input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": source_manifest,
                   "parsed_hash": _hash(parsed), "config": config}
@@ -1506,9 +1545,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         factual_response_reports = []
 
         def scoped_source(citation):
-            price_proof = price_continuations.get(citation.get("table_continuation_proof_sha256"))
+            source_proof = reviewed_continuations.get(citation.get("table_continuation_proof_sha256"))
             checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks), list(clause_by_id.values()),
-                                table_continuations + [price_proof] if price_proof else table_continuations, table_rows)
+                                table_continuations + [source_proof] if source_proof else table_continuations, table_rows)
             source_id = _id("SCOPE-", checked)
             if source_id not in source_map:
                 parent = source_map[checked["source_id"]]
@@ -1520,6 +1559,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
                         for cell in checked["cell_refs"])
                 if checked.get("block_ids"):
                     item["locator"] += "; through=" + checked["end_locator"] + "; blocks=" + ",".join(checked["block_ids"])
+                if checked.get("table_row_proof_sha256") in reviewed_row_hashes:
+                    item["locator"] += "; reviewed_row_proof_sha256=" + checked["table_row_proof_sha256"]
                 SourceRef.model_validate(item)
                 source_map[source_id] = item
                 sources.append(item)
