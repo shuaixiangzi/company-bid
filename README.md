@@ -53,6 +53,7 @@ flowchart LR
 自动链的 `company-bid --root <受控运行目录> --config <配置> create --input <清单> --review-before-writing` 会先读招标并匹配材料。如果需要本次安排负责人、核对社保或选择签署身份，会在写正文前返回一份可读简表和一份可复制填写的 JSON。省略该选项可照常自动制作。使用同一个运行目录继续操作。
 
 - `company-bid --root <受控运行目录> project-questions <run_id>` 从已成功的 N3 生成当前项目的简表和 JSON，仅在受控目录保存。
+- 简表列出本标有明确来源的实缴期限、最低次数和登记页读取情况。经办人录入的缴费信息保留待核说明。只有已从招标原件定位的正式截止时点可用于计算缴费窗口。
 - 复制 JSON，在副本中填 `reviewed_by` 和本次能够确定的 `answers`。可用键和选项由 `questions` 给出。人员、用工主体、代理人姓名使用字符串，签署身份取 `legal_representative` 或 `agent`。截止时点包含 `submitted_before`（北京时间 ISO 8601）和 `source_ref`（冻结招标来源）。缴费记录包含 `person_name`、`employer`、`paid_on`（年-月-日）与 `source_ref`。已存在的来源需对应本项，传入新凭证时使用 `supplied_payment_proof` 并在下一条命令加 `--payment-proof <PNG或JPEG>`。可留出暂未确定的项目。
 - `company-bid --root <受控运行目录> apply-project-answers <run_id> --input <填写后的副本>` 从冻结计划创建子版本并生成 Word。也可加 `--queue-only` 暂存子版本。本阶段补录后写作仅接通离线预备正文或已认证的完整回放。新增或变更正式招标要求的公告、澄清需作为招标输入重新读取。
 - 本次跳过全部补录时，使用 `company-bid --root <受控运行目录> resume <run_id>`。补录前后均保留公司缺项和办理事项，真实签字、盖章在线下办理。

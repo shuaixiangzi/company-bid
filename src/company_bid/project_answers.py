@@ -27,6 +27,7 @@ _MANUAL_PROVENANCE = {"manual_input", "user_authorized_fact"}
 _AUTHORIZATION = re.compile(r"(?:\d+[.、\s]*)?(?:法定?人?代表人?|单位负责人)?授权(?:委托)?书")
 _AGENT_SLOT = re.compile(r"现委托(?P<blank>[ \t_＿]+)[（(]姓名[）)]\s*$")
 _PERSONNEL_FIELDS_ONLY = re.compile(r"应在(?P<table>(?:拟派项目)?人员(?:配置)?表)中填写拟派项目负责人姓名(?P<employer>及用工主体)?[。.]?")
+_HISTORICAL_PERSONNEL = re.compile(r"(?:历史|既往|以往|已完成|已完工)(?:项目|合同|业绩)|业绩(?:统计|汇总|一览)表")
 _SOCIAL_FIELDS = {"manager_name", "employer", "deadline", "payment_evidence"}
 _SIGNING_FIELDS = {"signer_role", "agent_name"}
 _ROLE_VALUES = {"legal_representative": "法定代表人（单位负责人）签署", "agent": "代理人签署"}
@@ -156,7 +157,9 @@ def _fill_current_person_cells(plan, fields, questions):
             requirements[req["requirement_id"]] = (match["table"].removeprefix("拟派项目"), needed, req["text"])
     for table in plan["tables"]:
         section = sections[table["section_id"]]
-        if section["document_role"] != "response":
+        historic = any(_HISTORICAL_PERSONNEL.search(re.sub(r"\s+", "", title))
+                       for title in (section["title"], table["title"]))
+        if section["document_role"] != "response" or historic:
             continue
         native = section.get("native_format") or {}
         native_table = next((value for value in native.get("elements", []) if value.get("table_id") == table["table_id"]), None)
@@ -329,7 +332,22 @@ def _independent_attachment(plan, row, personnel_scope, source_ref):
     return {**row, "section_id": target["section_id"], "requirement_refs": refs}
 
 
-def _payment_note(plan, questions, answers, sources, candidates, effective_deadline):
+def _payment_source_evidence(source, proof_refs, sources, frozen_attachments, uploaded):
+    if not uploaded:
+        return [row for row in proof_refs if row["source_ref"] == source["source_id"]], False
+    proof_hash = source["sha256"]
+    matching_sources = {ref for ref, frozen in sources.items()
+                        if ref != source["source_id"] and frozen["sha256"] == proof_hash}
+    matching_attachments = {row["attachment_id"] for row in frozen_attachments if row["sha256"] == proof_hash}
+    if not matching_sources and not matching_attachments:
+        return [], True
+    # A frozen page keeps its original disposition even if uploaded under a new filename.
+    return [row for row in proof_refs if row["source_ref"] in matching_sources or
+            row.get("attachment_id") in matching_attachments], False
+
+
+def _payment_note(plan, questions, answers, sources, candidates, effective_deadline, *,
+                  frozen_attachments, uploaded_payment_source_id):
     payment = answers.get("payment_evidence")
     if not payment:
         return "实际缴费凭证仍待核对。", None
@@ -337,22 +355,29 @@ def _payment_note(plan, questions, answers, sources, candidates, effective_deadl
     if source is None or source["kind"] not in {"attachment", "company_material"}:
         raise ProjectAnswerError("PROJECT_ANSWER_PAYMENT_SOURCE_INVALID")
     proof_refs = questions["payment_evidence"].get("evidence_refs", [])
-    proof = [row for row in proof_refs if row.get("source_ref") == source["source_id"]]
+    uploaded = (source["source_id"] == uploaded_payment_source_id and source["kind"] == "attachment"
+                and source["provenance"] == "original" and source["source_id"] == "F-PAYMENT-" + source["sha256"])
+    proof, uploaded = _payment_source_evidence(source, proof_refs, sources, frozen_attachments, uploaded)
     if any(row["kind"] == "reviewed_registration" for row in proof):
         return "所选原图是参保登记页，实际缴费凭证仍待补。", None
-    uploaded = (source["kind"] == "attachment" and source["provenance"] == "original"
-                and source["source_id"] == "F-PAYMENT-" + source["sha256"])
-    scoped = [row for row in candidates.values() if source["source_id"] in row["source_refs"] and
-              row["attachment_id"] in {item.get("attachment_id") for item in proof}]
-    if not uploaded and not scoped:
-        raise ProjectAnswerError("PROJECT_ANSWER_PAYMENT_SOURCE_OUT_OF_SCOPE")
-    if not uploaded and not any(re.search(r"实缴|缴费", row["title"]) and not re.search(r"登记", row["title"]) for row in scoped):
-        return "所选历史材料的实缴用途待核，仍需提供可核对的实际缴费凭证。", None
+    payment_refs = set(questions["payment_evidence"]["requirement_ids"])
+    if not uploaded:
+        scoped = [row for row in candidates.values() if any(
+                  item.get("attachment_id") == row["attachment_id"] and item["source_ref"] in row["source_refs"]
+                  for item in proof)]
+        if not scoped:
+            raise ProjectAnswerError("PROJECT_ANSWER_PAYMENT_SOURCE_OUT_OF_SCOPE")
+        payment_attachment_ids = {row["attachment_id"] for row in scoped
+                                  if re.search(r"实缴|缴费", row["title"]) and not re.search(r"登记", row["title"])}
+        if not payment_attachment_ids:
+            return "所选历史材料的实缴用途待核，仍需提供可核对的实际缴费凭证。", None
+        if not any(row["attachment_id"] in payment_attachment_ids and
+                   payment_refs.intersection(row["requirement_refs"]) for row in plan["attachments"]):
+            return "所选历史凭证与本次人员安排的归属待核，未作为本次实缴附件采用。", None
     if not answers.get("manager_name") or not answers.get("employer"):
         return "已登记需核对的缴费材料，拟派人员、用工主体和凭证归属仍待确认。", None
     if payment["person_name"] != answers["manager_name"] or payment["employer"] != answers["employer"]:
         return "录入的缴费凭证人员或用工主体与本项目选择不一致，须重新核对归属。", None
-    payment_refs = set(questions["payment_evidence"]["requirement_ids"])
     own_employment_required = any(req["requirement_id"] in payment_refs and re.search(
         r"自有员工|本单位(?:在职)?员工|投标人(?:的)?正式员工|响应人(?:的)?正式员工", re.sub(r"\s+", "", req["text"]))
         for req in plan["requirements"])
@@ -361,9 +386,9 @@ def _payment_note(plan, questions, answers, sources, candidates, effective_deadl
     conditions = questions["payment_evidence"].get("conditions", {})
     window = conditions.get("window_days")
     if type(window) is not int or not 1 <= window <= 3650:
-        return "已登记原件及录入缴费日期，招标规定的实缴区间仍待核。", source if uploaded else None
+        return "已记录所选材料及填报的缴费日期，招标规定的实缴区间仍待核。", source if uploaded else None
     if not effective_deadline:
-        return "已登记原件及录入缴费日期，正式递交截止及实缴窗口仍待核。", source if uploaded else None
+        return "已记录所选材料及填报的缴费日期，正式递交截止及实缴窗口仍待核。", source if uploaded else None
     distance = (_deadline(effective_deadline["submitted_before"]).date() - _day(payment["paid_on"])).days
     if distance == 0:
         return "录入缴费日期与正式截止日相同，缴费时点及招标期限的适用口径仍待核。", None
@@ -374,18 +399,26 @@ def _payment_note(plan, questions, answers, sources, candidates, effective_deadl
 
 
 def _qualify_deadline(question, supplied, sources):
+    def original_tender(ref):
+        source = sources.get(ref, {})
+        return source.get("kind") == "tender" and source.get("provenance") in {"original", "synthetic"}
+
     known = _known(question)
-    if supplied and sources.get(supplied["source_ref"], {}).get("kind") != "tender":
+    if supplied and not original_tender(supplied["source_ref"]):
         raise ProjectAnswerError("PROJECT_ANSWER_DEADLINE_SOURCE_INVALID")
     if not known:
+        if supplied and supplied["source_ref"] not in question.get("source_refs", []):
+            raise ProjectAnswerError("PROJECT_ANSWER_DEADLINE_SOURCE_OUT_OF_SCOPE")
         return supplied, False
-    if supplied and (_deadline(supplied["submitted_before"]) != _deadline(known["submitted_before"]) or
-                     supplied["source_ref"] != known["source_ref"]):
-        raise ProjectAnswerError("PROJECT_ANSWER_DEADLINE_SOURCE_CONFLICT")
-    if (known["source_ref"] not in question.get("value_source_refs", []) or
-            sources.get(known["source_ref"], {}).get("kind") != "tender"):
+    value_sources = question.get("value_source_refs", [])
+    if known["source_ref"] not in value_sources or not original_tender(known["source_ref"]):
         raise ProjectAnswerError("PROJECT_ANSWER_DEADLINE_SOURCE_INVALID")
-    return known, True
+    if supplied is None:
+        return known, True
+    if (supplied["source_ref"] not in value_sources or
+            _deadline(supplied["submitted_before"]) != _deadline(known["submitted_before"])):
+        raise ProjectAnswerError("PROJECT_ANSWER_DEADLINE_SOURCE_CONFLICT")
+    return {**known, "source_ref": supplied["source_ref"]}, True
 
 
 def _add_pending_payment(plan, section, scope, source, proof, signing_ref):
@@ -396,15 +429,16 @@ def _add_pending_payment(plan, section, scope, source, proof, signing_ref):
         return
     identity = "PROJECT-PAYMENT-" + format_digest([signing_ref, source["source_id"], reqs])[:24]
     attachment = {"attachment_id": identity, "section_id": section["section_id"],
-                  "title": "本项目提供的社保凭证（原件实缴待核）", "path": source["path"],
+                  "title": "本次提交的社保凭证图片（实缴待核）", "path": source["path"],
                   "sha256": source["sha256"], "source_refs": [source["source_id"], signing_ref],
                   "requirement_refs": reqs, "synthetic": plan["synthetic"],
-                  "description": f"随本项目确认提供的凭证。录入缴费日期 {proof['paid_on']}；原件、实缴及资格待核。"}
+                  "description": f"经办人填报的缴费日期为 {proof['paid_on']}。请对照原件核实人员、单位及实缴记录，资格仍待核。"}
     plan["attachments"].append(attachment)
     section["attachment_refs"].append(identity)
 
 
-def apply_project_answers(plan: dict, questions: list[dict], answers: dict, source_ref: str) -> dict:
+def apply_project_answers(plan: dict, questions: list[dict], answers: dict, source_ref: str, *,
+                          uploaded_payment_source_id: str | None = None) -> dict:
     """Project confirmed decisions into N4's plan without altering frozen inputs."""
     validate_project_answer_values(questions, answers)
     if not answers:
@@ -416,13 +450,13 @@ def apply_project_answers(plan: dict, questions: list[dict], answers: dict, sour
         raise ProjectAnswerError("PROJECT_ANSWER_SNAPSHOT_SOURCE_INVALID")
     indexed = {question["key"]: question for question in questions}
     if set(answers) & _SOCIAL_FIELDS:
-        _apply_personnel(result, indexed, answers, sources, source_ref)
+        _apply_personnel(result, indexed, answers, sources, source_ref, uploaded_payment_source_id)
     if set(answers) & _SIGNING_FIELDS:
         _apply_signing(result, indexed, answers, source_ref)
     return result
 
 
-def _apply_personnel(plan, questions, answers, sources, ref):
+def _apply_personnel(plan, questions, answers, sources, ref, uploaded_payment_source_id):
     fields = {key: (answers[key], _fact(plan, key, answers[key], ref))
               for key in ("manager_name", "employer") if key in answers}
     _fill_current_person_cells(plan, fields, questions)
@@ -433,6 +467,7 @@ def _apply_personnel(plan, questions, answers, sources, ref):
                              if req["requirement_id"] in manager_scope and req["category"] == "qualification"
                              and req["response_mode"] in {"attachment", "factual_response"}}
     candidates = _frozen_personnel_candidates(plan, questions, personal_scope)
+    frozen_attachments = plan["attachments"]
     group_scope = personal_scope | {req["requirement_id"] for req in plan["requirements"]
         if re.search(r"人员要求材料|项目组人员配置情况", re.sub(r"\s+", "", req["text"][:90]))}
     withdrawn = _withdraw_personnel(plan, candidates, answers["manager_name"], group_scope, ref) if "manager_name" in answers else []
@@ -444,35 +479,46 @@ def _apply_personnel(plan, questions, answers, sources, ref):
     effective = {key: value for key in ("manager_name", "employer")
                  if (value := _known(questions.get(key, {}))) is not None}
     effective.update(answers)
-    evidence_note, proof = _payment_note(plan, questions, effective, sources, candidates, submitted if verified else None)
-    pending = [part for part in ("已录入本次拟派负责人。" if "manager_name" in answers else "",
-               "已录入本次用工主体，人员关系待核。" if "employer" in answers else "",
-               "人工提供的递交截止时点仍待正式原件核对。" if submitted and not verified else "", evidence_note,
-               "已撤出归属需重新确认的历史人员证明；历史检索和读取记录仍可查。" if withdrawn else "") if part]
+    evidence_note, proof = _payment_note(plan, questions, effective, sources, candidates, submitted if verified else None,
+                                         frozen_attachments=frozen_attachments,
+                                         uploaded_payment_source_id=uploaded_payment_source_id)
+    withdrawal_note = "已撤出归属需重新确认的历史人员证明；历史检索和读取记录仍可查。" if withdrawn else ""
+    pending = "".join(("人工提供的递交截止时点仍待正式原件核对。" if submitted and not verified else "",
+                       evidence_note, withdrawal_note))
     include_note = bool(answers.get("payment_evidence") or withdrawn)
     if include_note:
-        facts.append(_fact(plan, "payment_evidence", "".join(pending), ref,
+        facts.append(_fact(plan, "payment_evidence", pending, ref,
                            evidence_refs=[proof["source_id"]] if proof else []))
     section = _add_response_section(plan, scope or manager_scope, title="拟派负责人及用工资料核对",
                                     ref=ref, fact_ids=facts)
     if proof:
         _add_pending_payment(plan, section, scope, proof, answers["payment_evidence"], ref)
-    target_issues = _targets(questions, _SOCIAL_FIELDS, "issue_ids")
-    target_issues.update(issue["issue_id"] for issue in plan["issues"]
-                         if issue["requirement_refs"] and set(issue["requirement_refs"]) <= scope)
-    if withdrawn:
-        withdrawal_scope = {rid for row in withdrawn for rid in row["requirement_refs"]}
-        target_issues.update(issue["issue_id"] for issue in plan["issues"]
-                             if set(issue["requirement_refs"]) & withdrawal_scope)
+    withdrawal_scope = {rid for row in withdrawn for rid in row["requirement_refs"]} & group_scope
+    assembled_requirements = {rid for row in plan["attachments"] for rid in row["requirement_refs"]}
     for issue in plan["issues"]:
-        if issue["issue_id"] not in target_issues:
-            continue
-        if set(issue["requirement_refs"]) <= scope:
+        refs = set(issue["requirement_refs"])
+        if refs and refs <= scope:
             issue["title"] = "拟派负责人社保资料待核"
             issue["action"] = "核对本次拟派人员、用工主体、正式递交截止及窗口内的实缴原件。"
-        elif withdrawn:
-            issue["action"] = "按本次拟派安排重新核对证明归属及其他原要求。" + issue["action"]
-        issue["reason"] = "".join(pending) + "\n确认前的材料检索与读取记录：\n" + issue["reason"]
+            manager, employer = effective.get("manager_name"), effective.get("employer")
+            note = ((f"本项目填报的拟派负责人为{manager}。" if manager else "")
+                    + (f"填报的用工主体为{employer}，人员关系待核。" if employer else "")
+                    + pending)
+        elif refs & withdrawal_scope:
+            has_assembled = bool(refs & assembled_requirements)
+            note = ("已撤出归属需重新确认的部分人员证明；本项仍有已装配证明，适用条件待核。" if has_assembled else
+                    "已撤出归属需重新确认的历史人员证明；本项当前未装配相关证明，待按本次拟派安排核对。")
+            if not has_assembled and issue["title"] == "已附证明的适用条件仍待核对":
+                issue["title"] = "本次拟派人员证明待核对及补充"
+            if issue["action"] == "结合正文中的完整证明包逐项核对本条条件；转移附件位置不代表资格通过。":
+                issue["reason"] += "\n原办理动作：" + issue["action"]
+                issue["action"] = ("逐项核对正文保留证明的适用条件，并按本次拟派安排补齐相应证明。" if has_assembled else
+                                   "核对本次拟派人员及本条证明要求，确认后装配相应证明。")
+            else:
+                issue["action"] = "按本次拟派安排重新核对证明归属及其他原要求。" + issue["action"]
+        else:
+            continue
+        issue["reason"] = note + "\n确认前的材料检索与读取记录：\n" + issue["reason"]
 
 
 def _signing_proof_roles(text):
@@ -509,7 +555,8 @@ def _apply_signing(plan, questions, answers, ref):
     if role == "agent":
         if name:
             fact_id = _fact(plan, "agent_name", name, ref)
-            bound_section = _bind_agent_name(plan, name, fact_id, ref, scope)
+            name_scope = _targets(questions, ("agent_name",), "requirement_ids")
+            bound_section = _bind_agent_name(plan, name, fact_id, ref, name_scope)
             if bound_section is None:
                 facts.append(fact_id)
         action = ("按招标文件提供授权委托书，核对代理人、授权范围、期限、日期和签章。" if proof_required else
@@ -524,9 +571,22 @@ def _apply_signing(plan, questions, answers, ref):
     issue_ids = _targets(questions, _SIGNING_FIELDS, "issue_ids")
     for issue in plan["issues"]:
         refs = set(issue["requirement_refs"])
-        if refs and refs <= scope and (issue["issue_id"] in issue_ids or refs <= proof_rids):
-            issue["reason"] = pending + "签署及本签署方式对应的证明仍待办理。\n" + issue["reason"]
-            issue["action"] = action
+        if not refs or not refs <= scope:
+            continue
+        issue_roles = _signing_proof_roles(issue["source_requirement"]) if refs <= proof_rids else set()
+        if issue["issue_id"] not in issue_ids and not issue_roles:
+            continue
+        local_proof = role in issue_roles and all(role in proof_requirements[rid] for rid in refs)
+        unresolved = "签署仍待办理。"
+        if local_proof:
+            unresolved = "签署及本签署方式对应的证明仍待办理。"
+            if issue["title"] == "按实际签署人补齐身份证明或授权":
+                issue["action"] = action
+            else:
+                issue["action"] = action + " " + issue["action"]
+        issue["reason"] = pending + unresolved + "\n" + issue["reason"]
     for operation in plan["review_actions"]:
-        if set(operation["requirement_refs"]) <= scope and "签" in operation["source_requirement"]:
+        refs = operation["requirement_refs"]
+        if (refs and all(role in proof_requirements.get(rid, ()) for rid in refs)
+                and role in _signing_proof_roles(operation["source_requirement"])):
             operation["instruction"] = pending + action + " " + operation["instruction"]

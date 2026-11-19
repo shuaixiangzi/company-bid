@@ -133,6 +133,10 @@ def review_form(executor, run_id):
 
 def review_summary(form):
     labels = {"legal_representative": "法定代表人直接签署", "agent": "委托代理人签署"}
+    prompts = {"manager_name": "填写本项目实际拟派人员的姓名。", "employer": "填写该人员的实际用工主体。",
+               "deadline": "本次招标资料中尚未定位正式递交截止时点。新取得的公告或澄清须作为招标输入重新读取。",
+               "payment_evidence": "请提供能核对本人、缴费单位和实际缴费日期的凭证。",
+               "signer_role": "选择本次响应文件由谁签署。", "agent_name": "填写本次拟任代理人姓名。"}
     lines = ["# 写标前项目信息核对", "", "按现有资料即可继续生成。补录会生成新版本。", ""]
     choices = {row["key"]: row["value"] for row in form["questions"] if row["status"] == "known"}
     choices.update(form["answers"])
@@ -142,27 +146,54 @@ def review_summary(form):
             continue
         lines.append("## " + row["label"])
         lines.append("")
-        value = form["answers"].get(row["key"], row["value"])
-        if isinstance(value, dict):
-            value = " ".join(str(v) for k, v in value.items() if k != "source_ref")
-        prompts = {"manager_name": "填写本项目实际拟派人员的姓名。", "employer": "填写该人员的实际用工主体。",
-                   "deadline": "尚未定位正式截止时点，请提供载明时间的正式公告或澄清。",
-                   "payment_evidence": "可选用已有实缴凭证或补充本人的缴费凭证。",
-                   "signer_role": "选择本次响应文件由谁签署。", "agent_name": "填写本次拟任代理人姓名。"}
-        lines.append("已记录：" + labels.get(value, str(value)) if value else prompts[row["key"]])
+        key = row["key"]
+        value = choices.get(key)
         conditions = row.get("conditions", {})
-        if row["key"] == "signer_role" and conditions.get("allowed_roles"):
+        if key == "deadline" and value:
+            if row["status"] == "known":
+                lines.append("招标原件载明的递交截止时间为 " + row["value"]["submitted_before"] + "。")
+            else:
+                lines.append("经办人录入的截止时间为 " + value["submitted_before"] + "，仍待正式招标原件核对。")
+        elif key == "payment_evidence" and value:
+            lines.append(f"经办人录入的缴费信息为 {value['person_name']}，{value['employer']}，{value['paid_on']}。"
+                         "请对照凭证原件核实人员、单位和实缴记录。")
+        elif value:
+            displayed = labels[value] if key == "signer_role" else value
+            lines.append(("本次填报：" if key in form["answers"] else "冻结来源已记录：") + displayed)
+        elif conditions.get("ambiguous_assignment_scope"):
+            lines.append("本标涉及不同岗位或标段，请分别核对各自的人选和证明，本栏保持待核。")
+        elif key == "signer_role" and conditions.get("allowed_roles") == []:
+            lines.append("相关签署条款未能确定一致的签署身份，请按招标原件核对。")
+        elif key == "deadline" and conditions.get("source_conflict"):
+            lines.append("请以适用于本次递交的正式公告或澄清核对截止时间。")
+        else:
+            lines.append(prompts[key])
+        if conditions.get("source_conflict"):
+            lines.append("已定位的招标条款对" + ("截止时间" if key == "deadline" else "实缴条件") + "存在不同表述，请核对适用原文。")
+        if key == "signer_role" and conditions.get("allowed_roles"):
             lines.append("可采用：" + " / ".join(labels[r] for r in conditions["allowed_roles"]))
             if "agent" in conditions["allowed_roles"] and value is None:
                 lines.append("选择代理人签署时可一并填写代理人姓名。")
-        if row["key"] == "payment_evidence" and "window_days" in conditions:
-            lines.append(f"核对窗口：正式递交截止前 {conditions['window_days']} 日。")
+        if key == "payment_evidence":
+            terms = []
+            if "window_days" in conditions:
+                terms.append(f"正式递交截止前 {conditions['window_days']} 日内")
+            if "minimum_payments" in conditions:
+                terms.append(f"至少实缴 {conditions['minimum_payments']} 次")
+            if terms:
+                lines.append("招标要求：" + "，".join(terms) + "。")
         evidence = row.get("evidence_refs", [])
-        proof = next((item for item in evidence if item["kind"] == "reviewed_registration"), None)
-        if proof and row["key"] == "payment_evidence":
-            lines.append("已有参保登记页（" + proof["locator"].split("/")[-1] + "），实缴仍待核。")
+        if key == "payment_evidence":
+            notices = {"ocr_failed_pending_review": "该页机器读取或校验失败。",
+                       "ocr_no_text_unresolved": "该页机器读取未取得文字。"}
+            for locator, reading in dict.fromkeys((item["locator"], item.get("transcription_status"))
+                                                  for item in evidence if item["kind"] == "reviewed_registration"):
+                lines.append("已有参保登记页（" + locator.split("/")[-1] + "）。"
+                             + notices.get(reading, "") + "实际缴费另待核对。")
         if evidence:
             item = next((item for item in evidence if item["kind"] == "tender"), evidence[0])
+            if key == "deadline" and row["status"] == "known":
+                item = next(item for item in evidence if item["source_ref"] == value["source_ref"])
             locator = str(item.get("locator", "")).split(";", 1)[0]
             pdf = re.fullmatch(r"pdf/page\[(\d+)\](?:/line\[(\d+)\])?", locator)
             if pdf:
@@ -220,7 +251,8 @@ def _apply(store, prepared, rows, snapshot, ref):
     existing = {s["source_id"] for s in plan["sources"]}
     _require(all(s["source_id"] not in existing for s in extra), "PROJECT_REVIEW_SOURCE_COLLISION")
     plan["sources"].extend(extra)
-    updated = apply_project_answers(plan, rows, snapshot["answers"], source_id)
+    updated = apply_project_answers(plan, rows, snapshot["answers"], source_id,
+                                    uploaded_payment_source_id="F-PAYMENT-" + proof["sha256"] if proof else None)
     return PreparedBid.model_validate(updated).model_dump(mode="json")
 
 

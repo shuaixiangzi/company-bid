@@ -104,6 +104,8 @@ def test_skip_and_partial_person_confirmation_preserve_frozen_plan(sample):
     assert changed["tables"][0]["rows"][1] == plan["tables"][0]["rows"][1]
     assert [row["issue_id"] for row in changed["issues"]] == ["M-001", "M-003"]
     assert "实际缴费凭证仍待核对" in changed["issues"][0]["reason"]
+    assert "本项目填报的拟派负责人为新负责人。" in changed["issues"][0]["reason"]
+    assert "填报的用工主体为" not in changed["issues"][0]["reason"]
     assert "确认前的材料" in changed["issues"][0]["reason"]
     assert [item["attachment_id"] for item in changed["attachments"]] == ["PERFORMANCE", "MIXED"]
     assert changed["attachments"][0] == plan["attachments"][1]
@@ -113,17 +115,50 @@ def test_skip_and_partial_person_confirmation_preserve_frozen_plan(sample):
     PreparedBid.model_validate(changed)
 
 
+@pytest.mark.parametrize("remaining_proof", [False, True])
+def test_withdrawn_personnel_proof_reconciles_current_labels(sample, remaining_proof):
+    plan, questions = sample
+    ref, section_id = "RQF", "S"
+    text = "拟派项目负责人需提交证书。"
+    plan["requirements"].append(requirement(ref, text))
+    section = next(section for section in plan["sections"] if section["section_id"] == section_id)
+    section["requirement_refs"].append(ref)
+    next(row for row in questions if row["key"] == "manager_name")["requirement_ids"].append(ref)
+    for identity, name in [("OLD-CERT", "旧负责人"), *([("CURRENT-CERT", "新负责人")] if remaining_proof else [])]:
+        plan["attachments"].append(attachment(identity, section_id, name, [ref], "PER"))
+        section["attachment_refs"].append(identity)
+    attached_title = "已附证明的适用条件仍待核对"
+    former_action = "结合正文中的完整证明包逐项核对本条条件；转移附件位置不代表资格通过。"
+    plan["issues"].extend([
+        {**issue("M-010", section_id, ref, text, reason="已附证明：旧负责人。"), "title": attached_title},
+        {**issue("M-011", section_id, ref, text, reason="原证明页已转入正文。"),
+         "title": "证明材料落点及适用性待核对", "action": former_action},
+    ])
+    changed = apply_project_answers(plan, questions, {"manager_name": "新负责人"}, "SNAP")
+    assert [row["attachment_id"] for row in changed["attachments"] if ref in row["requirement_refs"]] == (
+        ["CURRENT-CERT"] if remaining_proof else [])
+    attached, placement = changed["issues"][-2:]
+    assert attached["title"] == (attached_title if remaining_proof else "本次拟派人员证明待核对及补充")
+    assert ("仍有已装配证明" if remaining_proof else "当前未装配相关证明") in attached["reason"].split("\n")[0]
+    assert "确认前的材料检索与读取记录：\n已附证明：旧负责人。" in attached["reason"]
+    assert placement["title"] == plan["issues"][-1]["title"]
+    assert former_action not in placement["action"] and "原办理动作：" + former_action in placement["reason"]
+    assert ("正文保留证明" if remaining_proof else "确认后装配") in placement["action"]
+
+
 def test_matching_payment_keeps_independent_document_and_waits_for_field_review(sample):
     plan, questions = sample
     known_deadline(questions)
     for key, value in (("manager_name", "新负责人"), ("employer", "测试公司")):
         next(row for row in questions if row["key"] == key).update(status="known", value=value, value_source_refs=["SNAP"])
-    result = apply_project_answers(plan, questions, {"payment_evidence": payment()}, "SNAP")
+    result = apply_project_answers(plan, questions, {"payment_evidence": payment()}, "SNAP",
+                                   uploaded_payment_source_id=PAYMENT_SOURCE)
     proof = next(row for row in result["attachments"] if row["attachment_id"].startswith("PROJECT-PAYMENT"))
     assert proof["requirement_refs"] == ["RS"]
     assert set(proof["source_refs"]) == {PAYMENT_SOURCE, "SNAP"}
     assert "正式截止日 30 日" in result["issues"][0]["reason"]
     assert "实际缴费和资格仍待核" in result["issues"][0]["reason"]
+    assert "填报的用工主体为测试公司，人员关系待核" in result["issues"][0]["reason"]
     assert "M-001" in {issue["issue_id"] for issue in result["issues"]}
     PreparedBid.model_validate(result)
 
@@ -138,7 +173,8 @@ def test_payment_conflict_is_pending_and_unattached(sample, person, day, source_
     plan, questions = sample
     known_deadline(questions)
     changed = apply_project_answers(plan, questions, {"manager_name": "新负责人", "employer": "测试公司",
-                        "payment_evidence": payment(name=person, day=day, ref=source_ref)}, "SNAP")
+                        "payment_evidence": payment(name=person, day=day, ref=source_ref)}, "SNAP",
+                                    uploaded_payment_source_id=PAYMENT_SOURCE)
     assert all(not row["attachment_id"].startswith("PROJECT-PAYMENT") for row in changed["attachments"])
     assert reason in changed["issues"][0]["reason"]
 
@@ -157,8 +193,8 @@ def test_signer_branches_protect_signature_and_limit_agent_to_actual_name_slot(s
     plan, questions = sample
     direct = apply_project_answers(plan, questions, {"signer_role": "legal_representative"}, "SNAP")
     assert direct["sections"][2] == plan["sections"][2]
-    assert "由法定代表人（单位负责人）完成签署" in direct["issues"][2]["action"]
-    assert "授权委托书" not in direct["issues"][2]["action"]
+    assert "拟由法定代表人（单位负责人）签署" in direct["issues"][2]["reason"]
+    assert direct["issues"][2]["action"] == plan["issues"][2]["action"]
     with pytest.raises(ProjectAnswerError, match="AGENT_ROLE_REQUIRED"):
         apply_project_answers(plan, questions, {"signer_role": "legal_representative", "agent_name": "代理甲"}, "SNAP")
 
@@ -168,7 +204,8 @@ def test_signer_branches_protect_signature_and_limit_agent_to_actual_name_slot(s
     authorization = next(sec for sec in agent["sections"] if sec["section_id"] == "FORM")
     assert authorization["fixed_content"][0]["text"] == CLAUSE.replace("现委托 ", "现委托代理甲")
     assert authorization["fixed_content"][1]["text"] == SIGNATURE
-    assert "授权委托书" in agent["issues"][2]["action"]
+    assert "拟由代理人签署。拟任代理人：代理甲。" in agent["issues"][2]["reason"]
+    assert agent["issues"][2]["action"] == plan["issues"][2]["action"]
     assert {"SNAP", "T"} == set(authorization["fixed_content"][0]["source_refs"])
     PreparedBid.model_validate(agent)
 
@@ -194,6 +231,30 @@ def test_native_agent_word_run_requires_bound_fact_and_retains_form_marks():
     block.source_refs.remove("SNAP")
     paragraph = _native_paragraph(Document(), section, element, 0, package=package)
     assert "代理甲" not in paragraph.text and paragraph.text.count("（姓名）") == 2
+
+
+def test_signer_scope_alone_does_not_authorize_writing_an_agent_name(sample):
+    plan, questions = sample
+    proxy = next(row for row in questions if row["key"] == "agent_name")
+    proxy["requirement_ids"] = ["RS"]
+    updated = apply_project_answers(plan, questions, {"signer_role": "agent", "agent_name": "代理甲"}, "SNAP")
+    original_form = next(section for section in plan["sections"] if section["section_id"] == "FORM")
+    updated_form = next(section for section in updated["sections"] if section["section_id"] == "FORM")
+    assert updated_form == original_form
+    fact = next(row for row in updated["facts"] if row["label"] == "本项目拟任授权代理人")
+    assert any(fact["fact_id"] in section["fact_refs"] for section in updated["sections"])
+
+
+@pytest.mark.parametrize("target", ["table", "section"])
+def test_current_manager_does_not_fill_same_label_in_a_historical_table(sample, target):
+    plan, questions = sample
+    table = plan["tables"][0]
+    contextual_item = table if target == "table" else next(
+        section for section in plan["sections"] if section["section_id"] == table["section_id"])
+    contextual_item["title"] = "历史项目人员登记表"
+    changed = apply_project_answers(plan, questions, {"manager_name": "新负责人"}, "SNAP")
+    assert changed["tables"][0] == table
+    assert next(issue for issue in changed["issues"] if issue["issue_id"] == "M-002") in plan["issues"]
 
 
 def test_ambiguous_assignment_and_conflicting_known_choice_are_rejected(sample):
@@ -261,7 +322,7 @@ def test_all_named_fields_must_be_filled_in_the_same_personnel_table(sample, emp
     ("agent", "提供", "按招标文件提供授权委托书"),
     ("agent", "提交", "按招标文件提供授权委托书"),
     ("agent", "提\n供", "按招标文件提供授权委托书"),
-    ("legal_representative", "提供", "由法定代表人（单位负责人）完成签署"),
+    ("legal_representative", "提供", "另附经核对的材料。"),
 ])
 def test_role_specific_proof_updates_actionable_word_checklist(sample, tmp_path, role, verb, expected):
     plan, questions = sample
@@ -309,7 +370,8 @@ def test_role_specific_proof_updates_actionable_word_checklist(sample, tmp_path,
     actions = [para for para in actionable if para.startswith("补充动作：")]
     assert len(actions) == 1 and expected in actions[0]
     if role == "legal_representative":
-        assert "核对是否另需附其身份证明" in actions[0] and "授权委托书" not in actions[0]
+        assert "补充动作：另附经核对的材料。" == actions[0]
+        assert any("拟由法定代表人（单位负责人）签署" in para for para in actionable)
 
 
 def test_negative_or_shared_actor_proof_cannot_replace_generic_action(sample):
@@ -323,3 +385,49 @@ def test_negative_or_shared_actor_proof_cannot_replace_generic_action(sample):
                       for index, row in enumerate(plan["requirements"], 7)]
     updated = apply_project_answers(plan, [question("signer_role", ["RA", "RB"])], {"signer_role": "agent"}, "SNAP")
     assert updated["issues"] == plan["issues"]
+
+
+@pytest.mark.parametrize(("role", "needed"), [
+    ("agent", "按招标文件提供授权委托书"),
+    ("legal_representative", "补充实际签署的法定代表人（单位负责人）身份证明"),
+])
+def test_role_proof_applies_to_its_own_procedure_instead_of_a_cover_rule(sample, role, needed):
+    plan, _ = sample
+    proof = ("由响应人的法定代表人（单位负责人）签字或加盖电子印章的，应附法定代表人（单\n"
+             "位负责人）身份证明，由代理人签字或加盖电子印章的，应附由法定代表人（单位负责人）\n签署的授权委托书。")
+    cover = "响应文件封面须法定代表人或授权代表签署并加盖单位公章，并按时递交。"
+    plan["requirements"].extend([requirement("RP", proof, mode="procedure"),
+                                 requirement("RF", cover, mode="procedure")])
+    scope = [question("signer_role", ["RA", "RP", "RF"])]
+    plan["review_actions"] = [
+        {"action_id": action, "kind": "procedure", "status": "pending_manual", "requirement_refs": [ref],
+         "source_refs": ["T"], "source_requirement": text, "instruction": "按原条文线下办理。"}
+        for action, ref, text in (("proof", "RP", proof), ("cover", "RF", cover), ("cover-quote", "RP", cover))
+    ]
+    updated = apply_project_answers(plan, scope, {"signer_role": role}, "SNAP")
+    assert needed in updated["review_actions"][0]["instruction"]
+    assert updated["review_actions"][1:] == plan["review_actions"][1:]
+    assert all(row["status"] == "pending_manual" for row in updated["review_actions"])
+
+
+def test_signing_issue_preserves_actions_outside_its_own_proof_branch(sample):
+    plan, _ = sample
+    agent_proof = "投标文件由代理人签字时须提供授权委托书。"
+    direct_proof = "投标文件由法定代表人签字时须提供身份证明。"
+    cover = "投标文件封面由法定代表人或代理人签字，须加盖公章并递交。"
+    plan["requirements"].extend([requirement("RP", agent_proof), requirement("RD", direct_proof),
+                                 requirement("RF", cover)])
+    plan["issues"] = [
+        {**issue("M-010", "FORM", "RP", agent_proof), "action": "另核对其他未完成的事项。"},
+        {**issue("M-011", "FORM", "RF", cover), "action": "核对公章和递交时限。"},
+        {**issue("M-012", "FORM", "RD", direct_proof), "action": "直接签署时核对身份证明。"},
+        {**issue("M-013", "FORM", "RP", agent_proof + cover), "requirement_refs": ["RP", "RF"],
+         "action": "核对本页盖章并递交。"},
+        {**issue("M-014", "FORM", "RP", cover), "action": "按封面原要求递交。"},
+    ]
+    scope = [question("signer_role", ["RA", "RP", "RD", "RF"], [row["issue_id"] for row in plan["issues"]])]
+    updated = apply_project_answers(plan, scope, {"signer_role": "agent"}, "SNAP")
+    action, *other = [row["action"] for row in updated["issues"]]
+    assert "按招标文件提供授权委托书" in action and "另核对其他未完成的事项。" in action
+    assert other == [row["action"] for row in plan["issues"][1:]]
+    assert all("拟由代理人签署" in row["reason"] for row in updated["issues"])
