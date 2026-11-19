@@ -25,6 +25,9 @@ from .extraction_illustrations import (
 )
 from .source_clauses import build_clause_catalog
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
+from .scoring_row_sources import (
+    SCORING_ROW_SOURCE_CONFIG_KEY, build_scoring_row_source_proof, normalize_scoring_row_source_config, resolve_scoring_row_selectors,
+)
 from .table_continuations import (
     build_table_continuations, build_table_row_catalog, scoring_table_continuation_issues,
 )
@@ -350,7 +353,8 @@ def _model_reference_packet(packet: dict) -> dict:
 
 
 def _model_window(window: dict) -> dict:
-    view = copy.deepcopy({key: value for key, value in window.items() if key != PRICE_SCORING_CONFIG_KEY})
+    view = copy.deepcopy({key: value for key, value in window.items()
+                          if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -514,6 +518,11 @@ def extraction_window_config(config: dict) -> dict:
             frozen[PRICE_SCORING_CONFIG_KEY] = normalize_price_scoring_config(config[PRICE_SCORING_CONFIG_KEY])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    if SCORING_ROW_SOURCE_CONFIG_KEY in config:
+        try:
+            frozen[SCORING_ROW_SOURCE_CONFIG_KEY] = normalize_scoring_row_source_config(config[SCORING_ROW_SOURCE_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -661,6 +670,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
             window["context_identity"] = _window_context_identity(window)
     if PRICE_SCORING_CONFIG_KEY in config:
         _bind_price_scoring_source(windows, documents, blocks, footer_skips, config[PRICE_SCORING_CONFIG_KEY])
+    if SCORING_ROW_SOURCE_CONFIG_KEY in config:
+        _bind_scoring_row_source(windows, blocks, footer_skips, config[SCORING_ROW_SOURCE_CONFIG_KEY])
     return windows, ledger
 
 
@@ -689,6 +700,25 @@ def _bind_price_scoring_source(windows, documents, blocks, footer_skips, config)
           "PRICE_SCORING_SOURCE_WINDOW_SCOPE_MISMATCH")
     owner[PRICE_SCORING_CONFIG_KEY] = {"config": copy.deepcopy(config), "native_blocks": copy.deepcopy(native_blocks),
         "footer_proof": copy.deepcopy(footer_proof), "continuation_owner_window_id": tail_owner["window_id"]}
+
+
+def _bind_scoring_row_source(windows, blocks, footer_skips, config):
+    try:
+        config = normalize_scoring_row_source_config(config)
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    owners = [window for window in windows if window["window_id"] == config["window_id"]]
+    _fail(len(owners) != 1 or not set(config["table_block_ids"]) <= {block["block_id"] for block in owners[0]["blocks"]},
+          "SCORING_ROW_SOURCE_WINDOW_SCOPE_MISMATCH")
+    owner = owners[0]
+    first, _, last = (blocks[key] for key in config["table_block_ids"])
+    native = sorted((block for block in blocks.values() if block["source_id"] == config["source_id"] and
+                     first["ordinal"] - 1 <= block["ordinal"] <= last["ordinal"]), key=lambda block: block["ordinal"])
+    _fail(len(native) != 6, "SCORING_ROW_SOURCE_CONTINUATION_UNPROVEN")
+    context = {"config": config, "native_blocks": copy.deepcopy(native),
+               "footer_proof": copy.deepcopy(footer_skips.get(native[-2]["block_id"]))}
+    owner[SCORING_ROW_SOURCE_CONFIG_KEY] = context
+    _scoring_row_proof(owner)
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -1079,7 +1109,7 @@ def _citation(citation: dict, available: dict, safe_skips: dict | None = None,
         return {**citation, "quote": row["quote"], "unit_id": block["unit_id"], "page": block.get("page"),
                 "start": 0, "end": len(row["quote"]), "basis": "frozen_table_rows_tsv_v1",
                 "end_locator": span[-1]["locator"], "pages": list(dict.fromkeys(value.get("page") for value in span)),
-                "skipped_block_ids": [], "quote_sha256": row["quote_sha256"],
+                "skipped_block_ids": list(row.get("skipped_block_ids", [])), "quote_sha256": row["quote_sha256"],
                 "cell_refs": copy.deepcopy(row["cell_refs"]), "table_row_parts": copy.deepcopy(row["parts"]),
                 "table_row_parents": copy.deepcopy(row["tables"]), "table_row_proof_sha256": row["proof_sha256"]}
     table_proof = None
@@ -1258,9 +1288,10 @@ def _window_source_catalogs(window: dict):
     return targets, available, safe_skips, clause_catalog, table_continuations, table_rows
 
 
-def _validate_window(raw: dict, window: dict) -> dict:
+def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=()) -> dict:
     data = _validate_response_schema(raw, _WindowResponse)
     targets, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
+    table_rows.extend(reviewed_scoring_rows)
     _fail(len(set(data["reviewed_block_ids"])) != len(data["reviewed_block_ids"]) or
           set(data["reviewed_block_ids"]) != set(targets), "WINDOW_BLOCK_DENOMINATOR_MISMATCH")
     titles = {chapter["title"] for chapter in data["format_chapters"]} | {row["title"] for row in window.get("source_heading_catalog", [])}
@@ -1477,6 +1508,37 @@ def _verified_price_scoring_resolution(raw: dict, window: dict) -> dict | None:
             "basis": "application_frozen_source_not_supplied_to_model"}
 
 
+def _scoring_row_proof(window: dict) -> tuple[dict, dict]:
+    context = window[SCORING_ROW_SOURCE_CONFIG_KEY]
+    _fail(not isinstance(context, dict) or set(context) != {"config", "native_blocks", "footer_proof"},
+          "SCORING_ROW_SOURCE_WINDOW_SCOPE_MISMATCH")
+    try:
+        config = normalize_scoring_row_source_config(context["config"])
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    _fail(window.get("source_format") != "pdf" or any(window.get(key) != config[key]
+          for key in ("source_id", "source_sha256", "window_id")), "SCORING_ROW_SOURCE_WINDOW_SCOPE_MISMATCH")
+    native, footer = context["native_blocks"], context["footer_proof"]
+    proof = build_scoring_row_source_proof(config, native, footer)
+    _fail(proof is None or proof["proof_sha256"] != config["source_proof_sha256"], "SCORING_ROW_SOURCE_CONTINUATION_UNPROVEN")
+    targets = {block["block_id"]: block for block in window["blocks"]}
+    _fail(footer not in window.get("safe_skip_blocks", []) or any(
+        targets.get(block["block_id"]) != {key: value for key, value in block.items() if key not in {"bbox", "image_ref"}}
+        for block in native), "SCORING_ROW_SOURCE_WINDOW_SCOPE_MISMATCH")
+    return config, proof
+
+
+def _verified_scoring_row_resolution(raw: dict, window: dict) -> dict | None:
+    if SCORING_ROW_SOURCE_CONFIG_KEY not in window:
+        return None
+    config, proof = _scoring_row_proof(window)
+    _fail(not isinstance(raw, dict) or raw.get("window_id") != config["window_id"] or
+          _hash(raw) != config["raw_candidate_sha256"], "SCORING_ROW_SOURCE_RAW_RESPONSE_MISMATCH")
+    resolution = resolve_scoring_row_selectors(config, raw, proof)
+    _fail(resolution is None, "SCORING_ROW_SOURCE_SELECTOR_MISMATCH")
+    return resolution
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -1505,11 +1567,18 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     # This is application normalization from frozen input,
     # not repaired model-reported IDs. Recorded/internal v1-v4 remains strict.
     internal = {key: data[key] for key in ("requirements", "format_chapters", "format_status")}
+    row_resolution = _verified_scoring_row_resolution(raw, window)
+    reviewed_rows = []
+    if row_resolution is not None:
+        reviewed_rows = row_resolution["proof"]["rows"]
+        for change in row_resolution["changes"]:
+            requirement = internal["requirements"][change["requirement_index"]]
+            requirement.update(citation=copy.deepcopy(change["citation"]), category=change["category"])
     for requirement in internal["requirements"]:
         if requirement["response_mode"] != "writing":
             requirement["reference_keywords"] = []
     internal["reviewed_block_ids"] = [block["block_id"] for block in window["blocks"]]
-    return _validate_window(internal, window)
+    return _validate_window(internal, window, reviewed_scoring_rows=reviewed_rows)
 
 
 def _validate_normalized_window_result(result: dict, window: dict) -> dict:
@@ -1542,6 +1611,9 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     resolution = _verified_price_scoring_resolution(raw, window)
     _fail((PRICE_SCORING_CONFIG_KEY in result) != (resolution is not None) or result.get(PRICE_SCORING_CONFIG_KEY) != resolution,
           "EXTRACTION_PRICE_SCORING_RESOLUTION_MISMATCH")
+    rows = _verified_scoring_row_resolution(raw, window)
+    _fail((SCORING_ROW_SOURCE_CONFIG_KEY in result) != (rows is not None) or result.get(SCORING_ROW_SOURCE_CONFIG_KEY) != rows,
+          "EXTRACTION_SCORING_ROW_RESOLUTION_MISMATCH")
     return validated
 
 
@@ -1701,7 +1773,8 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
     if (any(block.get("illustration_source_use") for block in [*window["blocks"], *window.get("adjacent_context", [])]) or
             any(packet.get("illustration_source_uses") for packet in window.get("reference_context", {}).get("packets", []))):
         instructions += _ILLUSTRATION_INSTRUCTIONS
-    model_config = {key: value for key, value in window_config.items() if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY}}
+    model_config = {key: value for key, value in window_config.items()
+                    if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -1774,11 +1847,16 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
             # A validator's enriched citations are stripped to the wire
             # fields so the same check works with either caller convention.
             candidate = _wire_candidate(candidate)
-        validated = _validate_window(candidate, window)
+        row_resolution = _verified_scoring_row_resolution(raw_model_candidate, window)
+        reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
+        validated = _validate_window(candidate, window, reviewed_scoring_rows=reviewed_rows)
         resolution = _verified_price_scoring_resolution(raw_model_candidate, window)
         supplement = {PRICE_SCORING_CONFIG_KEY: resolution} if resolution is not None else {}
         if resolution is not None:
             _capture(ctx, "n2-price-scoring-source-resolution", resolution)
+        if row_resolution is not None:
+            supplement[SCORING_ROW_SOURCE_CONFIG_KEY] = row_resolution
+            _capture(ctx, "n2-scoring-row-source-resolution", row_resolution)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -1948,7 +2026,9 @@ def _repair_numbered_procedure_spans(windows: list[dict], results: list[dict]) -
             citation = wire["requirements"][index]["citation"]
             del citation["quote"]
             citation["block_ids"] = list(ids)
-        expanded = _validate_window(wire, window)
+        row_resolution = result.get(SCORING_ROW_SOURCE_CONFIG_KEY)
+        reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
+        expanded = _validate_window(wire, window, reviewed_scoring_rows=reviewed_rows)
         projected.append({**result, "validated": expanded})
         for index, (ids, left, right, number) in replacements.items():
             def evidence(requirement):

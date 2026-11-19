@@ -16,6 +16,7 @@ from .models import (PreparedBid, SourceRef, SourceContextProof, RequirementSour
 from .slots import has_fill_marker, whole_cell_slot
 from .source_clauses import build_clause_catalog
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY
+from .scoring_row_sources import SCORING_ROW_SOURCE_CONFIG_KEY
 from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
@@ -1283,6 +1284,8 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     price_continuations = {proof["proof_sha256"]: proof for result in verified_results
                            if PRICE_SCORING_CONFIG_KEY in result
                            for proof in [result[PRICE_SCORING_CONFIG_KEY]["proof"]["table_continuation"]]}
+    table_rows.extend(row for result in verified_results if SCORING_ROW_SOURCE_CONFIG_KEY in result
+                      for row in result[SCORING_ROW_SOURCE_CONFIG_KEY]["proof"]["rows"])
 
     input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": source_manifest,
                   "parsed_hash": _hash(parsed), "config": config}

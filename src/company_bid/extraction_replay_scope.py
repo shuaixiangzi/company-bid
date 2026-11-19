@@ -8,7 +8,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
-from .extraction_failed_scoring_replay import FAILED_SCORING_REPLAY, FailedScoringReplay
+from .extraction_failed_scoring_replay import (
+    FAILED_SCORING_REPLAY, FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
+    FailedScoringReplay, FailedScoringRowsReplay,
+)
 from .extraction_illustrations import CONFIG_KEY
 from .provider import ProviderFailure
 from .storage import digest
@@ -41,12 +44,14 @@ def replay_window_inputs(config, manifest):
 class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_cell_wrap = None
     _failed_scoring = None
+    _failed_scoring_rows = None
 
     def preflight(self, ctx, value):
         self._ready = None
         self._scope_caches = {}
         self._failed_cell_wrap = None
         self._failed_scoring = None
+        self._failed_scoring_rows = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -56,6 +61,10 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  (FAILED_SCORING_REPLAY in self._target_extraction), "FAILED_SCORING_CONFIG_INVALID")
         if FAILED_SCORING_REPLAY in self._target_extraction:
             self._failed_scoring = FailedScoringReplay(self, ctx.execution_config)
+        _require((SCORING_ROW_SOURCE_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_SCORING_ROWS_REPLAY in self._target_extraction), "FAILED_SCORING_ROWS_CONFIG_INVALID")
+        if FAILED_SCORING_ROWS_REPLAY in self._target_extraction:
+            self._failed_scoring_rows = FailedScoringRowsReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
             return super().preflight(ctx, value)
 
@@ -88,6 +97,17 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        rows = self._failed_scoring_rows
+        if rows is None:
+            return self._read_preceding_entry(binding, task, full_window)
+        rows.verify_history(self)
+        if binding["unit_id"] == rows.unit_id:
+            return rows.read_failure(self, binding, task, full_window)
+        entry = self._read_preceding_entry(binding, task, full_window)
+        rows.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_preceding_entry(self, binding, task, full_window):
         scoring = self._failed_scoring
         if scoring is not None:
             scoring.verify_history(self)
@@ -140,7 +160,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_scoring is not None:
+        if self._failed_scoring_rows is not None:
+            self._failed_scoring_rows.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_scoring is not None:
             self._failed_scoring.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_cell_wrap is not None and unit_id != self._failed_cell_wrap["unit_id"]:
             replay_unit = ctx._record.get("units", {}).get(self._failed_cell_wrap["unit_id"], {})

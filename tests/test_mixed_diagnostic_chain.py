@@ -48,6 +48,17 @@ def test_incomplete_price_scoring_recovery_is_rejected(tmp_path, missing):
     assert not (tmp_path / "runtime").exists()
 
 
+@pytest.mark.parametrize("missing", ["scoring_row_source_resolution", "failed_scoring_rows_replay",
+                                    "failed_scoring_replay", "price_scoring_source_resolution"])
+def test_scoring_row_review_requires_both_the_source_and_prior_prefix(tmp_path, missing):
+    options = {"scoring_row_source_resolution": {}, "failed_scoring_rows_replay": {},
+               "failed_scoring_replay": {}, "price_scoring_source_resolution": {}, "failed_cell_wrap_replay": {}}
+    del options[missing]
+    with pytest.raises(PipelineFailure, match="FAILED_SCORING_ROWS_CONFIG_INVALID"):
+        build_executor(tmp_path / "runtime", {**config(), "extraction": options})
+    assert not (tmp_path / "runtime").exists()
+
+
 @pytest.mark.parametrize("change", ["missing_purpose", "ordinary_purpose", "missing_mapping", "mixed_mapping", "mixed_writer"])
 def test_mixed_mode_cannot_accidentally_apply_to_writing_or_inherited_mapping(tmp_path, change):
     settings = config()

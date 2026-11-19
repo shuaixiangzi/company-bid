@@ -33,7 +33,8 @@ def _version(*names: str) -> str:
                     "tender_ocr_replay.py": ("material_ocr_replay.py",),
                     "reading_source_review.py": ("reading_review_origin.py",),
                     "reading_review_origin.py": ("tender_ocr_replay.py", "material_ocr_quality.py"),
-                    "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py", "price_scoring_sources.py"),
+                    "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py", "price_scoring_sources.py",
+                                      "scoring_row_sources.py"),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py",),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
@@ -78,6 +79,10 @@ def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
     extraction = config.get("extraction")
     scoring_keys = {"price_scoring_source_resolution", "failed_scoring_replay"}
+    row_keys = {"scoring_row_source_resolution", "failed_scoring_rows_replay"}
+    if isinstance(extraction, dict) and row_keys.intersection(extraction):
+        if not (row_keys | scoring_keys).issubset(extraction):
+            raise PipelineFailure("FAILED_SCORING_ROWS_CONFIG_INVALID")
     if isinstance(extraction, dict) and scoring_keys.intersection(extraction):
         if not scoring_keys.issubset(extraction) or "failed_cell_wrap_replay" not in extraction:
             raise PipelineFailure("FAILED_SCORING_CONFIG_INVALID")
