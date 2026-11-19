@@ -458,12 +458,19 @@ def _resolve_unread(source, unit, config, ocr, requests):
     full_page = next(((locator, request) for locator, request in pending if request.get("object_kind") == "pdf_page"), None)
     if full_page is not None:
         pending = [full_page]
+    first_content_failure = None
     for locator, request in pending:
         try:
             blocks = _ocr_content(source, unit, locator, config, ocr, request)
         except _UnitFailure as exc:
             unit.coverage.status = "needs_ocr" if exc.code == "OCR_REQUIRED" else "failed"
             unit.coverage.error_code = exc.code
+            if exc.code in getattr(ocr, "independent_object_errors", ()):
+                unit.coverage.transformations.append({"kind": "ocr_object_unread", "locator": locator,
+                                                      "error_code": exc.code})
+                if first_content_failure is None:
+                    first_content_failure = exc
+                continue
             raise
         if blocks is not None:
             if request.get("object_kind") == "pdf_page":
@@ -475,6 +482,10 @@ def _resolve_unread(source, unit, config, ocr, requests):
             else:
                 unit.coverage.unread_objects.remove(locator)
             unit.blocks.extend(blocks)
+    if first_content_failure is not None:
+        unit.coverage.status = "failed"
+        unit.coverage.error_code = first_content_failure.code
+        raise first_content_failure
     if unit.coverage.unread_objects:
         unit.coverage.status = "needs_ocr"
     elif any(block.origin == "ocr" for block in unit.blocks):

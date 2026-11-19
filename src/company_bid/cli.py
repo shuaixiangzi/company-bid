@@ -114,6 +114,10 @@ def main(argv=None):
             return 0
         if args.credential_file:
             auth_env = config.get("provider", {}).get("auth_env", "COMPANY_BID_API_KEY")
+            ocr = config.get("ocr")
+            if (isinstance(ocr, dict) and ocr.get("engine") == "deepseek_ocr" and
+                    config.get("provider", {}).get("mode") == "prepared"):
+                auth_env = ocr.get("auth_env", "COMPANY_BID_DEEPSEEK_API_KEY")
             if not auth_env.startswith("COMPANY_BID_"):
                 raise ProviderFailure("LOCAL_CREDENTIAL_ENV_PREFIX_REQUIRED")
             secret = args.credential_file.read_text(encoding="utf-8").strip()

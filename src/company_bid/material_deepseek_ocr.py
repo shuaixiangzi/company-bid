@@ -251,12 +251,26 @@ def _failure(exc, fallback):
                                      else fallback, details=getattr(exc, "details", {}))
 
 
-def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_reference=None):
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate OCR response key.")
+        result[key] = value
+    return result
+
+
+def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_reference=None,
+              purchase_key=None, operation="material_ocr", validate_result=None):
     """One request, durable reservation and capture; errors always propagate."""
     preflight = uuid.uuid4().hex
-    base = {"provider": "deepseek_official_ocr", "operation": "material_ocr"}
+    tender = operation == "tender_ocr"
+    base = {"provider": "deepseek_official_ocr", "operation": "tender_ocr" if tender else "material_ocr"}
     secret = ""
     try:
+        _require(tender and isinstance(purchase_key, str) and _SHA.fullmatch(purchase_key) and callable(validate_result)
+                 or operation == "material_ocr" and purchase_key is None and validate_result is None,
+                 "MATERIAL_OCR_OPERATION_INVALID")
         config = _options(options, require_expected=True)
         fingerprint = engine_fingerprint(config)
         _require(isinstance(identity, dict) and len(json_bytes(identity)) <= 65536
@@ -274,9 +288,16 @@ def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_refer
                    "request_body_ref": body_ref, "body_sha256": hashlib.sha256(body).hexdigest(),
                    "image_sha256": image_sha256, "image_dimensions": [width, height], "expected_pages": 1,
                    "engine_fingerprint": fingerprint, "automatic_retry": False, "local_fallback": False}
+        if tender:
+            request.update(operation=operation, purchase_key=purchase_key)
         _capture(ctx, "request-" + call_id, request, secret)
-        ctx.reserve_call(call_id, 1, config["reserve_usd_per_page"], config["max_run_usd"], config["max_run_calls"],
-                         input_hash=request["body_sha256"])
+        if tender:
+            from .material_ocr_budget import reserve_tender_ocr
+
+            reserve_tender_ocr(ctx, purchase_key, call_id, config, input_hash=request["body_sha256"])
+        else:
+            ctx.reserve_call(call_id, 1, config["reserve_usd_per_page"], config["max_run_usd"], config["max_run_calls"],
+                             input_hash=request["body_sha256"])
     except Exception as exc:
         failure = _failure(exc, "MATERIAL_OCR_PREFLIGHT_FAILED")
         try:
@@ -284,7 +305,7 @@ def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_refer
                      "error_class": type(exc).__name__, "details": failure.details}, secret)
         except MaterialDeepSeekOCRFailure:
             pass
-        ctx.call_event("material_ocr.preflight.failed", {**base, "phase": "preflight", "error_code": failure.code})
+        ctx.call_event(base["operation"] + ".preflight.failed", {**base, "phase": "preflight", "error_code": failure.code})
         raise failure from None
 
     metadata = {**base, "call_id": call_id, "call_attempt": 1, "input_hash": request["body_sha256"], "usage_status": "unknown"}
@@ -300,7 +321,8 @@ def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_refer
             metadata["output_hash"] = hashlib.sha256(raw).hexdigest()
             if len(raw) <= MAX_RESPONSE_BYTES:
                 try:
-                    payload = json.loads(raw.decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+                    payload = json.loads(raw.decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+                                         object_pairs_hook=_unique_json_object if tender else None)
                 except (ValueError, UnicodeError):
                     pass
             # A JSON \u escape must not bypass literal credential redaction.
@@ -330,6 +352,8 @@ def recognize(ctx, *, image_path, image_sha256, identity, options, numeric_refer
             _require(final_path == path and final_bytes == image, "MATERIAL_OCR_IMAGE_CHANGED_DURING_CALL")
             result.update(billing=billing, response_raw_ref=raw_ref, response_raw_sha256=metadata["output_hash"],
                           actual_external_call=True, response_reused=False, local_fallback=False)
+            if tender:
+                result["tender_ocr_response"] = validate_result(result)
             _capture(ctx, "validation-" + call_id, {"call_id": call_id, "validation_status": "passed",
                      "validated_output": result, "validated_output_hash": digest(result)}, secret)
             metadata.update(http_status=status, elapsed_ms=round((time.monotonic() - start) * 1000),

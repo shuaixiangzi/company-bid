@@ -311,7 +311,7 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
             continue
         item.update({key: event[key] for key in ("node_key", "node_attempt_id", "unit_id", "unit_attempt_id", "model", "provider", "prompt_version",
                     "operation", "input_hash", "output_hash", "trace_id", "span_id", "elapsed_ms", "input_tokens", "output_tokens", "total_tokens",
-                    "cost", "usage_status", "error_code", "validation_status", "provider_request_id") if key in event})
+                    "cost", "usage_status", "error_code", "validation_status", "provider_request_id", "http_status") if key in event})
     for identity, event in usage_events:
         item = calls.get(identity)
         if item is None or not any(name in item["events"] for name in ("call.started", "call.completed", "call.failed")):
@@ -320,6 +320,72 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         item["events"].append("call.usage_recorded")
         item.setdefault("usage_events", []).append({key: event.get(key) for key in
             ("trace_id", "span_id", "unit_id", "unit_attempt_id", "input_tokens", "output_tokens", "total_tokens", "cost", "output_hash")})
+    attempts_by_id = {(node["key"], attempt["attempt_id"]): attempt
+                      for node in state["nodes"] for attempt in node["attempts"]}
+
+    def tender_fee(call, reservation):
+        from .material_deepseek_ocr import PAGE_PRICE_CNY, returned_billable_pages
+
+        call_id = call["call_id"]
+        binding = {"call_id": call_id, "call_attempt": call["call_attempt"]}
+        call["page_billing"] = {"provider_returned_pages": None, "official_page_fee_estimate_cny": None,
+                                "reserved_upper_usd_retained": None, "provider_invoice": False}
+        if reservation is None:
+            gap("TENDER_OCR_RESERVATION_MISSING", **binding)
+            return
+        if (call.get("node_key") != "N1" or call["call_attempt"] != 1 or
+                any(call.get(key) != reservation.get(key) for key in ("unit_id", "unit_attempt_id", "input_hash")) or
+                reservation.get("settlement_status") != "reserved_unknown_actual_cost"):
+            gap("TENDER_OCR_RESERVATION_MISMATCH", **binding)
+            return
+        upper = reservation["estimated_upper_usd"]
+        call["page_billing"]["reserved_upper_usd_retained"] = upper
+        attempt = attempts_by_id.get((call["node_key"], call["node_attempt_id"]), {})
+
+        def capture(name, *, required):
+            matches = [entry for entry in attempt.get("captures", [])
+                       if entry["name"] == name and all(call.get(key) == entry.get(key)
+                                                       for key in ("unit_id", "unit_attempt_id"))]
+            if not matches and not required:
+                return None
+            if len(matches) != 1 or matches[0]["status"] != "captured":
+                gap("TENDER_OCR_CALL_CAPTURE_UNAVAILABLE", **binding)
+                return None
+            value = artifact_json(matches[0].get("ref"))
+            if not isinstance(value, dict) or value.get("call_id") != call_id:
+                gap("TENDER_OCR_CALL_CAPTURE_MISMATCH", **binding)
+                return None
+            return value
+
+        request = capture("request-" + call_id, required=True)
+        response = capture("response-" + call_id, required=call.get("http_status") is not None or call["outcome"] == "completed")
+        if request and (request.get("body_sha256") != call.get("input_hash") or
+                        not re.fullmatch("[0-9a-f]{64}", str(request.get("purchase_key", "")))):
+            gap("TENDER_OCR_CALL_CAPTURE_MISMATCH", **binding)
+            return
+        if request:
+            body = ref(request.get("request_body_ref"))
+            if not body or body.get("integrity") != "valid" or body.get("sha256") != call.get("input_hash"):
+                gap("TENDER_OCR_CALL_CAPTURE_MISMATCH", **binding)
+                return
+        if not request or not response:
+            return
+        raw = ref(response.get("raw_response_ref"))
+        if (not raw or raw.get("integrity") != "valid" or response.get("http_status") != call.get("http_status") or
+                response.get("raw_received_sha256") != call.get("output_hash") or
+                response.get("raw_capture_status") != "credential_echo_redacted" and raw.get("sha256") != call.get("output_hash")):
+            gap("TENDER_OCR_CALL_CAPTURE_MISMATCH", **binding)
+            return
+        pages = returned_billable_pages(response["http_status"], response.get("response"), request.get("purpose"))
+        page_fee = str(PAGE_PRICE_CNY * pages) if pages is not None else None
+        billing = response.get("billing")
+        if (not isinstance(billing, dict) or billing.get("provider_returned_pages") != pages or
+                billing.get("official_page_fee_estimate_cny") != page_fee or billing.get("reserve_usd_retained") != upper or
+                billing.get("provider_invoice") is not False or billing.get("usd_is_fx_conversion") is not False):
+            gap("TENDER_OCR_BILLING_EVIDENCE_MISMATCH", **binding)
+            return
+        call["page_billing"].update(provider_returned_pages=pages, official_page_fee_estimate_cny=page_fee)
+
     for call in calls.values():
         names = call["events"]
         call["outcome"] = "completed" if "call.completed" in names else "failed" if "call.failed" in names else "unknown"
@@ -361,6 +427,8 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
                 call.pop("cost", None)
         if reservation:
             call["settlement_status"] = reservation.get("settlement_status", "reserved_unknown_actual_cost")
+        if call.get("provider") == "deepseek_official_ocr" and call.get("operation") == "tender_ocr":
+            tender_fee(call, reservation)
     for reservation in reservations:
         identity = (reservation["node_attempt_id"], reservation["call_id"], reservation["call_attempt"])
         if identity not in calls:
@@ -380,7 +448,8 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
     ocr_rejections = [{key: event.get(key) for key in ("node_key", "unit_id", "unit_attempt_id",
         "error_code", "trace_id", "span_id")} for event in events
         if event.get("event") == "material.ocr_replay.rejected" or
-        event.get("event") == "material_ocr.preflight.failed" and event.get("provider") == "deepseek_official_ocr"]
+        event.get("event") in {"material_ocr.preflight.failed", "tender_ocr.preflight.failed"} and
+        event.get("provider") == "deepseek_official_ocr"]
     return {"schema_version": "chain.diagnostic-index.v1", "run_id": run_id, "run_status": state["status"],
             **local_ocr,
             "deepseek_ocr_calls": ocr_calls, "deepseek_ocr_actual_attempts": len(ocr_calls),

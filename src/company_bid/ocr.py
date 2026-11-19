@@ -25,6 +25,7 @@ from .reading import OcrResponse, ReadingBlock, _bounded_ocr_code
 
 
 OCR_VERSION = "vision-ocr-1"
+DEEPSEEK_OCR_VERSION = "tender-deepseek-ocr.v1"
 PROMPT_VERSION = "vision-ocr-prompt-1"
 RENDERER_VERSION = "pdfium-pillow-1"
 _SHA = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -46,14 +47,17 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class OcrOptions(_Strict):
-    provider: dict[str, Any]
-    model: str | None = None
+class RasterOptions(_Strict):
     render_dpi: int = Field(default=160, ge=72, le=300)
     max_image_pixels: int = Field(default=6_000_000, ge=1, le=6_000_000)
     max_image_bytes: int = Field(default=1_500_000, ge=1, le=1_500_000)
     max_image_edge: int = Field(default=3072, ge=1, le=3072)
     max_source_bytes: int = Field(default=150_000_000, ge=1, le=500_000_000)
+
+
+class OcrOptions(RasterOptions):
+    provider: dict[str, Any]
+    model: str | None = None
 
     @model_validator(mode="after")
     def valid_model(self):
@@ -122,7 +126,7 @@ def _capture(ctx, name, value):
         _fail("DIAGNOSTICS_CAPTURE_FAILED")
 
 
-def _read_source(request: _Request, options: OcrOptions) -> bytes:
+def _read_source(request: _Request, options: RasterOptions) -> bytes:
     # Bounded local reads only. URL-like inputs cannot become network requests.
     if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", request.path):
         _fail("OCR_REMOTE_SOURCE_FORBIDDEN")
@@ -141,13 +145,13 @@ def _read_source(request: _Request, options: OcrOptions) -> bytes:
     return data
 
 
-def _check_dimensions(width: int, height: int, options: OcrOptions):
+def _check_dimensions(width: int, height: int, options: RasterOptions):
     if (width < 1 or height < 1 or max(width, height) > options.max_image_edge or
             width * height > options.max_image_pixels):
         _fail("OCR_IMAGE_DIMENSION_LIMIT")
 
 
-def _pdf_image(request: _Request, data: bytes, options: OcrOptions):
+def _pdf_image(request: _Request, data: bytes, options: RasterOptions):
     import pypdfium2
     import pdfplumber
     from pypdf import PdfReader
@@ -183,7 +187,8 @@ def _pdf_image(request: _Request, data: bytes, options: OcrOptions):
             if index >= len(page.images):
                 _fail("OCR_REGION_IDENTITY_INVALID")
             actual = [float(page.images[index][key]) for key in ("x0", "top", "x1", "bottom")]
-            if any(abs(a - b) > 0.01 for a, b in zip(box, actual)):
+            if (request.ocr_version == DEEPSEEK_OCR_VERSION and box != actual or
+                    any(abs(a - b) > 0.01 for a, b in zip(box, actual))):
                 _fail("OCR_REGION_IDENTITY_INVALID")
             bounds = tuple(float(value) for value in page.bbox)
             if bounds[:2] != (0.0, 0.0) or not (0 <= box[0] < box[2] <= page.width and 0 <= box[1] < box[3] <= page.height):
@@ -226,7 +231,7 @@ def _indexed(element, tag, index):
     return items[index]
 
 
-def _docx_image(request: _Request, data: bytes, options: OcrOptions):
+def _docx_image(request: _Request, data: bytes, options: RasterOptions):
     if request.page is not None or request.bbox is not None or not request.package_part or not request.image_sha256:
         _fail("OCR_DOCX_IDENTITY_INVALID")
     part = PurePosixPath(request.package_part)
@@ -346,7 +351,7 @@ def _docx_image(request: _Request, data: bytes, options: OcrOptions):
                    "embedded_image_sha256": request.image_sha256, "exif_orientation": orientation}
 
 
-def _prepare_image(request: _Request, data: bytes, options: OcrOptions):
+def _prepare_image(request: _Request, data: bytes, options: RasterOptions):
     try:
         if request.object_kind.startswith("pdf_"):
             if not data.startswith(b"%PDF-"):
@@ -420,9 +425,15 @@ def _validate_result(raw: dict, request: _Request, image_sha256: str) -> dict:
 def create_ocr(ctx, options: dict):
     """Return the reader callback; no call occurs until a necessary object asks.
 
-    ``options.provider`` is the same frozen provider configuration used by other
-    nodes. Only ``model`` may override it; the context owns the shared run quota.
+    Automatic runs select the official OCR adapter from the frozen settings.
+    The legacy vision implementation remains available to direct callers.
     """
+    execution_config = getattr(ctx, "execution_config", {})
+    if execution_config.get("pipeline") == "automatic":
+        frozen = execution_config.get("ocr")
+        if not isinstance(frozen, dict) or frozen.get("engine") != "deepseek_ocr":
+            _fail("OCR_LEGACY_PROVIDER_DISABLED")
+        return create_deepseek_ocr(ctx, frozen)
     try:
         config = OcrOptions.model_validate(options)
         provider_options = dict(config.provider)
@@ -480,3 +491,17 @@ def create_ocr(ctx, options: dict):
                 raise
             raise ProviderFailure(code) from None
     return recognize
+
+
+def official_tender_options(options: dict) -> dict:
+    """Validate frozen N1 options and return the shared OCR provider settings."""
+    from .tender_deepseek_ocr import validate_options
+
+    return validate_options(options)[1]
+
+
+def create_deepseek_ocr(ctx, options: dict):
+    """Return the reader's one-shot official OCR callback."""
+    from .tender_deepseek_ocr import create_deepseek_ocr as create
+
+    return create(ctx, options)
