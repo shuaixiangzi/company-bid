@@ -6,6 +6,18 @@ from company_bid.pipeline import build_executor
 
 
 @pytest.mark.parametrize("keys", [
+    ("contract_interested_parties_source_resolution",),
+    ("failed_contract_interested_parties_replay",),
+    ("contract_interested_parties_source_resolution", "failed_contract_interested_parties_replay"),
+])
+def test_interested_parties_recovery_requires_proof_and_annex_history(tmp_path, keys):
+    from company_bid.pipeline import PipelineFailure
+
+    with pytest.raises(PipelineFailure, match="FAILED_CONTRACT_INTERESTED_PARTIES_CONFIG_INVALID"):
+        build_executor(tmp_path, {"pipeline": "automatic", "extraction": {key: {} for key in keys}})
+
+
+@pytest.mark.parametrize("keys", [
     ("contract_annex_source_resolution",),
     ("failed_contract_annex_replay",),
     ("contract_annex_source_resolution", "failed_contract_annex_replay"),
@@ -123,6 +135,7 @@ def test_review_table_recovery_requires_source_proof_and_prior_cover_replay(tmp_
     ("extraction.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("extraction_illustrations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("contract_annex_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
+    ("contract_interested_parties_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("extraction_replay_scope.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("extraction_failed_scoring_replay.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("price_scoring_sources.py", {"N2", "N3", "N4", "N5", "N6"}),

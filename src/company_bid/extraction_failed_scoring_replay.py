@@ -6,6 +6,7 @@ import hashlib
 import re
 
 from .contract_annex_sources import CONTRACT_ANNEX_SOURCE_CONFIG_KEY
+from .contract_interested_parties_sources import CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY
 from .diagnostic_replay import _id, _one, _require
 from .extraction_illustrations import ILLUSTRATION_SOURCE_CONFIG_KEY
 from .provider import ProviderFailure
@@ -24,6 +25,7 @@ RESPONSE_LETTER_SOURCE_CONFIG_KEY = "response_letter_source_resolution"
 FAILED_RESPONSE_CELL_REFLOW_REPLAY = "failed_response_cell_reflow_replay"
 FAILED_ILLUSTRATION_REPLAY = "failed_illustration_replay"
 FAILED_CONTRACT_ANNEX_REPLAY = "failed_contract_annex_replay"
+FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY = "failed_contract_interested_parties_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -39,6 +41,8 @@ _LETTER_KEYS = {FAILED_RESPONSE_LETTER_REPLAY, RESPONSE_LETTER_SOURCE_CONFIG_KEY
 _CELL_REFLOW_KEYS = {FAILED_RESPONSE_CELL_REFLOW_REPLAY, RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY}
 _ILLUSTRATION_KEYS = {FAILED_ILLUSTRATION_REPLAY, ILLUSTRATION_SOURCE_CONFIG_KEY}
 _CONTRACT_ANNEX_KEYS = {FAILED_CONTRACT_ANNEX_REPLAY, CONTRACT_ANNEX_SOURCE_CONFIG_KEY}
+_CONTRACT_INTERESTED_PARTIES_KEYS = {FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY,
+                                   CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY}
 
 
 class FailedScoringReplay:
@@ -70,7 +74,8 @@ class FailedScoringReplay:
                                                  FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                                  FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
                                                  *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS,
-                                                 *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS}}
+                                                 *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
+                                                 *_CONTRACT_INTERESTED_PARTIES_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -99,6 +104,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in illustration.actual_units(replay))
         if annex := getattr(replay, "_failed_contract_annex", None):
             expected_bindings.update(_TASK + unit for unit in annex.actual_units(replay))
+        if interested_parties := getattr(replay, "_failed_contract_interested_parties", None):
+            expected_bindings.update(_TASK + unit for unit in interested_parties.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -266,7 +273,8 @@ class FailedScoringRowsReplay:
                              if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                             FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
                                             *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS,
-                                            *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS}}
+                                            *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
+                                            *_CONTRACT_INTERESTED_PARTIES_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -784,6 +792,10 @@ class FailedContractAnnexReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_illustration
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_contract_interested_parties", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(len(order) == 59 and order[14] == self.predecessor.unit_id and order[23] == self.unit_id and
@@ -802,6 +814,56 @@ class FailedContractAnnexReplay(_StoppedResponseReplay):
                  proof.get("resolved_block_ids") == context["block_ids"] and
                  digest(proof.get("original_error")) ==
                  digest({"error_code": self.historical_failure, "diagnostic_context": context}), self.proof_error)
+
+    def predecessor_windows(self):
+        return self.predecessor.enriched_windows()
+
+
+class FailedContractInterestedPartiesReplay(_StoppedResponseReplay):
+    """Authenticate W25's actual success and W26's first response against v88."""
+
+    replay_key = FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY
+    proof_key = CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY
+    config_error = "FAILED_CONTRACT_INTERESTED_PARTIES_CONFIG_INVALID"
+    source_error = "FAILED_CONTRACT_INTERESTED_PARTIES_SOURCE_INVALID"
+    proof_error = "FAILED_CONTRACT_INTERESTED_PARTIES_PROOF_MISMATCH"
+    cold_error = "FAILED_CONTRACT_INTERESTED_PARTIES"
+    historical_failure = _FAILURE
+    lineage_basis = "authenticated_contract_interested_parties_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_contract_annex
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[23] == self.predecessor.unit_id and order[25] == self.unit_id and
+                 all(replay.windows[unit]["blocks"] for unit in order[24:26]), self.config_error)
+        return order[24:26]
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_contract_interested_parties_resolution
+
+        return _verified_contract_interested_parties_resolution(raw, window)
+
+    def verify_source_resolution(self, resolution, context):
+        from .extraction import PlanningError, verify_contract_interested_parties_predecessor
+
+        _require(isinstance(context, dict) and context.get("field") == "unresolved_block_ids" and
+                 isinstance(context.get("block_ids"), list) and len(context["block_ids"]) == 1 and
+                 resolution.get("resolved_block_ids") == context["block_ids"] and
+                 resolution.get("original_error") ==
+                 {"error_code": self.historical_failure, "diagnostic_context": context}, self.proof_error)
+        preceding_unit = self.prefix[-2]
+        _require(resolution["proof"]["predecessor"]["window_id"] == preceding_unit, self.proof_error)
+        # The actual call and complete checkpoint are also verified by
+        # verify_success, independent of binding iteration order.
+        _, _, _, data, _ = self.run.unit("N2", preceding_unit)
+        try:
+            verify_contract_interested_parties_predecessor(data, resolution["proof"])
+        except PlanningError as error:
+            raise ProviderFailure("DIAGNOSTIC_REPLAY_" + self.proof_error) from error
 
     def predecessor_windows(self):
         return self.predecessor.enriched_windows()
