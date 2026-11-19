@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import PurePosixPath
 import re
 import unicodedata
@@ -86,6 +87,12 @@ _RELATIVE_SUBMISSION = re.compile(rf"(?:应|须|需|必须)(?:在|于).{{0,45}}{
                                   rf"(?:完成)?(?:递交|提交|送达|上传){_BID_FILE}")
 _NON_SUBMISSION_DEADLINE = re.compile(r"(?:报名|发放|领取|获取|下载|答疑|报名费|澄清|异议|保证金|"
                                       r"开标|评审|投标有效期|响应有效期)(?:的)?(?:时间|日期|截止|受理|提交)?(?:为|:|\t)")
+_PLATFORM_SUBMISSION_NOTICE = re.compile(
+    r"^(?:\d+(?:\.\d+)*[.、]?)?(?:响应|投标|应答)文件(?:递交|提交|送达|上传)截止(?:时间|时点|日期|日):"
+    r"(?:详见|见)(?P<platform>[\u4e00-\u9fff]{2,40}(?:电子招标平台|招标采购平台))"
+    r"(?:\(网址:https?://[A-Za-z0-9][A-Za-z0-9./:_%-]{1,255}\))?"
+    r"(?:发布的)?(?:本项目)?(?:采购|招标)?公告[;。]?$"
+)
 _NEGATIVE = re.compile(r"(?:不要求|无需|无须|不必|不需要?|免于|免予|不应|不得|禁止|不允许|"
                        r"不接受|不采用|不适用|不含|不包括)(?:再|另行|重复)?(?:填写|填报|安排|配备|委派|拟派|"
                        r"选派|设立|设置|提供|提交|出具|附上?|核对|由|选择)?")
@@ -110,6 +117,170 @@ _CORPORATE_TABLE = re.compile(r"^(?:\d+[.、 ]*)?(?:公司|企业|投标人|响�
 _AGENT_PROOF_USE = re.compile(r"(?:必须|应|须|需)(?:附|提交|提供|出具)(?:由[^,]{1,40}签署的)?(?:法定代表人)?授权委托书")
 _QUOTED = re.compile(r'“[^”]*”|‘[^’]*’|「[^」]*」|『[^』]*』|"[^"\n]*"')
 _CST = timezone(timedelta(hours=8))
+
+PERSONNEL_ROLES = {
+    "personnel_qualification_manager": "资格项目经理（负责人）",
+    "personnel_scoring_manager": "评分项目负责人",
+    "personnel_scoring_technical_lead": "评分技术负责人",
+    "personnel_scoring_site_staff": "评分现场工作人员",
+}
+QUALIFICATION_PERSONNEL = "personnel_qualification_manager"
+EMPLOYMENT_STATUSES = {
+    "employee": "本单位在职",
+    "retired_rehire": "退休返聘",
+    "unverified": "用工情形待核",
+}
+PERSONNEL_PROOF_FIELDS = {"payment_source_ref": "社保缴费证明",
+                          "labor_contract_source_ref": "本单位劳动合同",
+                          "retirement_proof_source_ref": "退休证明",
+                          "rehire_contract_source_ref": "返聘劳务合同"}
+_MONTHLY_PAYMENT = (
+    r"投标截止日前近(?:6|六)个月内任意(?:一|1)个月本单位缴纳社保的证明材料"
+    r"\(保险证明需体现:工伤、失业、养老并加盖社保公章\)"
+)
+_QUALIFICATION_PERSONNEL_CLAUSE = re.compile(
+    r"^(?:\d+(?:\.\d+)+[.、]?)?项目(?:经理\(负责人\)|负责人)资格要求:(?:1|一)人,①(?P<experience>[^②③]+)[;。]"
+    r"②提供本单位劳动合同[;。]③需提供" + _MONTHLY_PAYMENT
+    + r"\(如是退休返聘人员,需提供退休证明和返聘劳务合同\)[;。]?$"
+)
+_QUALIFICATION_EXPERIENCE = re.compile(
+    r"^(?:自\d{4}年\d{1,2}月\d{1,2}日起(?:至今)?)?作为项目(?:经理\(负责人\)|负责人)"
+    r"参与(?:过)?同类项目业绩,(?:须|应|需|必须)提供(?:有效)?证明(?:材料|资料)(?:[:。]|$)"
+)
+_QUALIFICATION_PERSONNEL_TEMPLATE = re.compile(
+    r"^\d+(?:\.\d+)+[.、]?项目经理\(负责人\)投标截止日前近(?:6|六)个月内任意(?:一|1)个月"
+    r"本单位缴纳社保的证明材料\(加盖社保公章\)\(保险证明需体现:工伤、失业、养老\)"
+    r"\(如是退休返聘人员,需提供退休证明和返聘劳务合同\)\(清晰扫描件\)$"
+)
+_SCORING_PERSONNEL_ROW = re.compile(
+    r"(?m)^[^\S\n\t]*项目组织\s*机构\s*[（(]\s*[7７]\s*分\s*[）)][^\S\t]*"
+    r"\t(?P<content>[^\t]+)\t[^\S\n\t]*[7７](?=[^\S\n\t]*(?:\n|$))"
+)
+_SCORING_PERSONNEL_CONTENT = re.compile(
+    r"^1[.、](?P<manager>项目负责人.{1,240}?)2[.、](?P<technical>.{1,120}?)"
+    r"3[.、](?P<site>.{1,120}?)\(以上人员须提供" + _MONTHLY_PAYMENT
+    + r"\)?[;。]注:以上相关人员需提供证件扫描件加盖公章,不提供的不得分[;。]?$"
+)
+_AMPP = r"AMPP\(原NACE\)阴极保护认证体系中"
+_CPL = "中国阴极保护协会"
+_SCORING_MANAGER = re.compile(
+    rf"^项目负责人(?:须|需)?具有{_AMPP}CP1级证书或{_CPL}CPL1级证书得2分;"
+    rf"具有{_AMPP}CP2级证书或{_CPL}CPL2级及以上证书得3分,满分3分;$"
+)
+_SCORING_TECHNICAL = re.compile(r"^(?:须|需)?配备(?:1|一)名具有中级及以上职称证书的技术负责人得1分,"
+                                r"每多配备(?:1|一)名(?:满足|符合)上述要求的技术负责人加1分,满分2分;$")
+_SCORING_SITE = re.compile(r"^(?:须|需)配备现场工作人员,每(?:提供|配备)(?:1|一)人得1分,满分2分[;。]"
+                           r"(?:须|需)在响应文件(?:的)?技术服务项目组成员表中列明[;。]$")
+_SCORING_NEGATION = re.compile(r"无需|无须|不需|不得|禁止|不认可|不予|不满足|不计分")
+_SCORING_PERSONNEL_TERMS = {
+    "personnel_scoring_manager": {"maximum_points": 3, "certificate_tiers": [
+        {"ampp": "CP1", "association": "CPL1", "points": 2},
+        {"ampp": "CP2", "association": "CPL2 及以上", "points": 3},
+    ]},
+    "personnel_scoring_technical_lead": {"maximum_points": 2, "points_per_person": 1, "people_for_max_points": 2,
+                                         "certificate": "中级及以上职称证书"},
+    "personnel_scoring_site_staff": {"maximum_points": 2, "points_per_person": 1, "people_for_max_points": 2,
+                                     "list_in": "技术服务项目组成员表"},
+}
+
+
+def _personnel_text(text: str) -> str:
+    # The circled markers identify independent subclauses. NFKC would turn them
+    # into digits and make a number at a line start indistinguishable from a marker.
+    parts = re.split(r"([①②③])", text)
+    return re.sub(r"\s+", "", "".join(part if part in "①②③" else _normalize(part) for part in parts))
+
+
+def _original_quote_sources(req, sources, *, synthetic=False):
+    refs = [sources[ref] for ref in req["source_refs"]]
+    quote_hash = "quote_sha256=" + hashlib.sha256(req["text"].encode()).hexdigest()
+    if refs and all(source["kind"] == "tender" and
+                    (source["provenance"] == "original" or synthetic and source["provenance"] == "synthetic") and
+                    quote_hash in source["locator"].split("; ") for source in refs):
+        return refs
+    return []
+
+
+def _scoped_personnel_requirements(prepared, sources, excluded):
+    """Recognize the complete qualification family and one technical score row.
+
+    The normal CLI supplies the validated automatic N3 plan. In particular, a
+    manual extract, an unrelated roster, or a lone numbered subclause cannot
+    attest to the missing role or transfer the qualification branch to scoring.
+    """
+    if prepared.get("input_kind") != "automatic":
+        return {}, set()
+    found = defaultdict(list)
+    isolated = set()
+    templates = set()
+    for req in prepared["requirements"]:
+        rid = req["requirement_id"]
+        if rid in excluded or req["category"] not in {"qualification", "technical"} or req["response_mode"] == "procedure":
+            continue
+        refs = _original_quote_sources(req, sources, synthetic=prepared.get("synthetic", False))
+        if not refs:
+            continue
+        if req["category"] == "qualification" and all(
+                re.match(r"pdf/page\[\d+\]/line\[\d+\];", source["locator"]) for source in refs):
+            clause = _personnel_text(req["text"])
+            if match := _QUALIFICATION_PERSONNEL_CLAUSE.fullmatch(clause):
+                has_experience_proof = bool(_QUALIFICATION_EXPERIENCE.search(match["experience"]))
+                found["qualification"].append((req, (0, len(req["text"])), has_experience_proof))
+                isolated.add(rid)
+            elif _QUALIFICATION_PERSONNEL_TEMPLATE.fullmatch(clause):
+                templates.add(rid)
+        if req["category"] != "technical" or not all(
+                re.match(r"pdf/page\[\d+\]/table\[\d+\];", source["locator"]) for source in refs):
+            continue
+        rows = list(_SCORING_PERSONNEL_ROW.finditer(req["text"]))
+        if rows:
+            isolated.add(rid)
+        match = _SCORING_PERSONNEL_CONTENT.fullmatch(_personnel_text(rows[0]["content"])) if len(rows) == 1 else None
+        if (match and not any(_SCORING_NEGATION.search(item) for item in match.groups())
+                and _SCORING_MANAGER.fullmatch(match["manager"]) and _SCORING_TECHNICAL.fullmatch(match["technical"])
+                and _SCORING_SITE.fullmatch(match["site"])):
+            found["scoring"].append((req, rows[0].span(), False))
+    groups = {scope: items[0] for scope, items in found.items() if len(items) == 1}
+    if "qualification" in groups:
+        isolated.update(templates)
+    return groups, isolated
+
+
+def _scoped_personnel_questions(prepared, sources, groups):
+    rows = []
+    for key, label in PERSONNEL_ROLES.items():
+        scope = "qualification" if key == QUALIFICATION_PERSONNEL else "scoring"
+        if scope not in groups:
+            continue
+        req, span, has_experience_proof = groups[scope]
+        rid = req["requirement_id"]
+        refs = req["source_refs"]
+        complete = span == (0, len(req["text"]))
+        issues = [issue for issue in prepared["issues"] if complete and issue["requirement_refs"] == [rid]]
+        evidence = [_source_location(sources[ref], "tender") for ref in refs]
+        if complete:
+            evidence.extend(_related_proof("payment_evidence", prepared, [rid], issues, sources))
+        fields = {"name": "姓名", "employer": "用工主体", "paid_month": "凭证载明的缴费月份（YYYY-MM）",
+                  "payment_source_ref": "社保缴费证明来源编号"}
+        conditions = {"scope": scope, "window_months": 6, "months_to_prove": 1, "payment_by_bidder": True,
+                      "insurance_types": ["工伤", "失业", "养老"], "requires_social_insurance_seal": True}
+        if scope == "qualification":
+            conditions.update(required_people=1, requires_labor_contract=True,
+                              retirement_rehire={"required_proofs": ["退休证明", "返聘劳务合同"]})
+            if has_experience_proof:
+                conditions["requires_similar_project_experience_proof"] = True
+            fields.update(employment_status=list(EMPLOYMENT_STATUSES),
+                          labor_contract_source_ref="本单位劳动合同来源编号",
+                          retirement_proof_source_ref="退休证明来源编号",
+                          rehire_contract_source_ref="返聘劳务合同来源编号")
+        else:
+            conditions.update(requires_stamped_certificate_scans=True, **_SCORING_PERSONNEL_TERMS[key])
+        rows.append({"key": key, "label": label, "status": "unresolved", "requirement_ids": [rid],
+                     "issue_ids": [issue["issue_id"] for issue in issues], "source_refs": refs,
+                     "evidence_refs": evidence, "value": None, "value_source_refs": [],
+                     "conditions": conditions, "depends_on": None, "answer_fields": {"people": [fields]},
+                     "source_quote_range": list(span)})
+    return rows
 
 
 def _normalize(text: str) -> str:
@@ -301,6 +472,7 @@ def build_project_questions(prepared: dict, *, project_source_ids: set[str] | No
     requirements = {}
     relevant = defaultdict(list)
     deadline_values = defaultdict(list)
+    platform_notices = defaultdict(list)
     payment_conditions = defaultdict(set)
     allowed_signers = []
     required_role_sources = defaultdict(list)
@@ -310,6 +482,7 @@ def build_project_questions(prepared: dict, *, project_source_ids: set[str] | No
     manager_lots = set()
     contract_requirements = {ref for section in prepared["sections"] if _CONTRACT_SECTION.search(section["title"])
                              for ref in section["requirement_refs"]}
+    personnel_groups, isolated_personnel = _scoped_personnel_requirements(prepared, sources, contract_requirements)
     for requirement in prepared["requirements"]:
         rid = requirement["requirement_id"]
         refs = [ref for ref in requirement["source_refs"] if sources[ref]["kind"] == "tender" and
@@ -318,6 +491,15 @@ def build_project_questions(prepared: dict, *, project_source_ids: set[str] | No
         if not refs or rid in contract_requirements or _SCOPE_EXCLUSION.search(text):
             continue
         requirements[rid] = refs
+        if rid in isolated_personnel:
+            if any(rid == item["requirement_id"] for item, *_ in personnel_groups.values()):
+                relevant["deadline"].append(rid)
+            continue
+        if personnel_groups and (notice := _PLATFORM_SUBMISSION_NOTICE.fullmatch(re.sub(r"\s+", "", text))):
+            originals = _original_quote_sources(requirement, sources)
+            if originals and all(re.match(r"pdf/page\[\d+\]/line\[\d+\];", source["locator"]) for source in originals):
+                relevant["deadline"].append(rid)
+                platform_notices[notice["platform"]].extend(source["source_id"] for source in originals)
         if _AGENT_FORM.search(text):
             agent_forms.append(rid)
             continue
@@ -400,6 +582,9 @@ def build_project_questions(prepared: dict, *, project_source_ids: set[str] | No
                 value = {"submitted_before": date, "source_ref": value_refs[0]}
             elif len(deadline_values) > 1:
                 conditions["source_conflict"] = True
+            if value is None and len(platform_notices) == 1:
+                name, notice_refs = next(iter(platform_notices.items()))
+                conditions["platform_notice"] = {"name": name, "source_refs": list(dict.fromkeys(notice_refs))}
         elif key == "payment_evidence":
             conditions = {name: next(iter(values)) for name, values in payment_conditions.items() if len(values) == 1}
             if any(len(values) > 1 for values in payment_conditions.values()):
@@ -420,4 +605,4 @@ def build_project_questions(prepared: dict, *, project_source_ids: set[str] | No
                         "requirement_ids": ids, "issue_ids": [issue["issue_id"] for issue in issues], "source_refs": refs,
                         "evidence_refs": evidence, "value": value, "value_source_refs": value_refs,
                         "conditions": conditions, "depends_on": depends_on})
-    return answers
+    return [*answers, *_scoped_personnel_questions(prepared, sources, personnel_groups)]

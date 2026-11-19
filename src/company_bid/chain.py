@@ -141,7 +141,11 @@ def intake_nodes(root: Path, version, settings: dict):
     mapping_keys = tuple(dict.fromkeys(("mapping_provider", mapping_provider_key, "planning") +
                          (() if settings.get("mapping_provider") else ("structured_provider",))))
     reading_keys = ("reading", "ocr") + (("provider",) if settings.get("ocr") is not None and "provider" not in settings["ocr"] else ())
-    planning_version = hashlib.sha256((version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py", "preparation_rules.py", "material_matching.py", "slots.py", "provider.py", "structured.py", "native_layout.py", "source_format.py", "source_format_contracts.py") + "|" + importlib.metadata.version("pdfplumber")).encode()).hexdigest()
+    planning_source = version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "planning.py",
+                              "preparation_rules.py", "material_matching.py", "slots.py", "provider.py",
+                              "structured.py", "native_layout.py", "source_format.py", "source_format_contracts.py")
+    layout_dependencies = [importlib.metadata.version(name) for name in ("pdfplumber", "pypdfium2")]
+    planning_version = hashlib.sha256("|".join([planning_source, *layout_dependencies]).encode()).hexdigest()
     return [NodeSpec("N0", freeze_version, freeze, config_keys=()),
             NodeSpec("N1", parser_version, read, config_keys=reading_keys),
             NodeSpec("N2", version(*core, "extraction.py", "source_clauses.py", "table_continuations.py", "provider.py", "structured.py", "diagnostic_replay.py"), extract,

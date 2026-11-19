@@ -5,6 +5,7 @@ import re
 from copy import deepcopy
 from datetime import date, datetime
 
+from .project_questions import EMPLOYMENT_STATUSES, PERSONNEL_PROOF_FIELDS, PERSONNEL_ROLES, QUALIFICATION_PERSONNEL
 from .slots import whole_cell_slot
 from .source_format_contracts import format_digest, negative_fill_instruction
 
@@ -38,6 +39,7 @@ _SIGNING_PROOF_SPLIT = re.compile(r"[。；;！？\n]|[，,](?=(?:由(?:(?:响�
                                   rf"(?:其)?(?:委托|授权)?代理人).{{0,16}}(?:{_SIGNING_ACTION}))")
 _NO_SIGNING_PROOF = re.compile(r"无需|无须|不需|不必|不得|不应|不能|免于|不用|不要")
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_MONTH = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
 _CST_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?\+08:00")
 
 
@@ -73,11 +75,39 @@ def _known(question):
     return question.get("value") if question.get("status") == "known" else None
 
 
+def _validate_role_answer(question, answer):
+    key = question["key"]
+    if not isinstance(answer, dict) or set(answer) != {"people"} or not isinstance(answer["people"], list):
+        raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_INVALID")
+    people = answer["people"]
+    if key == QUALIFICATION_PERSONNEL and len(people) > 1:
+        raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_QUALIFICATION_COUNT")
+    fields = question["answer_fields"]["people"][0]
+    names = set()
+    for person in people:
+        if not isinstance(person, dict) or not person or not set(person) <= set(fields) or any(
+                not _one_line(value, 48 if field == "name" else 128) for field, value in person.items()):
+            raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_INVALID")
+        name = person.get("name")
+        if name and name in names:
+            raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_DUPLICATE_PERSON")
+        if name:
+            names.add(name)
+        month = person.get("paid_month")
+        if month and (not _ISO_MONTH.fullmatch(month) or month.startswith("0000")):
+            raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_MONTH_INVALID")
+        employment = person.get("employment_status", "unverified")
+        if employment not in EMPLOYMENT_STATUSES or (
+                {"retirement_proof_source_ref", "rehire_contract_source_ref"} & person.keys()
+                and employment != "retired_rehire"):
+            raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_EMPLOYMENT_INVALID")
+
+
 def validate_project_answer_values(questions: list[dict], answers: dict) -> None:
     """Validate the finite answer schema before consuming or freezing its facts."""
     rows = {question["key"]: question for question in questions}
     allowed = set(rows)
-    if not isinstance(answers, dict) or not set(answers) <= (allowed & set(_LABELS)):
+    if not isinstance(answers, dict) or not set(answers) <= (allowed & (_LABELS.keys() | PERSONNEL_ROLES.keys())):
         raise ProjectAnswerError("PROJECT_ANSWER_FIELD_OUT_OF_SCOPE")
     if set(answers) & {"manager_name", "employer", "payment_evidence"} and any(
             question["key"] == "manager_name" and question.get("conditions", {}).get("ambiguous_assignment_scope")
@@ -108,6 +138,85 @@ def validate_project_answer_values(questions: list[dict], answers: dict) -> None
         if not _shape(answers["payment_evidence"], {"person_name": 48, "employer": 120, "paid_on": 10, "source_ref": 128}):
             raise ProjectAnswerError("PROJECT_ANSWER_PAYMENT_INVALID")
         _day(answers["payment_evidence"]["paid_on"])
+    for key in PERSONNEL_ROLES.keys() & answers.keys():
+        _validate_role_answer(rows[key], answers[key])
+
+
+def personnel_role_notes(question, value, official_deadline=None):
+    """Describe declarations for a single role without certifying their evidence."""
+    if not value["people"]:
+        return ["本岗位登记为待核，人选及证明尚待补充。"]
+    notes = []
+    for index, person in enumerate(value["people"], 1):
+        name = person.get("name") or "姓名待核"
+        employer = person.get("employer") or "用工主体待核"
+        terms = [name, employer]
+        employment = person.get("employment_status", "unverified")
+        retired = employment == "retired_rehire"
+        month = person.get("paid_month")
+        if month:
+            terms.append(f"填报缴费月份 {month}，实缴凭证待核")
+            if not official_deadline:
+                terms.append("正式递交截止及适用月份待核")
+            else:
+                year, number = map(int, month.split("-"))
+                cutoff = _deadline(official_deadline["submitted_before"])
+                distance = (cutoff.year - year) * 12 + cutoff.month - number
+                window = question["conditions"]["window_months"]
+                if distance in {0, window}:
+                    terms.append("填报月份位于期限边界，核对实际缴费日期及适用口径")
+                elif 0 < distance < window:
+                    terms.append("填报月份位于截止月之前的完整月份范围，实缴与人员归属仍待核")
+                else:
+                    terms.append("填报月份超出该月窗范围，请核对或补录")
+        elif not retired:
+            terms.append("凭证载明的缴费月份待核")
+        if question["key"] == QUALIFICATION_PERSONNEL:
+            terms.append(EMPLOYMENT_STATUSES[employment] + ("，人员关系待核" if employment != "unverified" else ""))
+            if retired:
+                proof_fields = ("retirement_proof_source_ref", "rehire_contract_source_ref")
+                if "labor_contract_source_ref" in person:
+                    proof_fields += ("labor_contract_source_ref",)
+                terms.append("按资格条款核对本次退休返聘的适用情形")
+            else:
+                proof_fields = ("labor_contract_source_ref",)
+        else:
+            proof_fields = ()
+        if not retired or "payment_source_ref" in person:
+            proof_fields = ("payment_source_ref", *proof_fields)
+        for field in proof_fields:
+            label = PERSONNEL_PROOF_FIELDS[field]
+            ref = person.get(field)
+            terms.append(f"{label}候选 {ref} 待核" if ref else f"{label}待核")
+        notes.append(f"第 {index} 人。经办填报 " + "，".join(terms) + "。")
+    return notes
+
+
+def personnel_role_requirements(question):
+    terms = question["conditions"]
+    notes = []
+    if question["key"] == QUALIFICATION_PERSONNEL:
+        notes.extend([f"资格要求 {terms['required_people']} 名项目经理（负责人）。请核对本单位劳动合同。",
+                      "如为退休返聘，请分别核对退休证明和返聘劳务合同，并按资格条款核对该情形。"])
+        if terms.get("requires_similar_project_experience_proof"):
+            notes.append("请核对其作为项目经理（负责人）参与同类项目的业绩证明。")
+    else:
+        if tiers := terms.get("certificate_tiers"):
+            for tier in tiers:
+                notes.append(f"AMPP（原 NACE）阴极保护认证的 {tier['ampp']} 或中国阴极保护协会的 "
+                             f"{tier['association']} 证书对应 {tier['points']} 分。")
+            notes.append(f"该项满分 {terms['maximum_points']} 分。")
+        else:
+            notes.append(f"评分每名符合条件的人员 {terms['points_per_person']} 分，满分 {terms['maximum_points']} 分，"
+                         f"{terms['people_for_max_points']} 人对应评分上限。")
+        if certificate := terms.get("certificate"):
+            notes.append(f"请核对每名技术负责人的{certificate}。")
+        if table := terms.get("list_in"):
+            notes.append(f"请在《{table}》列明现场工作人员。")
+        notes.append("评分人员还须逐人核对加盖公章的证件扫描件。评分条款未载退休返聘替代凭证。")
+    notes.append(f"社保证明取投标截止日前近 {terms['window_months']} 个月内任意 {terms['months_to_prove']} 个月"
+                 "本单位缴费记录，须体现工伤、失业、养老并加盖社保公章。")
+    return notes
 
 
 def _fact(plan, key, value, source_ref, *, label=None, evidence_refs=()):
@@ -437,6 +546,46 @@ def _add_pending_payment(plan, section, scope, source, proof, signing_ref):
     section["attachment_refs"].append(identity)
 
 
+def _validate_role_proof_sources(question, answer, sources):
+    proof = [item for item in question["evidence_refs"] if item["kind"] in {"attachment", "reviewed_registration"}]
+    for person in answer["people"]:
+        for field in PERSONNEL_PROOF_FIELDS.keys() & person.keys():
+            ref = person[field]
+            source = sources.get(ref, {})
+            matches = [item for item in proof if item["source_ref"] == ref]
+            if source.get("kind") not in {"attachment", "company_material"} or not matches:
+                raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_PROOF_OUT_OF_SCOPE")
+            if any(item["kind"] == "reviewed_registration" for item in matches):
+                raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_REGISTRATION_NOT_PROOF")
+
+
+def _apply_scoped_personnel(plan, questions, answers, sources):
+    deadline, verified = _qualify_deadline(questions.get("deadline", {}), answers.get("deadline"), sources)
+    requirements = {item["requirement_id"]: item for item in plan["requirements"]}
+    next_number = max((int(issue["issue_id"][2:]) for issue in plan["issues"]), default=0) + 1
+    for key in PERSONNEL_ROLES:
+        if key not in answers:
+            continue
+        question = questions[key]
+        value = answers[key]
+        _validate_role_proof_sources(question, value, sources)
+        refs = question["requirement_ids"]
+        sections = [section for section in plan["sections"] if set(refs) <= set(section["requirement_refs"])
+                    and section["section_id"] != plan.get("prescribed_cover_section_id")]
+        if not sections:
+            raise ProjectAnswerError("PROJECT_ANSWER_PERSONNEL_SECTION_MISSING")
+        target = min(sections, key=lambda section: (section["document_role"] != "response",
+                     bool(section.get("native_format")), len(section["requirement_refs"])))
+        notes = personnel_role_notes(question, value, deadline if verified else None)
+        start, end = question["source_quote_range"]
+        quote = requirements[refs[0]]["text"][start:end]
+        plan["issues"].append({"issue_id": f"M-{next_number:03d}", "title": question["label"] + "材料待核",
+                               "section_id": target["section_id"], "requirement_refs": refs,
+                               "reason": "\n".join(notes), "action": "".join(personnel_role_requirements(question)),
+                               "source_requirement": quote, "severity": "warning"})
+        next_number += 1
+
+
 def apply_project_answers(plan: dict, questions: list[dict], answers: dict, source_ref: str, *,
                           uploaded_payment_source_id: str | None = None) -> dict:
     """Project confirmed decisions into N4's plan without altering frozen inputs."""
@@ -451,6 +600,8 @@ def apply_project_answers(plan: dict, questions: list[dict], answers: dict, sour
     indexed = {question["key"]: question for question in questions}
     if set(answers) & _SOCIAL_FIELDS:
         _apply_personnel(result, indexed, answers, sources, source_ref, uploaded_payment_source_id)
+    if answers.keys() & PERSONNEL_ROLES.keys():
+        _apply_scoped_personnel(result, indexed, answers, sources)
     if set(answers) & _SIGNING_FIELDS:
         _apply_signing(result, indexed, answers, source_ref)
     return result

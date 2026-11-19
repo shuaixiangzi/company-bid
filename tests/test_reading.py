@@ -278,8 +278,8 @@ class GlyphPage:
     def find_tables(self, **kwargs):
         return []
 
-    def extract_words(self):
-        return [{"text": self.chars[0]["text"], "x0": 10, "x1": 20, "top": 30, "bottom": 40}]
+    def extract_words(self, *, return_chars=False):
+        return [{**self.chars[0], **({"chars": self.chars} if return_chars else {})}]
 
 
 def glyph_config(document, **changes):

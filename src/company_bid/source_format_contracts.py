@@ -423,6 +423,8 @@ class NativePageScope(_FormatModel):
 
 class NativeParagraphLayoutV2(NativeParagraphLayout):
     physical_page: int = Field(ge=1)
+    ink_color_rgb: Annotated[str, Field(pattern=r"^[0-9A-F]{6}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
 
 
 class NativeTableLayoutV2(NativeTableLayout):

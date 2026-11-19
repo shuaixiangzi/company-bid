@@ -31,7 +31,7 @@ from .contract_pending_plan import contract_pending_plan
 from .contract_review_slots import _CONTRACT as _CONTRACT_SOURCE_HEADING
 
 
-PLANNING_VERSION = "bid-plan-v27"
+PLANNING_VERSION = "bid-plan-v28"
 # Preserve the unchanged, independently checkpointed field-mapping request.
 MAPPING_VERSION = "bid-plan-v24"
 
@@ -235,11 +235,16 @@ def _canonical(label: str) -> str:
     return next((_normal(group[0]) for group in _LABEL_GROUPS if label in {_normal(v) for v in group}), label)
 
 
-def _fact_index(manifest: dict) -> list:
+def _fact_index(manifest: dict, *, limited_tender_scope: bool = False) -> list:
     facts = copy.deepcopy(manifest.get("facts", []))
+    identities = [("project", "项目名称")]
+    # A scoped original-page diagnostic can carry a company display label
+    # without providing company evidence. An explicit fact remains eligible.
+    if not limited_tender_scope:
+        identities.append(("company", "投标人名称"))
     facts.extend({"fact_id": _id("F-INPUT-", [key, manifest[key]]), "label": label,
                   "value": manifest[key]["name"], "source_refs": manifest[key]["source_refs"]}
-                 for key, label in (("project", "项目名称"), ("company", "投标人名称")))
+                 for key, label in identities)
     _fail(len({f["fact_id"] for f in facts}) != len(facts), "DUPLICATE_FACT_ID")
     # Identical duplicate values can share a label. Conflicting values stay
     # ambiguous rather than selecting the first library record.
@@ -783,6 +788,69 @@ def _source_format_additions(extracted, blocks, documents, formats):
     return additions
 
 
+def _fixed_native_table_notes(body, anchors):
+    """Recognize numbered explanatory notes immediately following a prescribed native table."""
+    result = {}
+    numbered = re.compile(r"^(\d{1,3})([.．、])\s*(?!\d)(\S.*)$")
+    for index, start in enumerate(body):
+        anchor = anchors.get(start["block_id"])
+        if not anchor or anchor["status"] != "prescribed" or not anchor["title"].endswith("表"):
+            continue
+        if index + 2 >= len(body):
+            continue
+        table, opening = body[index + 1:index + 3]
+        introduction = re.fullmatch(r"注[：:]\s*(.+)", opening["text"].strip())
+        first_item = numbered.fullmatch(introduction[1]) if introduction else None
+        frame = start.get("source_id"), start.get("page")
+
+        def native(block, kind):
+            return (frame[1] is not None and (block.get("source_id"), block.get("page")) == frame and
+                    block["kind"] == kind and block.get("origin") == "native" and
+                    not block.get("read_disposition") and bool(block.get("bbox")))
+
+        if (not native(start, "paragraph") or not native(table, "table") or not native(opening, "paragraph") or
+                not first_item or first_item[1] != "1" or opening["block_id"] in anchors or
+                not -1 <= opening["bbox"][1] - table["bbox"][3] <= 16):
+            continue
+        marker, number, previous = first_item[2], 1, opening
+        for position in range(index + 3, len(body)):
+            block = body[position]
+            if (not native(block, "paragraph") or block["block_id"] in anchors or
+                    abs(block["bbox"][0] - opening["bbox"][0]) > 1 or
+                    not 0 < block["bbox"][1] - previous["bbox"][1] <= 30):
+                break
+            text = block["text"].strip()
+            level = _heading_level(text)
+            item = numbered.fullmatch(text)
+            if item:
+                if int(item[1]) != number + 1 or item[2] != marker:
+                    break
+                if level is not None:
+                    following = body[position + 1] if position + 1 < len(body) else {}
+                    if (not re.search(r"[，,]", item[3]) or
+                            re.search(r"(?:表|函|书|资料|材料|方案|声明|承诺|证明|清单|目录)$", item[3]) or
+                            not following or not native(following, "paragraph") or
+                            following["block_id"] in anchors or
+                            abs(following["bbox"][0] - opening["bbox"][0]) > 1 or
+                            not 0 < following["bbox"][1] - block["bbox"][1] <= 30 or
+                            numbered.match(following["text"].strip()) or
+                            _heading_level(following["text"]) is not None or
+                            not re.search(r"[。；]$", following["text"].strip())):
+                        break
+                    proof = {"rule": "fixed_native_table_numbered_notes_v1",
+                             "anchor_block_id": start["block_id"], "table_block_id": table["block_id"],
+                             "introducer_block_id": opening["block_id"], "previous_block_id": previous["block_id"],
+                             "continuation_block_id": following["block_id"], "item_number": int(item[1]),
+                             "number_marker": marker, "original_heading_level": level,
+                             "text_sha256": hashlib.sha256(block["text"].encode()).hexdigest()}
+                    result[block["block_id"]] = {**proof, "proof_sha256": _hash(proof)}
+                number = int(item[1])
+            elif level is not None:
+                break
+            previous = block
+    return result
+
+
 def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, list, list]:
     """Account for whole structural format regions, including window continuations.
 
@@ -810,10 +878,10 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             errors.append({"reason": "source_role_conflict", "block_id": anchor,
                            "format_id": anchors[anchor]["format_id"],
                            "source_role": source_roles[anchor]["source_role"]})
-        letter_items = _fixed_letter_items(body, anchors)
+        continuation_items = _fixed_letter_items(body, anchors) | _fixed_native_table_notes(body, anchors)
 
         def structural_level(block):
-            return None if block["block_id"] in letter_items else _heading_level(block.get("text", ""))
+            return None if block["block_id"] in continuation_items else _heading_level(block.get("text", ""))
 
         regions = []
         for i, block in enumerate(body):
@@ -908,8 +976,8 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
             if source_role:
                 row.update(copy.deepcopy(source_role))
                 row["instruction_requirements"] = instruction_requirements
-            if block_id in letter_items:
-                row["continuation_basis"] = letter_items[block_id]
+            if block_id in continuation_items:
+                row["continuation_basis"] = continuation_items[block_id]
             if block_id in boundaries:
                 boundary = boundaries[block_id]
                 row["boundary_basis"] = {
@@ -1379,7 +1447,7 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             recall_settings=config.get("semantic_material_recall"), recall_handled=recall_handled)
         sources = copy.deepcopy(manifest["sources"])
         source_map = {item["source_id"]: item for item in sources}
-        facts = _fact_index(manifest)
+        facts = _fact_index(manifest, limited_tender_scope=bool(parsed.get("coverage", {}).get("diagnostic_pdf_range")))
         fact_map = {fact["fact_id"]: fact for fact in facts}
         requirements, details = [], {}
         sections, tables, attachments, issues, references = [], [], [], [], []

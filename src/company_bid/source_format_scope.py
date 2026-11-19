@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import re
 
-from .native_layout import NativeLayoutError, read_native_format_layout
+from .native_layout import NATIVE_FORMAT_LAYOUT_VERSION, NativeLayoutError, read_native_format_layout
 from .source_format_contracts import NativeFormatLayoutV2, format_digest
 from .source_format import _sha, _font, _centered, _paragraph, _can_join, _fill_line, _line_underlines, _cell_insets, _cell_underlines
 
@@ -66,9 +66,10 @@ def recover_one(ctx, section, chapter, blocks, source, tables, facts, manifest, 
         return None,"unsupported_non_native_or_omitted_block"
     full=sorted([b for b in blocks.values() if b["source_id"] == source["source_id"] and b.get("page") in pages],key=lambda b:b["ordinal"])
     unit_input={"source_id":source["source_id"],"source_sha256":source["sha256"],"physical_pages":pages,
-        "frozen_blocks":selected,"frozen_page_blocks":full,"version":VERSION}
+        "frozen_blocks":selected,"frozen_page_blocks":full,"version":VERSION,
+        "native_reader_version":NATIVE_FORMAT_LAYOUT_VERSION}
     def read():
-        value=read_native_format_layout(source["path"],source["sha256"],pages)
+        value=read_native_format_layout(source["path"],source["sha256"],pages,heading_locator=selected[0]["locator"])
         ctx.capture("n3-native-source-layout",value)
         return value
     native=ctx.run_unit("native-format-"+format_digest(unit_input)[:20],unit_input,read)

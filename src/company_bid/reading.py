@@ -28,7 +28,10 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pypdf import PdfReader
 
-READER_VERSION = "native-reading-3"
+from .pdf_table_geometry import discover_pdf_tables, embedded_pdf_glyph_measurements, object_box
+from .pdf_text_lines import horizontal_matrix as _horizontal_matrix, native_baseline_tops, pdf_page_text_lines, projected_chars
+
+READER_VERSION = "native-reading-4"
 Role = Literal["tender", "company_material", "reference_bid", "project_supplement"]
 Status = Literal["read", "empty", "needs_ocr", "failed", "unsupported"]
 
@@ -88,7 +91,21 @@ class NativeIgnoreRule(StrictModel):
         return self
 
 
+class DiagnosticPdfRange(StrictModel):
+    source_id: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    first_page: int = Field(strict=True, ge=1)
+    last_page: int = Field(strict=True, ge=1)
+
+    @model_validator(mode="after")
+    def ordered_pages(self):
+        if self.first_page > self.last_page:
+            raise ValueError("reversed diagnostic page range")
+        return self
+
+
 class ReadingConfig(StrictModel):
+    diagnostic_pdf_range: DiagnosticPdfRange | None = None
     required_roles: list[Role] = Field(default_factory=lambda: ["tender"])
     ocr_roles: list[Role] | None = None
     ocr_version: str = "unconfigured"
@@ -468,70 +485,76 @@ def _resolve_unread(source, unit, config, ocr, requests):
 
 
 class PdfTableCellOwnershipError(ValueError):
-    """A glyph crossing a table row has conflicting native ownership evidence."""
+    """A native glyph has conflicting table cell ownership evidence."""
 
 
-def _horizontal_matrix(char):
-    value = char.get("matrix")
-    if (char.get("upright") is not True or not isinstance(value, (list, tuple)) or len(value) != 6
-            or not all(isinstance(part, (float, int)) and math.isfinite(part) for part in value)):
-        return None
-    a, b, c, d, _, _ = value
-    if a > 0 and d > 0 and abs(b) < .0001 and abs(c) < .0001:
-        return value
-    return None
+def _same_table_baseline(char, matrix, peer):
+    other = _horizontal_matrix(peer)
+    return (other is not None and abs(peer["size"] - char["size"]) <= .25
+            and all(abs(a - b) <= .0001 for a, b in zip(matrix[:4], other[:4]))
+            and abs(matrix[5] - other[5]) <= .15)
 
 
-def _separator_adjacent_line(char, matrix, peers):
-    """Use two immediate, independent neighbors on one physical text line."""
-    before, after = [], []
-    gap = char["size"] * .15
-    for peer in peers:
-        other = _horizontal_matrix(peer)
-        if (other is None or not peer["text"].isalnum()
-                or abs(peer["size"] - char["size"]) > .25
-                or any(abs(a - b) > .0001 for a, b in zip(matrix[:4], other[:4]))
-                or abs(matrix[5] - other[5]) > .15):
-            continue
-        if peer["x0"] < char["x0"] and abs(char["x0"] - peer["x1"]) <= gap:
-            before.append(peer)
-        if peer["x1"] > char["x1"] and abs(peer["x0"] - char["x1"]) <= gap:
-            after.append(peer)
-    if len(before) == len(after) == 1 and round(before[0]["top"], 1) == round(after[0]["top"], 1):
-        return before[0]["top"]
-    return None
+def _bracketed_table_glyphs(separator, matrix, misplaced, anchors):
+    """Prove each adjacent excursion on a separator's line with two local anchors."""
+    gap = separator["size"] * .15
+    line = sorted((peer for peer in misplaced if _same_table_baseline(separator, matrix, peer)),
+                  key=lambda peer: peer["x0"])
+    spans = []
+    for peer in line:
+        if not spans or abs(peer["x0"] - spans[-1][-1]["x1"]) > gap:
+            spans.append([])
+        spans[-1].append(peer)
+    anchors = [peer for peer in anchors if _same_table_baseline(separator, matrix, peer)
+               and (peer["text"].isalnum() or peer["text"] in {"(", "（", ")", "）", ";", "；"})]
+    results = []
+    for span in spans:
+        left, right = span[0], span[-1]
+        before = [peer for peer in anchors if peer["x0"] < left["x0"] and abs(left["x0"] - peer["x1"]) <= gap]
+        after = [peer for peer in anchors if peer["x1"] > right["x1"] and abs(peer["x0"] - right["x1"]) <= gap]
+        if (len(before) != 1 or len(after) != 1
+                or round(before[0]["top"], 1) != round(after[0]["top"], 1)
+                or not (before[0]["text"].isalnum() or after[0]["text"].isalnum())):
+            raise PdfTableCellOwnershipError
+        results.extend((peer, before[0]["top"]) for peer in span)
+    return results
 
 
-def _pdf_table_cell_characters(page, table, locator, transformations=None):
-    """Share cell membership and the reading order of proven row separators."""
+def _pdf_table_cell_characters(page, table, locator, transformations=None, *, source_path=None, outside_claims=None):
+    """Share native cell membership across reading and response-format geometry."""
     boxes = [tuple(float(value) for value in box) for box in table.cells if box is not None]
     if not boxes:
         raise ValueError("table has no cells")
     groups = {box: [] for box in boxes}
-    separator_candidates = []
+    border_candidates = []
     for char in page.chars:
         x, y = (char["x0"] + char["x1"]) / 2, (char["top"] + char["bottom"]) / 2
         owners = [box for box in groups if _inside(box, x, y)]
         if char["text"].strip() and _inside(table.bbox, x, y) and not owners:
             raise ValueError("unassigned table text")
+        if char["text"].strip() and len(owners) > 1:
+            raise PdfTableCellOwnershipError
         for owner in owners:
             groups[owner].append(char)
-        # A standalone slash fully within a row keeps its usual ownership.
-        if (len(owners) == 1 and char["text"] in {"/", "／"}
-                and (char["top"] < owners[0][1] or char["bottom"] > owners[0][3])):
-            separator_candidates.append((char, x, owners[0]))
+        if char["text"].strip() and len(owners) <= 1:
+            owner = owners[0] if owners else None
+            if (owner is not None and (char["top"] < owner[1] or char["bottom"] > owner[3])
+                    or owner is None and outside_claims is not None and table.bbox[0] <= x < table.bbox[2]
+                       and any(char["top"] < border < char["bottom"] for border in (table.bbox[1], table.bbox[3]))):
+                border_candidates.append((char, x, y, owner))
 
     order_tops = {}
     if getattr(page, "rotation", None) != 0:
         return groups, order_tops
-    for char, x, owner in separator_candidates:
+    crossings = {}
+    for char, x, y, owner in border_candidates:
         matrix = _horizontal_matrix(char)
         if matrix is None:
             continue
         # pdfminer applies the MediaBox translation to the text matrix. Use
         # the page adapter's conversion from that coordinate system to top-left.
         _, baseline = page.point2coord((matrix[4], matrix[5]))
-        if _inside(owner, x, baseline):
+        if owner is not None and _inside(owner, x, baseline):
             continue
         contenders = [box for box in groups if _inside(box, x, baseline)]
         if len(contenders) != 1:
@@ -539,43 +562,75 @@ def _pdf_table_cell_characters(page, table, locator, transformations=None):
                 raise PdfTableCellOwnershipError
             continue
         target, = contenders
-        border = owner[1] if baseline < owner[1] else owner[3]
-        target_border = target[3] if baseline < owner[1] else target[1]
-        if (not char["top"] < border < char["bottom"] or abs(border - target_border) > .01
-                or not max(owner[0], target[0]) <= char["x0"] <= char["x1"] <= min(owner[2], target[2])):
+        if owner is not None:
+            border = owner[1] if baseline < owner[1] else owner[3]
+            target_border = target[3] if baseline < owner[1] else target[1]
+            left, right = max(owner[0], target[0]), min(owner[2], target[2])
+        else:
+            border = table.bbox[1] if y < table.bbox[1] else table.bbox[3]
+            target_border = target[1] if y < table.bbox[1] else target[3]
+            left, right = target[0], target[2]
+        if (abs(border - target_border) > .01 or not char["top"] < border < char["bottom"]
+                or not left <= char["x0"] <= char["x1"] <= right
+                or not any(abs(edge["top"] - border) <= .75 and abs(edge["bottom"] - border) <= .75
+                           and edge.get("stroke") is not False and edge["x0"] <= char["x0"]
+                           and char["x1"] <= edge["x1"] for edge in page.edges)):
             raise PdfTableCellOwnershipError
-        if not any(abs(edge["top"] - border) <= .75 and abs(edge["bottom"] - border) <= .75
-                   and edge["x0"] <= char["x0"] and edge["x1"] >= char["x1"] for edge in page.edges):
-            raise PdfTableCellOwnershipError
-        peers = [peer for peer in groups[target] if target[1] <= peer["top"] <= peer["bottom"] <= target[3]]
-        line_top = _separator_adjacent_line(char, matrix, peers)
-        if line_top is None:
-            raise PdfTableCellOwnershipError
-        groups[owner].remove(char)
-        groups[target].append(char)
-        order_tops[id(char)] = line_top
-        if transformations is not None:
-            transformations.append({"kind": "native_pdf_table_separator_ownership", "locator": locator,
-                "glyph_bbox": [char[key] for key in ("x0", "top", "x1", "bottom")], "baseline_top": baseline,
-                "center_cell_bbox": list(owner), "owning_cell_bbox": list(target)})
+        crossings.setdefault((owner, target), []).append(char)
+
+    measurements = (embedded_pdf_glyph_measurements(source_path, page, [char for glyphs in crossings.values() for char in glyphs])
+                    if crossings and source_path is not None else {})
+    for (owner, target), chars in crossings.items():
+        unresolved = [char for char in chars if id(char) not in measurements]
+        if unresolved:
+            anchors = [peer for peer in groups[target] if target[1] <= peer["top"] <= peer["bottom"] <= target[3]]
+            for separator in unresolved:
+                if owner is not None and separator["text"] in {"/", "／"} and id(separator) not in order_tops:
+                    moves = _bracketed_table_glyphs(separator, separator["matrix"], unresolved, anchors)
+                    order_tops.update((id(peer), line_top) for peer, line_top in moves)
+            if any(id(char) not in order_tops for char in unresolved):
+                raise PdfTableCellOwnershipError
+        for char in chars:
+            measured = measurements.get(id(char))
+            tight = measured["ink_bbox"] if measured is not None else None
+            if measured is not None:
+                mode, width = measured["text_render_mode"], measured["stroke_width_pt"]
+                if mode not in (0, 1, 2) or mode != 0 and (width is None or width < 0):
+                    raise PdfTableCellOwnershipError
+                stroke = width / 2 if mode != 0 else 0
+                if not (target[0] <= tight[0] - stroke < tight[2] + stroke <= target[2]
+                        and target[1] <= tight[1] - stroke < tight[3] + stroke <= target[3]):
+                    raise PdfTableCellOwnershipError
+            if owner is None:
+                if id(char) in outside_claims:
+                    raise PdfTableCellOwnershipError
+                outside_claims.add(id(char))
+            else:
+                groups[owner].remove(char)
+            groups[target].append(char)
+            if transformations is not None:
+                kind = ("native_pdf_table_separator_ownership" if char["text"] in {"/", "／"}
+                        else "native_pdf_table_baseline_ownership")
+                evidence = {"kind": kind, "locator": locator, "glyph_bbox": list(object_box(char)),
+                    "baseline_top": page.point2coord(char["matrix"][4:])[1],
+                    "center_cell_bbox": list(owner) if owner is not None else None, "owning_cell_bbox": list(target),
+                    "basis": "embedded_font_glyph_outline" if tight is not None else "bracketed_native_baseline"}
+                if tight is not None:
+                    evidence["embedded_glyph_bbox"] = list(tight)
+                transformations.append(evidence)
     return groups, order_tops
 
 
 def _table_text(chars, order_tops):
     # Only the extraction projection uses line tops. Native run rectangles and
     # the source PDF keep their measured coordinates and every original glyph.
-    extracted = []
-    for char in chars:
-        if id(char) in order_tops:
-            top = order_tops[id(char)]
-            delta = top - char["top"]
-            char = {**char, "top": top, "bottom": char["bottom"] + delta, "doctop": char["doctop"] + delta}
-        extracted.append(char)
+    extracted = projected_chars(chars, native_baseline_tops(chars, order_tops))
     return (pdfplumber.utils.extract_text(extracted) or "").strip() if extracted else ""
 
 
-def _pdf_table(source, page, table, locator, *, assignment=None, transformations=None):
-    groups, order_tops = assignment if assignment is not None else _pdf_table_cell_characters(page, table, locator, transformations)
+def _pdf_table(source, page, table, locator, *, assignment=None, transformations=None, outside_claims=None):
+    groups, order_tops = assignment if assignment is not None else _pdf_table_cell_characters(
+        page, table, locator, transformations, source_path=source.path, outside_claims=outside_claims)
     boxes = list(groups)
     # Native rectangle boundaries preserve horizontal and vertical spans.
     xs = sorted({round(v, 3) for box in boxes for v in (box[0], box[2])})
@@ -625,26 +680,17 @@ def _read_pdf_page(source, page, number, config, ocr):
                        locator=locator, page=number, coverage=UnitCoverage(status="empty"))
     try:
         _map_pdf_glyphs(source, page, number, config, unit.coverage)
-        tables = page.find_tables(table_settings=config.table_settings)
+        discovery = discover_pdf_tables(page, config.table_settings)
+        tables = discovery.tables
+        if discovery.text_backgrounds or discovery.diagonal_rules:
+            unit.coverage.transformations.append(discovery.transformation(locator))
         table_boxes = [tuple(table.bbox) for table in tables]
+        outside_claims = set()
         for index, table in enumerate(tables):
             unit.blocks.append(_pdf_table(source, page, table, locator + f"/table[{index}]",
-                                          transformations=unit.coverage.transformations))
-        outside = [word for word in page.extract_words() if not any(
-            _inside(box, (word["x0"] + word["x1"]) / 2, (word["top"] + word["bottom"]) / 2) for box in table_boxes)]
-        lines: list[list[dict]] = []
-        for word in sorted(outside, key=lambda item: (round(item["top"], 1), item["x0"])):
-            if lines and abs(lines[-1][0]["top"] - word["top"]) <= 3:
-                lines[-1].append(word)
-            else:
-                lines.append([word])
-        for index, words in enumerate(lines):
-            words.sort(key=lambda item: item["x0"])
-            text = " ".join(str(word["text"]) for word in words).strip()
-            if text:
-                unit.blocks.append(_block(source, locator + f"/line[{index}]", "paragraph", text=text,
-                                          bbox=[min(w["x0"] for w in words), min(w["top"] for w in words),
-                                                max(w["x1"] for w in words), max(w["bottom"] for w in words)]))
+                                          transformations=unit.coverage.transformations, outside_claims=outside_claims))
+        for index, text, bbox, _, _ in pdf_page_text_lines(page, table_boxes, outside_claims):
+            unit.blocks.append(_block(source, locator + f"/line[{index}]", "paragraph", text=text, bbox=bbox))
         requests = []
         for index, image in enumerate(page.images):
             image_locator = locator + f"/image[{index}]"
@@ -910,6 +956,14 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
         raise ReadingFailure("READING_INPUT_INVALID") from None
     if not sources or len({s.source_id for s in sources}) != len(sources):
         raise ReadingFailure("READING_SOURCE_SET_INVALID")
+    selected = options.diagnostic_pdf_range
+    if selected and (getattr(ctx, "execution_config", {}).get("run_purpose") != "diagnostic_replay"
+                     or getattr(ctx, "artifact_scope", None) != "diagnostic"
+                     or len(sources) != 1 or sources[0].role != "tender" or documents[0].get("kind") != "tender"
+                     or documents[0].get("provenance") != "original" or documents[0].get("synthetic")
+                     or (sources[0].source_id, sources[0].sha256) != (selected.source_id, selected.source_sha256)
+                     or "tender" not in options.required_roles):
+        raise ReadingFailure("DIAGNOSTIC_ORIGINAL_PDF_SCOPE_INVALID")
     native_evidence = _prepare_native_rules(ctx, sources, options)
     results = []
     for source in sources:
@@ -952,6 +1006,8 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                 result["units"].append(unit.model_dump(mode="json"))
             except _UnitFailure as exc:
                 result["units"].append(exc.unit.model_dump(mode="json"))
+        if selected and not magic.startswith(b"%PDF-"):
+            raise ReadingFailure("DIAGNOSTIC_ORIGINAL_PDF_SCOPE_INVALID")
         if magic.startswith(b"%PDF-"):
             result["format"] = "pdf"
             try:
@@ -971,7 +1027,16 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                 raise ReadingFailure("READING_PDF_CORRUPTED") from None
             result["expected_units"] = page_count
             with pdf:
-                for index, page in enumerate(pdf.pages, 1):
+                first, last = 1, page_count
+                if selected:
+                    first, last = selected.first_page, selected.last_page
+                    if last > page_count:
+                        raise ReadingFailure("DIAGNOSTIC_ORIGINAL_PDF_SCOPE_INVALID")
+                    result["expected_units"] = last - first + 1
+                    result["diagnostic_pdf_range"] = {**selected.model_dump(), "source_page_count": page_count,
+                        "outside_scope_page_count": page_count - result["expected_units"]}
+                for index in range(first, last + 1):
+                    page = pdf.pages[index - 1]
                     execute(_unit_id(source, f"pdf-p{index:05d}"), f"pdf/page[{index}]", index,
                             lambda page=page, index=index: _read_pdf_page(source, page, index, options, ocr))
                     page.close()
@@ -1000,6 +1065,10 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
             raise ReadingFailure("READING_SOURCE_CHANGED_DURING_READ")
     output = {"schema_version": "1.0", "producer_version": READER_VERSION,
               "documents": results, "coverage": _summary(results, options)}
+    if selected:
+        output["coverage"].update(coverage_basis="diagnostic_original_pdf_range",
+                                  diagnostic_pdf_range=results[0]["diagnostic_pdf_range"],
+                                  publication_status="diagnostic_only")
     native_rules = _native_rule_ledger(results, options, native_evidence)
     invalid_native_rules = any(row["match_count"] != 1 for row in native_rules)
     if native_rules:

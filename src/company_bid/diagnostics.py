@@ -144,6 +144,8 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
                 embedded_artifacts(data)
         if mismatches:
             gap("CHECKPOINT_METADATA_MISMATCH", node_key=node_key, unit_id=unit_id, fields=mismatches)
+        else:
+            return envelope
 
     if not state.get("initial_input_ref"):
         gap("INITIAL_INPUT_MISSING")
@@ -151,18 +153,15 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
     if initial is not None and digest(initial) != state.get("initial_input_hash"):
         gap("INITIAL_INPUT_HASH_MISMATCH")
 
-    def reading_limitation(capture, attempt_id):
+    def reading_limitation(value, attempt_id, artifact_id, inherited_from=None):
         """Recognize a complete ledger of partial source reading, including old captures.
 
         Do not reinterpret arbitrary partial captures, bad JSON or a missing
         ledger as available evidence. Content is not declared semantically read.
         """
-        if capture.get("name") != "reading-coverage" or capture.get("status") not in {"captured", "partial"}:
-            return False
         def invalid():
             gap("READING_LEDGER_INVALID", attempt_id=attempt_id)
             return False
-        value = artifact_json(capture.get("ref"))
         if not isinstance(value, dict) or value.get("schema_version") != "1.0":
             return invalid()
         coverage, documents = value.get("coverage"), value.get("documents")
@@ -181,6 +180,27 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
                 for doc in documents for unit in doc["units"] if unit["coverage"]["status"] not in {"read", "empty"}]
             expected_required = [entry for entry in expected_unresolved if next(
                 doc["role"] for doc in documents if doc["source_id"] == entry["source_id"]) in roles]
+            scope = coverage.get("diagnostic_pdf_range")
+            frozen_scope = state.get("execution_config", {}).get("reading", {}).get("diagnostic_pdf_range")
+            if scope is not None or frozen_scope is not None:
+                if not isinstance(scope, dict) or not isinstance(frozen_scope, dict) or len(documents) != 1:
+                    return invalid()
+                doc = documents[0]
+                first, last, total = (scope[key] for key in ("first_page", "last_page", "source_page_count"))
+                if (state.get("artifact_scope") != "diagnostic" or
+                        state["execution_config"].get("run_purpose") != "diagnostic_replay" or
+                        coverage.get("publication_status") != "diagnostic_only" or
+                        coverage.get("coverage_basis") != "diagnostic_original_pdf_range" or
+                        any(type(value) is not int for value in (first, last, total)) or
+                        not 1 <= first <= last <= total or doc.get("diagnostic_pdf_range") != scope or
+                        doc["role"] != "tender" or doc.get("format") != "pdf" or
+                        (doc["source_id"], doc["sha256"]) != (scope["source_id"], scope["source_sha256"]) or
+                        scope != {**frozen_scope, "source_page_count": total,
+                                  "outside_scope_page_count": total - (last - first + 1)} or
+                        len(units) != last - first + 1 or
+                        any((unit["page"], unit["locator"]) != (i, f"pdf/page[{i}]")
+                            for i, unit in enumerate(units, first))):
+                    return invalid()
             if (type(coverage["complete"]) is not bool or coverage["complete"] != (not expected_unresolved) or
                     type(coverage["required_complete"]) is not bool or not isinstance(unresolved, list) or
                     not units or any(type(doc.get("expected_units")) is not int or
@@ -197,10 +217,13 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
                 return invalid()
         except (KeyError, TypeError):
             return invalid()
+        if scope and scope["outside_scope_page_count"]:
+            content_limitations.append({"code": "DIAGNOSTIC_ORIGINAL_PDF_RANGE", "attempt_id": attempt_id,
+                "artifact_id": artifact_id, **({"reused_from_run_id": inherited_from} if inherited_from else {}), **scope})
         if not unresolved:
             return False
         content_limitations.append({"code": "SOURCE_READING_PARTIAL", "attempt_id": attempt_id,
-            "artifact_id": capture["ref"]["artifact_id"], "coverage_status": coverage["status"],
+            "artifact_id": artifact_id, "coverage_status": coverage["status"],
             "required_complete": coverage["required_complete"], "unit_count": coverage["unit_count"],
             "unresolved_unit_count": len(unresolved), "diagnostic_ledger_status": "captured"})
         return True
@@ -215,7 +238,10 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         result["captures"] = [{**{key: c.get(key) for key in ("name", "status", "unit_id", "unit_attempt_id", "error_code")},
                                "artifact": ref(c.get("ref"))} for c in item.get("captures", [])]
         for capture in item.get("captures", []):
-            source_limitation = reading_limitation(capture, item["attempt_id"])
+            source_limitation = False
+            if capture.get("name") == "reading-coverage" and capture.get("status") in {"captured", "partial"}:
+                source_limitation = reading_limitation(artifact_json(capture.get("ref")), item["attempt_id"],
+                                                       (capture.get("ref") or {}).get("artifact_id"))
             if capture["status"] == "write_failed" or capture["status"] == "partial" and not source_limitation:
                 gaps.append({"code": "CAPTURE_INCOMPLETE", "attempt_id": item["attempt_id"], "name": capture["name"], "status": capture["status"]})
         return result
@@ -230,7 +256,11 @@ def inspect_diagnostics(root: Path, run_id: str) -> dict:
         if node["status"] == "succeeded":
             if seen_pending or node.get("input_hash") != previous_hash:
                 gap("CHECKPOINT_CHAIN_MISMATCH", node_key=node["key"])
-            checkpoint(node, node["key"])
+            envelope = checkpoint(node, node["key"])
+            if (inherited and node["key"] == "N1" and envelope and
+                    state["execution_config"].get("reading", {}).get("diagnostic_pdf_range")):
+                reading_limitation(envelope["data"].get("parsed"), envelope.get("node_attempt_id"),
+                                   node["output_ref"]["artifact_id"], envelope.get("run_id"))
             previous_hash = node.get("output_hash")
         else:
             seen_pending = True

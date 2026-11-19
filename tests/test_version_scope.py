@@ -11,6 +11,8 @@ from company_bid.pipeline import build_executor
     ("planning.py", {"N3"}),
     ("native_layout.py", {"N3"}),
     ("reading.py", {"N1", "N3"}),
+    ("pdf_table_geometry.py", {"N1", "N3"}),
+    ("pdf_text_lines.py", {"N1", "N3"}),
     ("provider.py", {"N1", "N2", "N3", "N4", "N5"}),
     ("source_format.py", {"N3"}),
     ("source_format_scope.py", {"N3"}),

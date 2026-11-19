@@ -23,8 +23,19 @@ def _sha(text):
 def _font(runs):
     if not runs:
         return {"font_family": "宋体", "font_size_pt": 12., "bold": False}
-    first = runs[0]
-    return {key: first[key] for key in ("font_family", "font_size_pt", "bold")}
+    # A numbered note can open with a short Latin-font token. The font covering
+    # most of the source line governs its editable paragraph.
+    counts = {}
+    for run in runs:
+        key = run["font_family"], round(run["font_size_pt"], 3), run["bold"]
+        counts[key] = counts.get(key, 0) + len(run.get("text", "").strip())
+    family, size, bold = max(counts, key=counts.get)
+    return {"font_family": family, "font_size_pt": size, "bold": bold}
+
+
+def _line_ink(line):
+    colors = {run.get("ink_color_rgb") for run in line["runs"] if run.get("text", "").strip()}
+    return next(iter(colors)) if len(colors) == 1 and colors != {"000000"} else None
 
 
 def _centered(line):
@@ -144,6 +155,7 @@ def _paragraph(indices, originals, source_blocks, lines, fixed, rules, width):
     alignment = "center" if _centered(first) else (
         "right" if first["bbox"][0] > width / 2 else "left")
     pitch = (lines[1]["bbox"][1] - first["bbox"][1]) if len(lines) > 1 else font["font_size_pt"] * 1.25
+    color = _line_ink(first)
     return {"kind": "paragraph", "fixed_indices": indices, "source_block_ids": source_blocks,
         "source_texts": originals, "output_texts_sha256": format_digest([fixed[i]["text"] for i in indices]),
         "source_locators": [line["locator"] for line in lines],
@@ -151,7 +163,8 @@ def _paragraph(indices, originals, source_blocks, lines, fixed, rules, width):
         "left_pt": left, "right_pt": max(0., width - right_edge),
         "first_line_indent_pt": first["bbox"][0] - left, "line_spacing_pt": max(font["font_size_pt"] * 1.15, pitch),
         "underlines": [rule for line, index in zip(lines, indices) for rule in _line_underlines(line, rules, index)],
-        "grouping_rule": "continuous_native_sentence" if len(indices) > 1 else "one_native_line"}
+        "grouping_rule": "continuous_native_sentence" if len(indices) > 1 else "one_native_line",
+        **({"ink_color_rgb": color} if color else {})}
 
 
 def _can_join(previous, following):
@@ -161,7 +174,8 @@ def _can_join(previous, following):
     def standalone(text):
         return (bool(re.match(r"(?:响应人|投标人|供应商|法定代表人|项目负责人|委托代理人|委托日期|日期|日\s*期|说明)[^：:]{0,20}[：:]", text)) or
                 bool(re.search(r"签字|盖(?:单位)?章", text)))
-    return (a == b and not a["bold"] and not standalone(previous["text"]) and not standalone(following["text"]) and
+    return (a == b and _line_ink(previous) == _line_ink(following) and not a["bold"] and
+        not standalone(previous["text"]) and not standalone(following["text"]) and
         not _centered(previous) and not _centered(following) and
         not re.search(r"[。；;：:！!？?]$", previous["text"]) and
         not re.match(r"(?:[0-9一二三四五六七八九十]+[、.)）]|(?:响应人|投标人|法定代表人|委托代理人|委托日期)[：:])", following["text"]) and

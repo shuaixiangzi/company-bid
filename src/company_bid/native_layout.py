@@ -19,11 +19,13 @@ import unicodedata
 
 import pdfplumber
 
-from .reading import PdfTableCellOwnershipError, SourceDocument, _inside, _pdf_table, _pdf_table_cell_characters
+from .pdf_table_geometry import discover_pdf_tables
+from .reading import PdfTableCellOwnershipError, SourceDocument, _pdf_table, _pdf_table_cell_characters
+from .pdf_text_lines import native_baseline_tops, pdf_page_text_lines
 from .storage import digest
 
 
-NATIVE_FORMAT_LAYOUT_VERSION = "native-format-layout-v1"
+NATIVE_FORMAT_LAYOUT_VERSION = "native-format-layout-v2"
 
 
 class NativeLayoutError(ValueError):
@@ -62,11 +64,6 @@ def _union(boxes):
             max(b[2] for b in boxes), max(b[3] for b in boxes)]
 
 
-def _selected_chars(chars, bbox):
-    return [char for char in chars if _inside(bbox, (char["x0"] + char["x1"]) / 2,
-                                            (char["top"] + char["bottom"]) / 2)]
-
-
 def _font(char):
     name = str(char.get("fontname", ""))
     size = _number(char.get("size"))
@@ -75,16 +72,24 @@ def _font(char):
     italic = bool(re.search(r"italic|oblique", name, re.IGNORECASE))
     family = re.sub(r"^[A-Z]{6}\+", "", name)
     family = re.sub(r"[,\-](?:BoldItalic|Bold|Italic|Oblique)(?:MT)?$", "", family, flags=re.IGNORECASE)
-    return {"font_name": name, "font_family": family, "font_size_pt": size,
+    color = char.get("non_stroking_color")
+    rgb = ("".join(f"{round(component * 255):02X}" for component in color)
+           if isinstance(color, (tuple, list)) and len(color) == 3 and all(
+               type(component) in (float, int) and 0 <= component <= 1 for component in color)
+           else None)
+    return {"font_name": name, "font_family": family, "font_size_pt": size, "ink_color_rgb": rgb,
             "bold": bold, "italic": italic, "style_basis": "native_font_name"}
 
 
-def _runs(chars, *, order_tops=None):
+def _runs(chars, *, order_tops=None, fill_stroke_bold=False):
     """Keep native character positions, including spaces, in font-homogeneous runs."""
     order_tops = order_tops or {}
     result = []
     for char in sorted(chars, key=lambda value: (round(order_tops.get(id(value), value["top"]), 1), value["x0"])):
         font = _font(char)
+        if fill_stroke_bold:
+            font["bold"] = True
+            font["style_basis"] = "native_matching_fill_and_stroke"
         box = _char_box(char)
         entry = {"text": char["text"], "bbox": box}
         same = (result and all(result[-1][key] == value for key, value in font.items()) and
@@ -100,61 +105,76 @@ def _runs(chars, *, order_tops=None):
     return result
 
 
-def _alignment(chars, container):
+def _alignment(chars, container, *, row_tops=None):
     """Measured gaps are evidence; suggestions are not logical paragraph claims."""
     visible = [char for char in chars if char["text"].strip()]
     if not visible:
         return {"basis": "no_native_glyphs", "horizontal": "unresolved", "vertical": "unresolved"}
     glyphs = _union([_char_box(char) for char in visible])
-    left, top = glyphs[0] - container[0], glyphs[1] - container[1]
-    right, bottom = container[2] - glyphs[2], container[3] - glyphs[3]
+    row_tops = row_tops or {}
+    projected = [char for char in visible if id(char) in row_tops]
+    # The same row's equivalent native matrices can put one font's PDF box
+    # almost a whole em below its displayed line. Keep both kinds of evidence.
+    tops = [row_tops.get(id(char), char["top"]) for char in visible]
+    bottoms = [top + char["bottom"] - char["top"] for top, char in zip(tops, visible)]
+    left, top = glyphs[0] - container[0], min(tops) - container[1]
+    right, bottom = container[2] - glyphs[2], container[3] - max(bottoms)
     center_x, center_y = (left - right) / 2, (top - bottom) / 2
     horizontal = "center" if abs(center_x) <= 3 else "unresolved"
     vertical = "center" if abs(center_y) <= 3 else ("top" if top < bottom else "bottom")
-    return {"basis": "native_glyph_bounds_relative_to_container", "container_bbox": list(container),
+    basis = ("native_shared_row_baseline_relative_to_container" if projected
+             else "native_glyph_bounds_relative_to_container")
+    return {"basis": basis, "container_bbox": list(container),
             "glyph_bbox": glyphs, "left_gap_pt": left, "right_gap_pt": right,
             "top_gap_pt": top, "bottom_gap_pt": bottom, "center_delta_x_pt": center_x,
             "center_delta_y_pt": center_y, "horizontal": horizontal, "vertical": vertical,
             "suggestion_only": True}
 
 
-def _physical_lines(page, table_boxes, number):
-    # Same word partition and locator numbering as the immutable N1 reader.
-    outside = [word for word in page.extract_words() if not any(
-        _inside(box, (word["x0"] + word["x1"]) / 2, (word["top"] + word["bottom"]) / 2)
-        for box in table_boxes)]
-    groups = []
-    for word in sorted(outside, key=lambda item: (round(item["top"], 1), item["x0"])):
-        if groups and abs(groups[-1][0]["top"] - word["top"]) <= 3:
-            groups[-1].append(word)
-        else:
-            groups.append([word])
+def _visible_heading_stroke(source, page, chars):
+    from .pdf_table_geometry import embedded_pdf_glyph_measurements
+
+    visible = [char for char in chars if char["text"].strip()]
+    if not visible or any(char.get("non_stroking_color") is None or
+                          char["non_stroking_color"] != char.get("stroking_color") for char in visible):
+        return None
+    measured = embedded_pdf_glyph_measurements(source.path, page, visible)
+    widths = []
+    for char in visible:
+        ink = measured.get(id(char), {})
+        width = ink.get("stroke_width_pt")
+        if ink.get("text_render_mode") != 2 or width is None or not .01 * char["size"] <= width <= .08 * char["size"]:
+            return None
+        widths.append(width)
+    return {"basis": "matching_fill_and_stroke_on_same_embedded_font_glyphs",
+            "text_render_mode": 2, "glyph_count": len(widths), "stroke_widths_pt": sorted(set(widths))}
+
+
+def _physical_lines(source, page, table_boxes, number, heading_locator, outside_claims=()):
     lines = []
-    for index, words in enumerate(groups):
-        words.sort(key=lambda word: word["x0"])
-        text = " ".join(str(word["text"]) for word in words).strip()
-        if not text:
-            continue
-        bbox = _box([min(w["x0"] for w in words), min(w["top"] for w in words),
-                     max(w["x1"] for w in words), max(w["bottom"] for w in words)], page.width, page.height)
-        chars = _selected_chars(page.chars, bbox)
+    for index, text, bbox, chars, tops in pdf_page_text_lines(page, table_boxes, outside_claims):
+        bbox = _box(bbox, page.width, page.height)
         _require(chars, "NATIVE_LAYOUT_LINE_WITHOUT_NATIVE_GLYPHS")
         alignment = _alignment(chars, [0., 0., float(page.width), float(page.height)])
+        locator = f"pdf/page[{number}]/line[{index}]"
+        stroke = _visible_heading_stroke(source, page, chars) if locator == heading_locator else None
         footer_number = (bbox[1] >= page.height * .9 and
                          abs((bbox[0] + bbox[2]) / 2 - page.width / 2) <= page.width * .1 and
                          bool(re.fullmatch(r"\s*[-–—]?\s*\d+\s*[-–—]?\s*", text)))
-        lines.append({"locator": f"pdf/page[{number}]/line[{index}]", "text": text,
-            "text_sha256": hashlib.sha256(text.encode()).hexdigest(), "bbox": bbox, "runs": _runs(chars),
+        lines.append({"locator": locator, "text": text,
+            "text_sha256": hashlib.sha256(text.encode()).hexdigest(), "bbox": bbox,
+            "runs": _runs(chars, order_tops=tops, fill_stroke_bold=stroke is not None),
+            **({"native_heading_stroke": stroke} if stroke else {}),
             "alignment_evidence": alignment, "page_furniture_candidate": "page_number" if footer_number else None,
             "furniture_policy": "retained_for_cross_check_not_automatically_form_content"})
     return lines
 
 
-def _table_layout(source, page, table, number, index):
+def _table_layout(source, page, table, number, index, *, outside_claims=None):
     bbox = _box(list(table.bbox), page.width, page.height)
     locator = f"pdf/page[{number}]/table[{index}]"
     try:
-        assignment = _pdf_table_cell_characters(page, table, locator)
+        assignment = _pdf_table_cell_characters(page, table, locator, source_path=source.path, outside_claims=outside_claims)
     except PdfTableCellOwnershipError as exc:
         raise NativeLayoutError("NATIVE_LAYOUT_TABLE_CELL_OWNERSHIP_AMBIGUOUS") from exc
     block = _pdf_table(source, page, table, locator, assignment=assignment)
@@ -162,6 +182,9 @@ def _table_layout(source, page, table, number, index):
     boxes = list(groups)
     xs = sorted({round(value, 3) for box in boxes for value in (box[0], box[2])})
     ys = sorted({round(value, 3) for box in boxes for value in (box[1], box[3])})
+    row_tops = {top: native_baseline_tops([char for box in boxes if round(box[1], 3) == top
+                                           for char in groups[box]], order_tops)
+                for top in ys[:-1]}
     cells = []
     for raw_box in sorted(boxes, key=lambda box: (box[1], box[0])):
         cell_box = _box(list(raw_box), page.width, page.height)
@@ -170,8 +193,9 @@ def _table_layout(source, page, table, number, index):
         chars = groups[raw_box]
         cells.append({"row": row, "column": column,
             "row_span": ys.index(bottom) - row, "col_span": xs.index(right) - column,
-            "bbox": cell_box, "text": block.rows[row][column], "runs": _runs(chars, order_tops=order_tops),
-            "alignment_evidence": _alignment(chars, cell_box)})
+            "bbox": cell_box, "text": block.rows[row][column],
+            "runs": _runs(chars, order_tops=native_baseline_tops(chars, order_tops)),
+            "alignment_evidence": _alignment(chars, cell_box, row_tops=row_tops[top])})
     heights = [ys[index + 1] - ys[index] for index in range(len(ys) - 1)]
     _require(all(value > 0 for value in heights) and
              abs(sum(heights) - (bbox[3] - bbox[1])) <= .01, "NATIVE_LAYOUT_TABLE_HEIGHT_MISMATCH")
@@ -190,11 +214,14 @@ def _table_layout(source, page, table, number, index):
     return result
 
 
-def _horizontal_rules(page, tables, number):
+def _horizontal_rules(page, tables, number, text_backgrounds=()):
     result = []
+    background_intervals = {(left, y, right) for left, top, right, bottom in text_backgrounds for y in (top, bottom)}
     for edge in sorted(page.edges, key=lambda value: (value["top"], value["x0"])):
         x0, x1, top, bottom = (_number(edge[key]) for key in ("x0", "x1", "top", "bottom"))
         if x1 <= x0 or abs(bottom - top) > .3:
+            continue
+        if edge.get("object_type") == "rect_edge" and edge.get("stroke") is False and (x0, top, x1) in background_intervals:
             continue
         _require(-.01 <= x0 < x1 <= page.width + .01 and -.01 <= top <= page.height + .01,
                  "NATIVE_LAYOUT_INVALID_RULE")
@@ -209,7 +236,7 @@ def _horizontal_rules(page, tables, number):
     return result
 
 
-def _page_layout(source, page, number):
+def _page_layout(source, page, number, heading_locator):
     _require(page.rotation == 0, "NATIVE_LAYOUT_UNSUPPORTED_ROTATION")
     _require(_number(page.page_obj.attrs.get("UserUnit", 1)) == 1, "NATIVE_LAYOUT_UNSUPPORTED_USER_UNIT")
     _require(page.width > 0 and page.height > 0, "NATIVE_LAYOUT_INVALID_PAGE")
@@ -224,22 +251,32 @@ def _page_layout(source, page, number):
         matrix = char.get("matrix")
         _require(not matrix or (len(matrix) == 6 and abs(matrix[1]) < .0001 and abs(matrix[2]) < .0001
                                and matrix[0] > 0 and matrix[3] > 0), "NATIVE_LAYOUT_UNSUPPORTED_TEXT_TRANSFORM")
-        _box(_char_box(char), page.width, page.height)
+        char_box = _char_box(char)
+        if text == "\u200d" and char_box[0] == char_box[2]:
+            # A zero-width joiner has an original text position but no ink.
+            x, top, _, bottom = char_box
+            _require(0 <= x <= page.width and 0 <= top < bottom <= page.height, "NATIVE_LAYOUT_INVALID_GEOMETRY")
+        else:
+            _box(char_box, page.width, page.height)
         _font(char)
-    native_tables = page.find_tables()
-    tables = [_table_layout(source, page, table, number, index) for index, table in enumerate(native_tables)]
-    lines = _physical_lines(page, [table["bbox"] for table in tables], number)
+    discovery = discover_pdf_tables(page)
+    outside_claims = set()
+    tables = [_table_layout(source, page, table, number, index, outside_claims=outside_claims)
+              for index, table in enumerate(discovery.tables)]
+    lines = _physical_lines(source, page, [table["bbox"] for table in tables], number, heading_locator, outside_claims)
     result = {"page_number": number, "locator": f"pdf/page[{number}]",
         "width_pt": float(page.width), "height_pt": float(page.height), "rotation": 0,
         "coordinate_system": "top_left_pdf_points", "lines": lines, "tables": tables,
-        "horizontal_rules": _horizontal_rules(page, tables, number), "images": [],
+        "horizontal_rules": _horizontal_rules(page, tables, number, discovery.text_backgrounds), "images": [],
         "native_character_count": len(page.chars),
         "layout_semantics": "physical_lines_and_measured_geometry_only_no_paragraph_or_fill_authorization"}
+    if discovery.text_backgrounds or discovery.diagonal_rules:
+        result["table_discovery"] = discovery.transformation(result["locator"])
     result["layout_sha256"] = digest(result)
     return result
 
 
-def read_native_format_layout(source_path, source_sha256, page_numbers):
+def read_native_format_layout(source_path, source_sha256, page_numbers, *, heading_locator=None):
     """Read exact native pages; unsupported content raises a bounded failure.
 
     Pages are one-based and must be explicitly unique. Page-number furniture is
@@ -253,6 +290,9 @@ def read_native_format_layout(source_path, source_sha256, page_numbers):
     _require(isinstance(page_numbers, (list, tuple)) and page_numbers and len(page_numbers) <= 100 and
              all(type(value) is int and value >= 1 for value in page_numbers) and
              len(set(page_numbers)) == len(page_numbers), "NATIVE_LAYOUT_PAGE_SCOPE_INVALID")
+    if heading_locator is not None:
+        match = re.fullmatch(r"pdf/page\[(\d+)\]/line\[\d+\]", str(heading_locator))
+        _require(match and int(match[1]) in page_numbers, "NATIVE_LAYOUT_HEADING_SCOPE_INVALID")
     path = Path(source_path)
     try:
         raw = path.read_bytes()
@@ -265,7 +305,7 @@ def read_native_format_layout(source_path, source_sha256, page_numbers):
     try:
         with pdfplumber.open(io.BytesIO(raw)) as document:
             _require(max(page_numbers) <= len(document.pages), "NATIVE_LAYOUT_PAGE_SCOPE_INVALID")
-            pages = [_page_layout(source, document.pages[number - 1], number) for number in page_numbers]
+            pages = [_page_layout(source, document.pages[number - 1], number, heading_locator) for number in page_numbers]
     except NativeLayoutError:
         raise
     except Exception as exc:

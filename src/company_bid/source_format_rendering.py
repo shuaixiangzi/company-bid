@@ -1,16 +1,18 @@
 """Render measured editable response forms; never rasterize or shrink text."""
 from __future__ import annotations
 
+import re
 import unicodedata
 
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt
 
 
 def native_font(name):
-    return {"SimSun": "宋体", "SimHei": "黑体", "TimesNewRomanPS": "Times New Roman"}.get(name, name)
+    return {"SimSun": "宋体", "SimHei": "黑体", "TimesNewRomanPS": "Times New Roman",
+            "FZSSK--GBK1-0": "宋体"}.get(name, name)
 
 
 def _estimated_width(text, size):
@@ -51,8 +53,40 @@ def _fills_blank_rule_right_edge(binding, line, element, index):
             not binding.before_text[line.start:line.end].strip(" \t"))
 
 
+def _positioned_source_blanks(paragraph, element, text, spans, index):
+    """Keep standalone signature and date blanks anchored to their original vectors."""
+    lines = sorted([line for line in element.underlines if line.fixed_index == index], key=lambda line: line.start)
+    if (len(lines) not in {1, 3} or len(lines) != len(spans) or len(element.fixed_indices) != 1 or
+            any(getattr(line, "basis", None) != "native_vector_rule" or line.bbox is None for line in lines) or
+            any((line.start, line.end, line.width_pt) != span for line, span in zip(lines, sorted(spans))) or
+            any(text[line.start:line.end].strip() for line in lines)):
+        return False
+    if len(lines) == 3:
+        if not (lines[0].start == 0 and text[lines[0].end:lines[1].start] == "年" and
+                text[lines[1].end:lines[2].start] == "月" and text[lines[2].end:] == "日"):
+            return False
+        left = lines[0].bbox[0]
+    else:
+        rule = lines[0]
+        if (element.alignment != "left" or not re.search(r"[：:]$", text[:rule.start]) or
+                not re.fullmatch(r"[（(][^（）()]{0,16}(?:签字|盖(?:单位)?章)[^（）()]{0,16}[）)]",
+                                 text[rule.end:]) or
+                abs(element.bbox[0] + _estimated_width(text[:rule.start], element.font_size_pt) -
+                    rule.bbox[0]) > 1):
+            return False
+        left = element.bbox[0]
+    pf = paragraph.paragraph_format
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    pf.left_indent = Pt(left)
+    pf.first_line_indent = Pt(0)
+    for line in lines:
+        pf.tab_stops.add_tab_stop(Pt(line.bbox[2]), WD_TAB_ALIGNMENT.LEFT, WD_TAB_LEADER.LINES)
+    return True
+
+
 def _native_paragraph(document, section, element, gap, *, paragraph=None, package=None):
     from .rendering import _font, _indent
+    ink = getattr(element, "ink_color_rgb", None)
     if paragraph is None:
         paragraph = document.add_paragraph()
         _indent(paragraph._p, 0, element.font_size_pt)
@@ -64,6 +98,10 @@ def _native_paragraph(document, section, element, gap, *, paragraph=None, packag
             # A short signature's last glyph is evidence, not a text-box wall.
             # Use the form's measured common right edge for editable reflow.
             right_edge = max(e.bbox[2] for e in measured)
+            if ink:
+                # Word uses its own CJK punctuation metrics. A measured line
+                # needs a small right margin allowance to keep every glyph.
+                right_edge = min(section.native_format.page_width_pt, right_edge + element.font_size_pt)
             pf.right_indent = Pt(min(element.right_pt, section.native_format.page_width_pt - right_edge))
         pf.first_line_indent = Pt(element.first_line_indent_pt)
         leading = next((b.source_rule for b in section.native_format.bindings
@@ -141,13 +179,20 @@ def _native_paragraph(document, section, element, gap, *, paragraph=None, packag
                      (left + delta, right + delta, points) if left >= end else (left, right, points)
                      for left, right, points in spans]
         cursor = 0
+        positioned_blanks = _positioned_source_blanks(paragraph, element, text, spans, index)
+        if ink and member:
+            paragraph.add_run().add_break()
         for start, end, width in sorted(spans):
             if start < cursor or end > len(text):
                 raise ValueError("NATIVE_RENDER_SLOT_RANGE_CHANGED")
-            _font(paragraph.add_run(text[cursor:start]), name=family, size=element.font_size_pt, bold=element.bold)
-            _underlined_run(paragraph, text[start:end], width, family, element.font_size_pt, element.bold)
+            _font(paragraph.add_run(text[cursor:start]), name=family, size=element.font_size_pt, bold=element.bold,
+                  color=ink)
+            if positioned_blanks:
+                _font(paragraph.add_run("\t"), name=family, size=element.font_size_pt, bold=element.bold)
+            else:
+                _underlined_run(paragraph, text[start:end], width, family, element.font_size_pt, element.bold)
             cursor = end
-        _font(paragraph.add_run(text[cursor:]), name=family, size=element.font_size_pt, bold=element.bold)
+        _font(paragraph.add_run(text[cursor:]), name=family, size=element.font_size_pt, bold=element.bold, color=ink)
     return paragraph
 
 

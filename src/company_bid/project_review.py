@@ -77,9 +77,12 @@ def _checkpoint(state):
     return node
 
 
-def _form(run_id, node, prepared, rows):
+def _form(run_id, node, plan_output, rows):
+    coverage = plan_output.get("chain_diagnostics", {}).get("parser_coverage", {})
+    scope = coverage.get("diagnostic_pdf_range")
     return {"schema_version": FORM_VERSION, "run_id": run_id,
-            "project_id": prepared["project"]["project_id"], "plan_sha256": node["output_hash"],
+            **({"diagnostic_pdf_range": scope} if scope else {}),
+            "project_id": plan_output["prepared"]["project"]["project_id"], "plan_sha256": node["output_hash"],
             "n3_artifact_id": node["output_ref"]["artifact_id"], "questions_sha256": digest(rows),
             "questions": rows, "reviewed_by": None, "answers": {}}
 
@@ -122,23 +125,48 @@ def _read_snapshot(store, state, node, prepared, rows):
 def review_form(executor, run_id):
     state = executor.inspect(run_id)
     node = _checkpoint(state)
-    prepared = executor.output(run_id, "N3")["prepared"]
+    plan_output = executor.output(run_id, "N3")
+    prepared = plan_output["prepared"]
     rows = _rows(executor, state, prepared)
-    form = _form(run_id, node, prepared, rows)
+    form = _form(run_id, node, plan_output, rows)
     snapshot = _read_snapshot(executor.store, state, node, prepared, rows)
     if snapshot:
         form["answers"] = snapshot["answers"]
     return form
 
 
+def _personnel_summary(row, value, official_deadline):
+    from .project_answers import personnel_role_notes, personnel_role_requirements
+    from .project_questions import QUALIFICATION_PERSONNEL
+
+    if row["key"] == QUALIFICATION_PERSONNEL:
+        prompt = "本次拟派哪位项目经理？请填写姓名和用工单位，并说明是在职还是退休返聘。"
+    else:
+        prompt = f"本次拟派哪些人担任{row['label'].removeprefix('评分')}？请逐人填写姓名和用工单位。"
+    lines = [prompt, "能提供哪个月份的本单位社保缴费凭证？已有凭证可填写月份和对应材料编号。",
+             *personnel_role_requirements(row)]
+    if official_deadline is None:
+        lines.append("正式递交截止时点尚待查证，凭证适用月份待核。")
+    lines.append("可先填已知信息，尚未确定的人选和证明保留待核。")
+    if value is not None:
+        lines.extend(personnel_role_notes(row, value, official_deadline))
+    return lines
+
+
 def review_summary(form):
+    from .project_questions import PERSONNEL_ROLES
+
     labels = {"legal_representative": "法定代表人直接签署", "agent": "委托代理人签署"}
     prompts = {"manager_name": "填写本项目实际拟派人员的姓名。", "employer": "填写该人员的实际用工主体。",
                "deadline": "本次招标资料中尚未定位正式递交截止时点。新取得的公告或澄清须作为招标输入重新读取。",
                "payment_evidence": "请提供能核对本人、缴费单位和实际缴费日期的凭证。",
                "signer_role": "选择本次响应文件由谁签署。", "agent_name": "填写本次拟任代理人姓名。"}
     lines = ["# 写标前项目信息核对", "", "按现有资料即可继续生成。补录会生成新版本。", ""]
+    if scope := form.get("diagnostic_pdf_range"):
+        lines.extend([f"本次仅核对冻结招标原件第 {scope['first_page']}～{scope['last_page']} 页"
+                      f"（全本 {scope['source_page_count']} 页）。问题和诊断稿限于所选范围。", ""])
     choices = {row["key"]: row["value"] for row in form["questions"] if row["status"] == "known"}
+    official_deadline = choices.get("deadline")
     choices.update(form["answers"])
     for row in form["questions"]:
         condition = row.get("depends_on")
@@ -149,7 +177,10 @@ def review_summary(form):
         key = row["key"]
         value = choices.get(key)
         conditions = row.get("conditions", {})
-        if key == "deadline" and value:
+        platform_notice = conditions.get("platform_notice") if key == "deadline" else None
+        if key in PERSONNEL_ROLES:
+            lines.extend(_personnel_summary(row, value, official_deadline))
+        elif key == "deadline" and value:
             if row["status"] == "known":
                 lines.append("招标原件载明的递交截止时间为 " + row["value"]["submitted_before"] + "。")
             else:
@@ -166,8 +197,12 @@ def review_summary(form):
             lines.append("相关签署条款未能确定一致的签署身份，请按招标原件核对。")
         elif key == "deadline" and conditions.get("source_conflict"):
             lines.append("请以适用于本次递交的正式公告或澄清核对截止时间。")
+        elif platform_notice:
+            lines.append("正式递交截止时点尚待查证。")
         else:
             lines.append(prompts[key])
+        if platform_notice:
+            lines.append(f"请到招标原件所指的{platform_notice['name']}查看本项目公告，核对正式递交截止时间。")
         if conditions.get("source_conflict"):
             lines.append("已定位的招标条款对" + ("截止时间" if key == "deadline" else "实缴条件") + "存在不同表述，请核对适用原文。")
         if key == "signer_role" and conditions.get("allowed_roles"):
@@ -183,7 +218,7 @@ def review_summary(form):
             if terms:
                 lines.append("招标要求：" + "，".join(terms) + "。")
         evidence = row.get("evidence_refs", [])
-        if key == "payment_evidence":
+        if key == "payment_evidence" or key in PERSONNEL_ROLES:
             notices = {"ocr_failed_pending_review": "该页机器读取或校验失败。",
                        "ocr_no_text_unresolved": "该页机器读取未取得文字。"}
             for locator, reading in dict.fromkeys((item["locator"], item.get("transcription_status"))
@@ -194,10 +229,16 @@ def review_summary(form):
             item = next((item for item in evidence if item["kind"] == "tender"), evidence[0])
             if key == "deadline" and row["status"] == "known":
                 item = next(item for item in evidence if item["source_ref"] == value["source_ref"])
+            elif platform_notice:
+                item = next(item for item in evidence if item["source_ref"] in platform_notice["source_refs"])
             locator = str(item.get("locator", "")).split(";", 1)[0]
-            pdf = re.fullmatch(r"pdf/page\[(\d+)\](?:/line\[(\d+)\])?", locator)
+            pdf = re.fullmatch(r"pdf/page\[(\d+)\](?:/(line|table)\[(\d+)\])?", locator)
             if pdf:
-                locator = f"招标原件第 {pdf[1]} 页" + (f"第 {pdf[2]} 行" if pdf[2] else "")
+                locator = f"招标原件第 {pdf[1]} 页"
+                if pdf[2] == "table":
+                    locator += f"第 {int(pdf[3]) + 1} 张表"
+                elif pdf[2] and key not in PERSONNEL_ROLES and not platform_notice:
+                    locator += f"第 {pdf[3]} 行"
             lines.append("相关条款：" + locator)
         lines.append("")
     if not form["questions"]:
@@ -261,9 +302,10 @@ def submit_answers(executor, run_id, submission, payment_proof=None):
     require_offline_writing(state["execution_config"])
     node = _checkpoint(state)
     # Authentication covers both the N3 prefix and the question generator.
-    prepared = executor.output(run_id, "N3")["prepared"]
+    plan_output = executor.output(run_id, "N3")
+    prepared = plan_output["prepared"]
     rows = _rows(executor, state, prepared)
-    expected = _form(run_id, node, prepared, rows)
+    expected = _form(run_id, node, plan_output, rows)
     _require(isinstance(submission, dict) and submission.keys() == expected.keys() and
              all(submission[key] == value for key, value in expected.items()
                  if key not in {"answers", "reviewed_by"}), "PROJECT_REVIEW_FORM_CHANGED")

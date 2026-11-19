@@ -27,6 +27,7 @@ def _version(*names: str) -> str:
     dependencies = {"runtime.py": ("unit_concurrency.py",),
                     "source_format_contracts.py": ("slots.py",),
                     "native_layout.py": ("reading.py",),
+                    "reading.py": ("pdf_table_geometry.py", "pdf_text_lines.py"),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
                     "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py", "project_identity.py", "commitment_planning.py", "reviewed_source_actions.py", "material_recall.py"),
@@ -68,6 +69,10 @@ def validate_sources(prepared: PreparedBid) -> None:
 
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
+    reading = config.get("reading")
+    if isinstance(reading, dict) and reading.get("diagnostic_pdf_range") is not None and (
+            config.get("pipeline") != "automatic" or config.get("run_purpose") != "diagnostic_replay"):
+        raise PipelineFailure("DIAGNOSTIC_ORIGINAL_PDF_SCOPE_INVALID")
     if ("review_before_writing" in config and type(config["review_before_writing"]) is not bool
             or (config.get("review_before_writing") or "project_answer_snapshot" in config)
             and config.get("pipeline") != "automatic"):
