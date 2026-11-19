@@ -375,7 +375,7 @@ def _proof_summary(summary, key):
         title = "核对企业资格及资质材料"
         if evidence:
             available.append("已定位部分企业证照或资质证明候选，本次适用性待核。")
-        texts = {rid: _compact(summary.current[rid].text) for rid in rids}
+        texts = {rid: _compact(req.text) for rid, req in summary.current.items() if rid in rids}
         certificates = {rid: text for rid, text in texts.items() if re.search(r"营业执照|法人证书|资质证书|许可证", text)
                         and not re.search(r"吊销|信用|评审项目", text)}
         if certificates:

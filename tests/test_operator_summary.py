@@ -101,6 +101,16 @@ def test_negative_topics_and_historical_names_stay_out_of_summary(tmp_path):
     assert "M-007" in result["other_issue_ids"]
 
 
+def test_qualification_sources_use_frozen_requirement_order_before_truncation(tmp_path):
+    package = _package(tmp_path, *((f"第{n}项应提供有效资质证书。", "qualification", "attachment", "资质材料")
+                                   for n in range(1, 8)))
+    summary, _ = _summary(package)
+    assert summary["qualification"]["primary_source_refs"] == [f"SRC-{n}" for n in range(1, 5)]
+    package.requirements.reverse()
+    reversed_summary, _ = _summary(package)
+    assert reversed_summary["qualification"]["primary_source_refs"] == [f"SRC-{n}" for n in range(7, 3, -1)]
+
+
 def test_quote_group_honors_original_table_fields_and_strict_price_comparator(tmp_path):
     table_quote = "本项目应填写投标报价表。"
     table = dict(table_id="T", section_id="SEC-1", title="投标报价表", columns=["字段", "输入"],
