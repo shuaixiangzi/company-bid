@@ -53,6 +53,8 @@ from company_bid.pipeline import build_executor
     ("material_ocr_index.py", {"N3"}),
     ("tender_deepseek_ocr.py", {"N1"}),
     ("tender_ocr_replay.py", {"N1"}),
+    ("reading_source_review.py", {"N1"}),
+    ("reading_review_origin.py", {"N1"}),
     ("material_deepseek_ocr.py", {"N1", "N3"}),
     ("material_ocr_quality.py", {"N1", "N3"}),
     ("material_ocr_replay.py", {"N1", "N3"}),

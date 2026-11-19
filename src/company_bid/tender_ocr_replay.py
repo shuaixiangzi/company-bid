@@ -69,7 +69,7 @@ class _TenderOrigin(_OCROrigin):
         _require(path.resolve(strict=True).parent == directory and path.stat().st_size <= 30_000_000, "ORIGIN_FILE_LIMIT")
         return super()._file(name)
 
-    def target(self, unit_id):
+    def target(self, unit_id, allowed_failures):
         node, unit, inputs, _, _ = self.unit("N1", unit_id, successful=False)
         manifest = _one((item for item in self.state["node_manifest"] if item["key"] == "N1"), "NODE_VERSION_INVALID")
         _require(manifest["version"] == node["version"] and node["status"] in {"succeeded", "failed"}, "NODE_VERSION_INVALID")
@@ -86,7 +86,7 @@ class _TenderOrigin(_OCROrigin):
                  _same(span["attributes"], {"unit_id": unit_id, "unit_attempt_id": attempt["attempt_id"],
                      "node_attempt_id": parent["attempt_id"], "input_hash": unit["input_hash"]}), "SOURCE_UNIT_TRACE_INVALID")
         if expected_failed:
-            _require(attempt.get("error_code") == REVIEWABLE_FAILURE and not unit.get("output_ref"), "SOURCE_UNIT_INVALID")
+            _require(attempt.get("error_code") in allowed_failures and not unit.get("output_ref"), "SOURCE_UNIT_INVALID")
             output = None
         else:
             checkpoint = self.checkpoint(unit, "N1", unit_id)
@@ -130,10 +130,13 @@ class _TenderOrigin(_OCROrigin):
             self.store.read_bytes(ref)
 
 
-def _authenticate(origin, binding, image, preparation, purpose):
+def _authenticate(origin, binding, image, preparation, purpose, *, allowed_failures=(REVIEWABLE_FAILURE,)):
     identity, raster, purchase_key = (preparation[key] for key in ("identity", "renderer", "purchase_key"))
     unit_id, call_id = binding["unit_id"], binding["call_id"]
-    node, inputs, output, attempt, expected_failed = origin.target(unit_id)
+    node, inputs, output, attempt, expected_failed = origin.target(unit_id, allowed_failures)
+    provider_error = attempt.get("error_code") if expected_failed else None
+    if provider_error == "OCR_OUTPUT_INCOMPLETE":
+        provider_error = "MATERIAL_OCR_OUTPUT_INCOMPLETE"
     _require(unit_id == "tender-ocr-" + digest(identity) and
              _same(inputs, {"identity": identity, "renderer": raster, "options": origin.options,
                  "engine_fingerprint": origin.fingerprint, "purchase_key": purchase_key}) and
@@ -173,7 +176,14 @@ def _authenticate(origin, binding, image, preparation, purpose):
              _same(response, {"call_id": call_id, "http_status": 200, "raw_capture_status": "captured",
                               "raw_received_sha256": raw_sha}), "RESPONSE_CAPTURE_INVALID")
     payload = json.loads(raw, object_pairs_hook=official._unique_json_object)
-    official.validate_provider_response(payload, purpose)
+    try:
+        official.validate_provider_response(payload, purpose)
+    except official.MaterialDeepSeekOCRFailure as exc:
+        # Only a source-image review can cite a truncated response as a historical failure.
+        # Ordinary OCR replay still requires a completed, schema-valid response.
+        _require(provider_error == exc.code == "MATERIAL_OCR_OUTPUT_INCOMPLETE" and
+                 official.returned_billable_pages(200, payload, purpose) == 1 and
+                 payload["pages"][0]["finish_reason"] == "length", "FAILED_RESPONSE_NOT_REVIEWABLE")
     _require(payload == response["response"], "RESPONSE_BYTES_CHANGED")
 
     related = [e for e in origin.events if e.get("unit_id") == unit_id and e["event"] in _CALL_EVENTS]
@@ -190,7 +200,7 @@ def _authenticate(origin, binding, image, preparation, purpose):
              attempt["trace_id"] == binding["trace_id"], "CALL_TRACE_INVALID")
     outcome = {"output_hash": raw_sha, "http_status": 200, "provider_request_id": payload["id"],
                "validation_status": "failed" if expected_failed else "passed",
-               "error_code": REVIEWABLE_FAILURE if expected_failed else None, "usage_status": "not_token_billed"}
+               "error_code": provider_error, "usage_status": "not_token_billed"}
     span = origin.span(binding["trace_id"], binding["span_id"])
     _require(_same(terminal, outcome) and span["name"] == "provider.call" and
              span["parent_span_id"] == attempt["span_id"] and (span["status"] == "ERROR") == expected_failed and
@@ -200,7 +210,7 @@ def _authenticate(origin, binding, image, preparation, purpose):
     _require(_same(validation, {"call_id": call_id, "validation_status": outcome["validation_status"]}),
              "VALIDATION_CAPTURE_INVALID")
     if expected_failed:
-        _require(_same(validation, {"error_code": REVIEWABLE_FAILURE, "http_status": 200, "raw_response_available": True,
+        _require(_same(validation, {"error_code": provider_error, "http_status": 200, "raw_response_available": True,
                                 "fee_pages": 1, "server_completion": "response_received", "automatic_retry": False,
                                 "local_fallback": False}), "FAILED_RESPONSE_NOT_REVIEWABLE")
     else:

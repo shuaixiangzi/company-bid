@@ -30,6 +30,8 @@ from pypdf import PdfReader
 
 from .pdf_table_geometry import discover_pdf_tables, embedded_pdf_glyph_measurements, object_box
 from .pdf_text_lines import horizontal_matrix as _horizontal_matrix, native_baseline_tops, pdf_page_text_lines, projected_chars
+from .reading_source_review import (KIND as _SOURCE_REVIEW_KIND, VERSION as _SOURCE_REVIEW_VERSION,
+                                    PdfRegionReview, prepare_region_review, review_box_on_page)
 
 READER_VERSION = "native-reading-4"
 Role = Literal["tender", "company_material", "reference_bid", "project_supplement"]
@@ -115,6 +117,7 @@ class ReadingConfig(StrictModel):
     ignored_objects: dict[str, str] = Field(default_factory=dict)
     glyph_maps: list[GlyphMap] = Field(default_factory=list)
     native_ignored_objects: list[NativeIgnoreRule] = Field(default_factory=list)
+    pdf_region_reviews: list[PdfRegionReview] = Field(default_factory=list, max_length=64)
 
     @model_validator(mode="after")
     def explicit_ignores(self):
@@ -135,6 +138,14 @@ class ReadingConfig(StrictModel):
                 raise ValueError("duplicate native ignore rule or target")
             identities.add(rule.rule_id)
             anchors.add(anchor)
+        targets = {(review.source_id, review.source_sha256, review.locator) for review in self.pdf_region_reviews}
+        origins = {(review.origin.run_id, review.origin.call_id) for review in self.pdf_region_reviews}
+        if len(targets) != len(self.pdf_region_reviews) or len(origins) != len(self.pdf_region_reviews):
+            raise ValueError("A PDF screenshot review requires a unique target and historical call.")
+        for review in self.pdf_region_reviews:
+            prefix = f"{review.source_sha256}::{review.source_id}::pdf/page[{review.page}]/image["
+            if any(key.startswith(prefix) for key in self.ignored_objects):
+                raise ValueError("Screenshots on a source review page require explicit reading.")
         return self
 
 
@@ -164,7 +175,7 @@ class ReadingBlock(StrictModel):
     header_rows: list[int] = Field(default_factory=list)
     locator: str
     source_id: str
-    origin: Literal["native", "ocr"] = "native"
+    origin: Literal["native", "ocr", "source_review"] = "native"
     bbox: list[float] | None = None
     image_ref: dict[str, Any] | None = None
 
@@ -197,7 +208,7 @@ class ReadingBlock(StrictModel):
 
 class UnitCoverage(StrictModel):
     status: Status
-    origin: Literal["native", "ocr", "mixed"] = "native"
+    origin: Literal["native", "ocr", "mixed", "source_review"] = "native"
     native_text_chars: int = 0
     table_count: int = 0
     image_count: int = 0
@@ -449,17 +460,73 @@ def _ocr_content(source: SourceDocument, unit: ReadingUnit, locator: str, config
         raise _UnitFailure(code or "OCR_FAILED_OR_IDENTITY_INVALID", unit) from None
 
 
-def _resolve_unread(source, unit, config, ocr, requests):
+def _source_review_blocks(source, record):
+    return [_block(source, entry["locator"], "paragraph", text=entry["text"], origin="source_review",
+                   bbox=review_box_on_page(record, entry["pixel_bbox"])) for entry in record.get("entries", [])]
+
+
+def _block_position(block):
+    return (block.bbox or [0, 0])[1], (block.bbox or [0, 0])[0]
+
+
+def _source_review_failure(unit, code):
+    unit.coverage.status, unit.coverage.error_code = "failed", code
+    return _UnitFailure(code, unit)
+
+
+def _source_review_coverage_origin(unit):
+    return ("mixed" if any(block.origin != "source_review" and block.kind != "image" for block in unit.blocks)
+            else "source_review")
+
+
+def _verify_source_review_checkpoint(source, unit, reviews):
+    records = [record for record in unit.coverage.transformations if record.get("kind") == _SOURCE_REVIEW_KIND]
+    blocks = [block for block in unit.blocks if block.origin == "source_review" or "/source-review/" in block.locator]
+    expected = sorted((block for record in reviews.values() for block in _source_review_blocks(source, record)),
+                      key=_block_position)
+    if records != list(reviews.values()) or blocks != expected:
+        raise ReadingFailure("READING_SOURCE_REVIEW_CHECKPOINT_INVALID")
+    if reviews and (unit.coverage.origin != _source_review_coverage_origin(unit) or
+                    unit.coverage.status != "read" or unit.coverage.error_code is not None or
+                    unit.coverage.unread_objects):
+        raise ReadingFailure("READING_SOURCE_REVIEW_CHECKPOINT_INVALID")
+    for record in reviews.values():
+        locator = record["locator"]
+        original = [block for block in unit.blocks if block.locator == locator]
+        if (record["status"] != "confirmed" or len(original) != 1 or original[0].kind != "image" or
+                original[0].source_id != source.source_id or original[0].origin != "native" or
+                original[0].bbox != record["bbox"] or any(row.get("locator") == locator for row in unit.coverage.ignored_objects)):
+            raise ReadingFailure("READING_SOURCE_REVIEW_CHECKPOINT_INVALID")
+
+
+def _resolve_unread(source, unit, config, ocr, requests, reviews=None):
+    reviews = reviews or {}
     pending = [(locator, request) for locator, request in requests
                if not _ignored(config, source, locator, unit.coverage)]
     unit.coverage.unread_objects.extend(locator for locator, _ in pending)
+    unmatched = reviews.keys() - set(unit.coverage.unread_objects)
+    if unmatched:
+        unit.coverage.unread_objects.extend(sorted(unmatched))
+        raise _source_review_failure(unit, "READING_SOURCE_REVIEW_OBJECT_MISMATCH")
     # A whole-page request covers its regions too; do not make redundant calls
     # or count native text and whole-page OCR as two independent paragraphs.
     full_page = next(((locator, request) for locator, request in pending if request.get("object_kind") == "pdf_page"), None)
     if full_page is not None:
+        if reviews:
+            # An overlapping full-page replacement cannot certify independent
+            # screenshot fragments or preserve the native context around them.
+            raise _source_review_failure(unit, "READING_SOURCE_REVIEW_WHOLE_PAGE_REQUIRED")
         pending = [full_page]
     first_content_failure = None
     for locator, request in pending:
+        if locator in reviews:
+            review = reviews[locator]
+            unit.blocks.extend(_source_review_blocks(source, review))
+            if review["status"] == "confirmed":
+                unit.coverage.unread_objects.remove(locator)
+            elif first_content_failure is None:
+                first_content_failure = _source_review_failure(unit, review["error_code"])
+            continue
         try:
             blocks = _ocr_content(source, unit, locator, config, ocr, request)
         except _UnitFailure as exc:
@@ -482,12 +549,16 @@ def _resolve_unread(source, unit, config, ocr, requests):
             else:
                 unit.coverage.unread_objects.remove(locator)
             unit.blocks.extend(blocks)
+    if any(block.origin == "source_review" for block in unit.blocks):
+        unit.coverage.origin = _source_review_coverage_origin(unit)
     if first_content_failure is not None:
         unit.coverage.status = "failed"
         unit.coverage.error_code = first_content_failure.code
         raise first_content_failure
     if unit.coverage.unread_objects:
         unit.coverage.status = "needs_ocr"
+    elif reviews:
+        unit.coverage.status = "read"
     elif any(block.origin == "ocr" for block in unit.blocks):
         unit.coverage.status = "read"
         unit.coverage.origin = "mixed" if any(b.origin == "native" and b.kind != "image" for b in unit.blocks) else "ocr"
@@ -685,10 +756,12 @@ def _map_pdf_glyphs(source, page, number, config, coverage):
             char["text"] = "".join(result)
 
 
-def _read_pdf_page(source, page, number, config, ocr):
+def _read_pdf_page(source, page, number, config, ocr, reviews=None):
     locator = f"pdf/page[{number}]"
     unit = ReadingUnit(unit_id=_unit_id(source, f"pdf-p{number:05d}"), source_id=source.source_id,
                        locator=locator, page=number, coverage=UnitCoverage(status="empty"))
+    if reviews:
+        unit.coverage.transformations.extend(reviews.values())
     try:
         _map_pdf_glyphs(source, page, number, config, unit.coverage)
         discovery = discover_pdf_tables(page, config.table_settings)
@@ -725,12 +798,14 @@ def _read_pdf_page(source, page, number, config, ocr):
             requests.append((locator + "/vector-content", {"object_kind": "pdf_page"}))
         if unit.coverage.unmapped_glyphs:
             requests.append((locator + "/unmapped-glyphs", {"object_kind": "pdf_page"}))
-        if requests:
+        if requests or reviews:
             unit.coverage.status = "needs_ocr"
-            _resolve_unread(source, unit, config, ocr, requests)
-        unit.blocks.sort(key=lambda block: ((block.bbox or [0, 0])[1], (block.bbox or [0, 0])[0]))
+            _resolve_unread(source, unit, config, ocr, requests, reviews)
+        unit.blocks.sort(key=_block_position)
         return unit
     except _UnitFailure:
+        if reviews:
+            unit.blocks.sort(key=_block_position)
         raise
     except PdfTableCellOwnershipError:
         unit.coverage.status, unit.coverage.error_code = "failed", "PDF_TABLE_CELL_OWNERSHIP_AMBIGUOUS"
@@ -951,6 +1026,28 @@ def _summary(documents, config):
             "page_numbering": "PDF physical pages are 1-based; DOCX page is null; object indices are 0-based"}
 
 
+def _review_targets(ctx, inputs, sources, options, ocr):
+    if not options.pdf_region_reviews:
+        return {}
+    runtime = getattr(ctx, "execution_config", {})
+    ocr_options = runtime.get("ocr")
+    recorded = (isinstance(ocr_options, dict) and ocr_options.get("engine") == "deepseek_ocr" and
+                isinstance(ocr_options.get("recorded_targets"), list) and "live_targets" not in ocr_options)
+    if (runtime.get("run_purpose") != "diagnostic_replay" or getattr(ctx, "artifact_scope", None) != "diagnostic" or
+            runtime.get("debug_capture", True) is not True or
+            (ocr_options is not None or ocr is not None) and not recorded):
+        raise ReadingFailure("READING_SOURCE_REVIEW_DIAGNOSTIC_SCOPE_REQUIRED")
+    by_id = {source.source_id: (source, item) for source, item in zip(sources, inputs)}
+    by_page = {}
+    for review in options.pdf_region_reviews:
+        source, item = by_id.get(review.source_id, (None, {}))
+        if (source is None or source.sha256 != review.source_sha256 or source.role != "tender" or
+                item.get("kind") != "tender" or item.get("provenance") != "original" or item.get("synthetic") is not False):
+            raise ReadingFailure("READING_SOURCE_REVIEW_SOURCE_MISMATCH")
+        by_page.setdefault((review.source_id, review.page), []).append(review)
+    return by_page
+
+
 def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | None = None) -> dict:
     """Read frozen sources. OCR is a synchronous, caller-observed callback.
 
@@ -967,6 +1064,7 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
         raise ReadingFailure("READING_INPUT_INVALID") from None
     if not sources or len({s.source_id for s in sources}) != len(sources):
         raise ReadingFailure("READING_SOURCE_SET_INVALID")
+    review_targets = _review_targets(ctx, documents, sources, options, ocr)
     selected = options.diagnostic_pdf_range
     if selected and (getattr(ctx, "execution_config", {}).get("run_purpose") != "diagnostic_replay"
                      or getattr(ctx, "artifact_scope", None) != "diagnostic"
@@ -988,9 +1086,10 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                   "sha256": source.sha256, "format": "", "units": []}
         results.append(result)
         unit_inputs = {"source_id": source.source_id, "sha256": source.sha256, "role": source.role,
-                       "reader_version": READER_VERSION, "config": options.model_dump(mode="json"),
+                       "reader_version": READER_VERSION,
+                       "config": options.model_dump(mode="json", exclude={"pdf_region_reviews"}),
                        "ocr_configured": ocr is not None}
-        def execute(unit_id, locator, page, fn):
+        def execute(unit_id, locator, page, fn, reviews=None):
             def parse_unit():
                 try:
                     unit = fn()
@@ -1005,8 +1104,11 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                 return unit.model_dump(mode="json")
 
             try:
-                value = ctx.run_unit(unit_id, {**unit_inputs, "locator": locator, "page": page},
-                                     parse_unit)
+                identity = {**unit_inputs, "locator": locator, "page": page}
+                if reviews:
+                    identity["source_reviews"] = {"version": _SOURCE_REVIEW_VERSION, "targets": [
+                        review.model_dump(mode="json") for review in review_targets[(source.source_id, page)]]}
+                value = ctx.run_unit(unit_id, identity, parse_unit)
                 unit = ReadingUnit.model_validate(value)
                 if (unit.unit_id, unit.source_id, unit.locator, unit.page) != (unit_id, source.source_id, locator, page):
                     raise ReadingFailure("READING_CHECKPOINT_IDENTITY_INVALID")
@@ -1014,11 +1116,16 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                     # Recompute identity and decisions even after a page-cache
                     # hit; the stored exemption is not its own authority.
                     _verify_native_decisions(source, unit, options, native_evidence)
+                if review_targets:
+                    _verify_source_review_checkpoint(source, unit, reviews or {})
                 result["units"].append(unit.model_dump(mode="json"))
             except _UnitFailure as exc:
                 result["units"].append(exc.unit.model_dump(mode="json"))
         if selected and not magic.startswith(b"%PDF-"):
             raise ReadingFailure("DIAGNOSTIC_ORIGINAL_PDF_SCOPE_INVALID")
+        review_pages = {page for source_id, page in review_targets if source_id == source.source_id}
+        if review_pages and not magic.startswith(b"%PDF-"):
+            raise ReadingFailure("READING_SOURCE_REVIEW_SOURCE_MISMATCH")
         if magic.startswith(b"%PDF-"):
             result["format"] = "pdf"
             try:
@@ -1046,10 +1153,16 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
                     result["expected_units"] = last - first + 1
                     result["diagnostic_pdf_range"] = {**selected.model_dump(), "source_page_count": page_count,
                         "outside_scope_page_count": page_count - result["expected_units"]}
+                if any(not first <= number <= last for number in review_pages):
+                    raise ReadingFailure("READING_SOURCE_REVIEW_PAGE_OUTSIDE_SCOPE")
                 for index in range(first, last + 1):
                     page = pdf.pages[index - 1]
-                    execute(_unit_id(source, f"pdf-p{index:05d}"), f"pdf/page[{index}]", index,
-                            lambda page=page, index=index: _read_pdf_page(source, page, index, options, ocr))
+                    unit_id = _unit_id(source, f"pdf-p{index:05d}")
+                    reviews = {review.locator: prepare_region_review(ctx, source, unit_id, review)
+                               for review in review_targets.get((source.source_id, index), [])}
+                    review_options = {"reviews": reviews} if reviews else {}
+                    execute(unit_id, f"pdf/page[{index}]", index,
+                            lambda: _read_pdf_page(source, page, index, options, ocr, **review_options), reviews)
                     page.close()
         elif magic.startswith(b"PK"):
             result["format"] = "docx"
@@ -1080,6 +1193,13 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
         output["coverage"].update(coverage_basis="diagnostic_original_pdf_range",
                                   diagnostic_pdf_range=results[0]["diagnostic_pdf_range"],
                                   publication_status="diagnostic_only")
+    if review_targets:
+        review_records = [record for doc in results for unit in doc["units"] for record in unit["coverage"]["transformations"]
+                          if record.get("kind") == _SOURCE_REVIEW_KIND]
+        output["coverage"].update(publication_status="diagnostic_only", pdf_region_source_review={
+            "version": _SOURCE_REVIEW_VERSION, "scope": "diagnostic_replay", "target_count": len(options.pdf_region_reviews),
+            "confirmed_count": sum(record["status"] == "confirmed" for record in review_records),
+            "unresolved_count": sum(record["status"] != "confirmed" for record in review_records)})
     native_rules = _native_rule_ledger(results, options, native_evidence)
     invalid_native_rules = any(row["match_count"] != 1 for row in native_rules)
     if native_rules:
@@ -1108,7 +1228,7 @@ def read_documents(ctx, documents: list[dict], config: dict, ocr: Callable | Non
         # Preserve a bounded application failure after saving the entire
         # denominator; the ledger still reports every other unresolved unit.
         code = next((gap["error_code"] for gap in gaps
-                     if (gap.get("error_code") or "").startswith("READING_NATIVE_IGNORE_")), None)
+                     if (gap.get("error_code") or "").startswith(("READING_NATIVE_IGNORE_", "READING_SOURCE_REVIEW_"))), None)
         code = code or next((code for gap in gaps if (code := _bounded_ocr_code(gap.get("error_code")))), None)
         if code is None:
             code = "OCR_REQUIRED" if any(gap["status"] == "needs_ocr" for gap in gaps) else "READING_INCOMPLETE"
