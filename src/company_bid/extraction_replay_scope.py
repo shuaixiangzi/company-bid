@@ -9,6 +9,7 @@ from contextvars import ContextVar
 
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
+    CONTRACT_ANNEX_SOURCE_CONFIG_KEY, FAILED_CONTRACT_ANNEX_REPLAY, FailedContractAnnexReplay,
     FAILED_ILLUSTRATION_REPLAY, FailedIllustrationReplay,
     FAILED_RESPONSE_CELL_REFLOW_REPLAY, FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY,
     FAILED_RESPONSE_REVIEW_TABLE_REPLAY,
@@ -56,6 +57,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_response_letter = None
     _failed_response_cell_reflow = None
     _failed_illustration = None
+    _failed_contract_annex = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -68,6 +70,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_response_letter = None
         self._failed_response_cell_reflow = None
         self._failed_illustration = None
+        self._failed_contract_annex = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -103,6 +106,10 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  (FAILED_ILLUSTRATION_REPLAY in self._target_extraction), FailedIllustrationReplay.config_error)
         if FAILED_ILLUSTRATION_REPLAY in self._target_extraction:
             self._failed_illustration = FailedIllustrationReplay(self, ctx)
+        _require((CONTRACT_ANNEX_SOURCE_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_CONTRACT_ANNEX_REPLAY in self._target_extraction), FailedContractAnnexReplay.config_error)
+        if FAILED_CONTRACT_ANNEX_REPLAY in self._target_extraction:
+            self._failed_contract_annex = FailedContractAnnexReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
             return super().preflight(ctx, value)
 
@@ -135,6 +142,21 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        annex = self._failed_contract_annex
+        if annex is None:
+            return self._read_before_contract_annex(binding, task, full_window)
+        annex.verify_history(self)
+        unit_id = binding["unit_id"]
+        if unit_id == annex.unit_id:
+            return annex.read_failure(self, binding, task, full_window)
+        if unit_id in annex.predecessor.prefix:
+            entry = self._read_before_contract_annex(binding, task, full_window)
+        else:
+            entry = super()._read_entry(binding, task, full_window)
+        annex.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_before_contract_annex(self, binding, task, full_window):
         illustration = self._failed_illustration
         if illustration is None:
             return self._read_before_illustration(binding, task, full_window)
@@ -261,7 +283,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_illustration is not None:
+        if self._failed_contract_annex is not None:
+            self._failed_contract_annex.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_illustration is not None:
             self._failed_illustration.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_response_cell_reflow is not None:
             self._failed_response_cell_reflow.allow_candidate(self, ctx, task_type, unit_id)

@@ -16,6 +16,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from .contract_annex_sources import (
+    CONTRACT_ANNEX_SOURCE_CONFIG_KEY, build_contract_annex_proof, contract_annex_pages, normalize_contract_annex_config,
+)
 from .extraction_illustrations import (
     CONFIG_KEY as _ILLUSTRATIVE_OCR_REGIONS,
     ILLUSTRATION_SOURCE_CONFIG_KEY,
@@ -374,7 +377,8 @@ def _model_window(window: dict) -> dict:
     view = copy.deepcopy({key: value for key, value in window.items()
                           if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY,
                                          RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
-                                         RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY}})
+                                         RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
+                                         CONTRACT_ANNEX_SOURCE_CONFIG_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -568,6 +572,11 @@ def extraction_window_config(config: dict) -> dict:
             frozen[ILLUSTRATION_SOURCE_CONFIG_KEY] = normalize_illustration_context_scope(config[ILLUSTRATION_SOURCE_CONFIG_KEY])
         except IllustrationError as exc:
             raise PlanningError(str(exc)) from None
+    if CONTRACT_ANNEX_SOURCE_CONFIG_KEY in config:
+        try:
+            frozen[CONTRACT_ANNEX_SOURCE_CONFIG_KEY] = normalize_contract_annex_config(config[CONTRACT_ANNEX_SOURCE_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -727,6 +736,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_response_cell_reflow_source(windows, documents, config[RESPONSE_CELL_REFLOW_CONFIG_KEY])
     if ILLUSTRATION_SOURCE_CONFIG_KEY in config:
         _bind_illustration_context_source(windows, documents, blocks, footer_skips, config[ILLUSTRATION_SOURCE_CONFIG_KEY])
+    if CONTRACT_ANNEX_SOURCE_CONFIG_KEY in config:
+        _bind_contract_annex_source(windows, documents, blocks, footer_skips, config[CONTRACT_ANNEX_SOURCE_CONFIG_KEY])
     return windows, ledger
 
 
@@ -884,6 +895,27 @@ def _bind_illustration_context_source(windows, documents, blocks, footer_skips, 
     except (IllustrationError, KeyError, TypeError):
         raise PlanningError("ILLUSTRATION_CONTEXT_SOURCE_PROOF_MISMATCH") from None
     window[ILLUSTRATION_SOURCE_CONFIG_KEY] = {"config": config, "proof": proof}
+
+
+def _bind_contract_annex_source(windows, documents, blocks, footer_skips, config):
+    matching = [doc for doc in documents if doc["source_id"] == config["source_id"]]
+    order = {entry["window_id"]: index for index, entry in enumerate(windows)}
+    reference, owner = order.get(config["window_id"]), order.get(config["owner_window_id"])
+    _fail(len(matching) != 1 or reference is None or owner is None or reference >= owner,
+          "CONTRACT_ANNEX_SOURCE_WINDOW_SCOPE_MISMATCH")
+    window, owner_window = windows[reference], windows[owner]
+    try:
+        pages = contract_annex_pages(config, matching[0], blocks)
+        footer = footer_skips.get(pages[3][-1]["block_id"])
+        proof = build_contract_annex_proof(config, pages, footer)
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise PlanningError("CONTRACT_ANNEX_SOURCE_PROOF_MISMATCH") from None
+    owner_ids = {block["block_id"] for block in owner_window["blocks"]}
+    _fail(proof["proof_sha256"] != config["source_proof_sha256"] or not set(proof["block_ids"]) <= owner_ids or
+          any(owner_window.get(key) != config[key] for key in ("source_id", "source_sha256")),
+          "CONTRACT_ANNEX_SOURCE_WINDOW_SCOPE_MISMATCH")
+    window[CONTRACT_ANNEX_SOURCE_CONFIG_KEY] = {"config": copy.deepcopy(config), "pages": pages, "footer": footer}
+    _contract_annex_proof(window)
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -2081,6 +2113,54 @@ def verify_illustration_predecessor(predecessor_result: dict, resolution: dict) 
           "ILLUSTRATION_CONTEXT_PREDECESSOR_MISMATCH")
 
 
+def _contract_annex_proof(window):
+    context = window[CONTRACT_ANNEX_SOURCE_CONFIG_KEY]
+    _fail(not isinstance(context, dict) or set(context) != {"config", "pages", "footer"},
+          "CONTRACT_ANNEX_SOURCE_PROOF_MISMATCH")
+    try:
+        config = normalize_contract_annex_config(context["config"])
+        proof = build_contract_annex_proof(config, context["pages"], context["footer"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise PlanningError("CONTRACT_ANNEX_SOURCE_PROOF_MISMATCH") from None
+    targets = {block["block_id"]: block for block in window["blocks"]}
+    seen = set(targets) | {block["block_id"] for block in window.get("adjacent_context", [])}
+    reference = next(block for block in context["pages"][0] if block["block_id"] == config["reference_block_id"])
+    _fail(window.get("source_format") != "pdf" or any(window.get(key) != config[key]
+          for key in ("source_id", "source_sha256", "window_id")) or proof["proof_sha256"] != config["source_proof_sha256"] or
+          targets.get(reference["block_id"]) != {key: value for key, value in reference.items() if key not in {"bbox", "image_ref"}} or
+          set(proof["block_ids"]) & seen or any(key in window for key in (PRICE_SCORING_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY)),
+          "CONTRACT_ANNEX_SOURCE_WINDOW_SCOPE_MISMATCH")
+    return config, proof
+
+
+def _verified_contract_annex_resolution(raw: dict, window: dict) -> dict | None:
+    if CONTRACT_ANNEX_SOURCE_CONFIG_KEY not in window:
+        return None
+    config, proof = _contract_annex_proof(window)
+    resolved = [config["reference_block_id"]]
+    _fail(not isinstance(raw, dict) or _hash(raw) != config["raw_candidate_sha256"] or raw.get("unresolved_block_ids") != resolved,
+          "CONTRACT_ANNEX_SOURCE_RAW_RESPONSE_MISMATCH")
+    original_window = {key: value for key, value in window.items() if key != CONTRACT_ANNEX_SOURCE_CONFIG_KEY}
+    expected = {"error_code": "LIVE_REQUIRED_BLOCK_UNRESOLVED",
+                "diagnostic_context": {"field": "unresolved_block_ids", "block_ids": resolved}}
+    try:
+        validate_live_window(raw, original_window)
+    except PlanningError as exc:
+        original_error = {"error_code": exc.code, "diagnostic_context": exc.diagnostic_context}
+        _fail(original_error != expected, "CONTRACT_ANNEX_SOURCE_HISTORICAL_FAILURE_MISMATCH")
+    else:
+        raise PlanningError("CONTRACT_ANNEX_SOURCE_HISTORICAL_FAILURE_MISMATCH")
+    body_ids = proof["body_block_ids"]
+    annex = {row["block_id"]: row for row in window[CONTRACT_ANNEX_SOURCE_CONFIG_KEY]["pages"][3]}
+    selector = {key: annex[body_ids[0]][key] for key in ("source_id", "block_id", "locator")}
+    citation = {**selector, "block_ids": body_ids, "clause_id": None, "table_row_id": None}
+    requirement = _validate_response_schema({"citation": citation, "category": "technical", "response_mode": "writing",
+        "mandatory": True, "confidence": "high", "format_status": "not_prescribed"}, _Requirement)
+    requirement["citation"] = {**_citation(citation, annex), "label_grounding": []}
+    return {"proof": proof, "raw_candidate_sha256": config["raw_candidate_sha256"], "resolved_block_ids": resolved,
+            "original_error": original_error, "requirement": requirement}
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2106,7 +2186,8 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     resolution = _verified_price_scoring_resolution(raw, window)
     cover = _verified_response_cover_resolution(raw, window)
     _fail(resolution is not None and cover is not None, "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
-    resolved = resolution or cover
+    annex = _verified_contract_annex_resolution(raw, window)
+    resolved = resolution or cover or annex
     if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
@@ -2194,6 +2275,9 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     illustration = _verified_illustration_resolution(raw, window)
     _fail((ILLUSTRATION_SOURCE_CONFIG_KEY in result) != (illustration is not None) or
           result.get(ILLUSTRATION_SOURCE_CONFIG_KEY) != illustration, "EXTRACTION_ILLUSTRATION_CONTEXT_RESOLUTION_MISMATCH")
+    annex = _verified_contract_annex_resolution(raw, window)
+    _fail((CONTRACT_ANNEX_SOURCE_CONFIG_KEY in result) != (annex is not None) or
+          result.get(CONTRACT_ANNEX_SOURCE_CONFIG_KEY) != annex, "EXTRACTION_CONTRACT_ANNEX_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2286,13 +2370,16 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                   expected_source_id=block["source_id"], actual_source_id=deferred["source_id"])
             owner_result = by_result[owner["window_id"]]
             cover = owner_result.get(RESPONSE_COVER_CONFIG_KEY)
-            source_resolved = cover is not None and deferred["block_id"] in cover["resolved_block_ids"]
+            annex = owner_result.get(CONTRACT_ANNEX_SOURCE_CONFIG_KEY)
+            resolved_sources = (("owner_target_source_proven_cover", cover), ("owner_target_source_proven_annex_reference", annex))
+            source_resolved = next((basis for basis, source in resolved_sources
+                                    if source is not None and deferred["block_id"] in source["resolved_block_ids"]), None)
             guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
                   "DEFERRED_CONTEXT_OWNER_TARGET_UNRESOLVED", **context)
             items.append({"block_id": block["block_id"], "source_id": block["source_id"], "locator": block["locator"],
                           "source_sha256": by_window[owner["window_id"]]["source_sha256"],
                           "deferred_from_window_id": identity, "owner_window_id": owner["window_id"],
-                          "resolution": "owner_target_source_proven_cover" if source_resolved else "owner_target_structurally_processed",
+                          "resolution": source_resolved or "owner_target_structurally_processed",
                           "semantic_review": "requires_source_review"})
     return {"schema_version": "deferred-context-closure-v1", "status": "structurally_closed",
             "basis": "all_frozen_target_windows_processed_v1", "semantic_review": "requires_source_review",
@@ -2362,7 +2449,8 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
     model_config = {key: value for key, value in window_config.items()
                     if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                    RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
-                                   RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY}}
+                                   RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
+                                   CONTRACT_ANNEX_SOURCE_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -2468,6 +2556,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
         if illustration is not None:
             supplement[ILLUSTRATION_SOURCE_CONFIG_KEY] = illustration
             _capture(ctx, "n2-illustration-source-resolution", illustration)
+        annex = _verified_contract_annex_resolution(raw_model_candidate, window)
+        if annex is not None:
+            supplement[CONTRACT_ANNEX_SOURCE_CONFIG_KEY] = annex
+            _capture(ctx, "n2-contract-annex-source-resolution", annex)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2674,9 +2766,25 @@ def reviewed_authority_tail(window, raw):
     return proof
 
 
+def _same_contract_annex_scope(requirement: dict, citation: dict, annex: dict, *, owner: bool) -> bool:
+    source = annex["requirement"]["citation"]
+    if (requirement["category"] != "technical" or requirement["response_mode"] != "writing" or
+            not requirement["mandatory"] or requirement["format_status"] != "not_prescribed" or
+            requirement["required_fact_labels"] or requirement["attachment_keywords"] or citation["source_id"] != source["source_id"]):
+        return False
+    if owner and not set(source["block_ids"]) <= set(citation["block_ids"]):
+        return False
+    heading = r"^附件\s*1\s*[：:]\s*技术服务内容\s*" if owner else r"^2\.2\s*采购范围[：:]\s*"
+    text = re.sub(heading, "", citation["quote"], count=1)
+    if (not owner and text == citation["quote"]) or re.search(r"\d\s+\d", text):
+        return False
+    return re.sub(r"\s+", "", text) == re.sub(r"\s+", "", source["quote"])
+
+
 def _merge_results(results: list) -> tuple[list, list]:
     requirements, formats, by_key = [], [], {}
     source_covers, source_letters = {}, {}
+    annex_owners = {}
     for result_index, result in enumerate(results):
         data = result["validated"]
         local_ids = []
@@ -2689,21 +2797,46 @@ def _merge_results(results: list) -> tuple[list, list]:
             _fail(_RESPONSE_REVIEW_MERGE_PROJECTION not in result, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
             data = result[_RESPONSE_REVIEW_MERGE_PROJECTION]["validated"]
         candidates = data["requirements"] if resolution is None else [*data["requirements"], resolution["requirement"]]
+        annex_owner = annex_owners.get(result["window_id"])
         for candidate in candidates:
             semantics = {key: value for key, value in candidate.items() if key != "citation"}
             semantics["text"] = candidate["citation"]["quote"]
             key = _hash(semantics)
             requirement = by_key.get(key)
+            if annex_owner is not None and _same_contract_annex_scope(candidate, candidate["citation"], annex_owner[0], owner=True):
+                requirement = annex_owner[1]
             if requirement is None:
                 requirement = {"requirement_id": _id("R-", semantics), **semantics,
                                "citations": [], "window_ids": []}
                 by_key[key] = requirement
                 requirements.append(requirement)
-            if candidate["citation"] not in requirement["citations"]:
-                requirement["citations"].append(candidate["citation"])
+            citations = (requirement["citations"] if candidate["citation"]["quote"] == requirement["text"]
+                         else requirement.setdefault("equivalent_annex_citations", []))
+            if candidate["citation"] not in citations:
+                citations.append(candidate["citation"])
             if result["window_id"] not in requirement["window_ids"]:
                 requirement["window_ids"].append(result["window_id"])
             local_ids.append(requirement["requirement_id"])
+        if annex := result.get(CONTRACT_ANNEX_SOURCE_CONFIG_KEY):
+            source_requirement = annex["requirement"]
+            prior = [item for item in requirements if any(
+                _same_contract_annex_scope(item, citation, annex, owner=False) for citation in item["citations"])]
+            if len(prior) == 1:
+                canonical = prior[0]
+            else:
+                semantics = {key: value for key, value in source_requirement.items() if key != "citation"}
+                semantics["text"] = source_requirement["citation"]["quote"]
+                canonical = {"requirement_id": _id("R-", semantics), **semantics, "citations": [], "window_ids": []}
+                requirements.append(canonical)
+                by_key[_hash(semantics)] = canonical
+            citation = source_requirement["citation"]
+            citations = (canonical["citations"] if citation["quote"] == canonical["text"]
+                         else canonical.setdefault("equivalent_annex_citations", []))
+            if citation not in citations:
+                citations.append(citation)
+            if result["window_id"] not in canonical["window_ids"]:
+                canonical["window_ids"].append(result["window_id"])
+            annex_owners[annex["proof"]["owner_window_id"]] = (annex, canonical)
         for index, chapter in enumerate(data["format_chapters"]):
             refs = list(dict.fromkeys(local_ids[i] for i in chapter["requirement_indices"]))
             if index == 0 and (cell := result.get(RESPONSE_CELL_REFLOW_CONFIG_KEY)):

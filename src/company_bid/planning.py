@@ -1591,7 +1591,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
             citations = raw.get("citations", [])
             _fail(not citations or any(c["quote"] != raw["text"] for c in citations), "REQUIREMENT_CITATION_MISMATCH")
             requirement = {key: raw[key] for key in ("requirement_id", "text", "category", "mandatory", "response_mode")}
-            requirement["source_refs"] = list(dict.fromkeys(scoped_source(c) for c in citations))
+            # Source equivalence and ownership were rebuilt from N1 during the N2 merge check.
+            annex_citations = raw.get("equivalent_annex_citations", [])
+            requirement["source_refs"] = list(dict.fromkeys(scoped_source(c) for c in [*citations, *annex_citations]))
             requirement["source_contexts"] = []
             if raw["requirement_id"] in context_derivations:
                 payload = {**context_derivations[raw["requirement_id"]], "child_source_refs": requirement["source_refs"]}
