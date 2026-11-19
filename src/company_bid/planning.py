@@ -18,7 +18,7 @@ from .source_clauses import build_clause_catalog
 from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
-    _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid,
+    _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid, extraction_window_config,
     _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result, _close_deferred_context,
     _chapter_boundary, _repair_numbered_procedure_spans,
 )
@@ -859,14 +859,19 @@ def _format_plan(extracted: dict, blocks: dict, documents: list) -> tuple[list, 
     boundary; unknown headings and images never disappear into free writing.
     """
     formats = copy.deepcopy(extracted.get("format_chapters", []))
-    formats.extend(_source_format_additions(extracted, blocks, documents, formats))
+    format_blocks = {key: block for key, block in blocks.items() if not block.get("illustration_source_use")}
+    formats.extend(_source_format_additions(extracted, format_blocks, documents, formats))
     footer_skips = _pdf_footer_skips(blocks)
     ledger, errors = list(footer_skips.values()), []
+    ledger.extend({"source_id": block["source_id"], "block_id": key, "locator": block["locator"],
+                   "kind": block["kind"], "status": "illustration_source", "format_id": None,
+                   "illustration_source_use": block["illustration_source_use"]}
+                  for key, block in blocks.items() if key not in format_blocks)
     anchors = {chapter["citation"]["block_id"]: chapter for chapter in formats}
     for anchor in set(anchors) & set(footer_skips):
         errors.append({"reason": "format_anchor_is_page_footer", "block_id": anchor})
     for document in documents:
-        body = [block for block in blocks.values() if block["source_id"] == document["source_id"] and
+        body = [block for block in format_blocks.values() if block["source_id"] == document["source_id"] and
                 block["block_id"] not in footer_skips and
                 not re.search(r"(?:^|/)(?:header|footer)\d*\.xml", block["locator"])]
         body.sort(key=lambda block: block["ordinal"])
@@ -1230,9 +1235,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
           "EXTRACTION_INPUT_MISMATCH")
     _fail(extracted.get("coverage", {}).get("status") != "complete", "EXTRACTION_COVERAGE_INCOMPLETE")
     frozen_window_config = extracted.get("window_config")
-    _fail(not isinstance(frozen_window_config, dict) or set(frozen_window_config) != {"window_max_chars", "window_max_blocks"},
+    _fail(not isinstance(frozen_window_config, dict) or extraction_window_config(frozen_window_config) != frozen_window_config,
           "EXTRACTION_WINDOW_CONFIGURATION_MISSING")
-    windows, denominator = _windows(documents, blocks, frozen_window_config)
+    windows, denominator = _windows(documents, blocks, frozen_window_config, manifest=source_manifest)
     expected_coverage = {"status": "complete", "semantic_review": "requires_source_review", "tender_unit_count": len(denominator), "window_count": len(windows),
                          "completed_window_count": len(windows), "units": denominator}
     for row in denominator:
@@ -1256,6 +1261,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     expected_requirements, expected_formats = _merge_results(merge_results)
     _fail(expected_requirements != extracted.get("requirements") or expected_formats != extracted.get("format_chapters"),
           "EXTRACTION_MERGE_MISMATCH")
+    uses = {block["block_id"]: block["illustration_source_use"] for window in windows for block in window["blocks"]
+            if "illustration_source_use" in block}
+    if uses:
+        blocks = {key: (block | {"illustration_source_use": uses[key]}) if key in uses else block
+                  for key, block in blocks.items()}
     clause_by_id = {}
     for window in windows:
         for clause in build_clause_catalog(window):

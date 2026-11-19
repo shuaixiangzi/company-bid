@@ -16,6 +16,13 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from .extraction_illustrations import (
+    CONFIG_KEY as _ILLUSTRATIVE_OCR_REGIONS,
+    IllustrationError,
+    illustration_source_uses,
+    is_context_only,
+    normalize_regions,
+)
 from .source_clauses import build_clause_catalog
 from .table_continuations import (
     build_table_continuations, build_table_row_catalog, scoring_table_continuation_issues,
@@ -221,6 +228,7 @@ def _index(parsed: dict, manifest: dict) -> tuple[dict, dict, list]:
                 _fail(not isinstance(block.get("text", ""), str), "PARSED_TEXT_INVALID")
                 block = copy.deepcopy(block)
                 block.pop("read_disposition", None)
+                block.pop("illustration_source_use", None)
                 ignored = next((entry for entry in unit.get("coverage", {}).get("ignored_objects", [])
                                 if isinstance(entry, dict) and entry.get("locator") == block["locator"] and
                                 isinstance(entry.get("reason"), str) and entry["reason"].strip()), None)
@@ -308,8 +316,19 @@ def _chapter_boundary(block: dict) -> bool:
 
 def _reference_projection(block: dict) -> dict:
     # This is complete reading text, not a replacement grid or citation source.
-    keys = ("block_id", "locator", "kind", "text", "ordinal", "text_basis", "read_disposition")
+    keys = ("block_id", "locator", "kind", "text", "ordinal", "text_basis", "read_disposition", "illustration_source_use")
     return {key: copy.deepcopy(block[key]) for key in keys if key in block}
+
+
+def _model_source_block(block: dict) -> dict:
+    use = block.get("illustration_source_use")
+    if use:
+        block["illustration_source_use"] = use["role"]
+        if use["role"] not in {"instruction", "navigation", "interface"}:
+            block["text"] = ""
+            if "rows" in block:
+                block["rows"] = []
+    return block
 
 
 def _model_reference_packet(packet: dict) -> dict:
@@ -317,16 +336,39 @@ def _model_reference_packet(packet: dict) -> dict:
     # stays in the private capture and is rebuilt independently in N3.
     keys = ("source_id", "source_sha256", "trigger_block_ids", "trigger_routes", "chapter_start", "chapter_end",
             "member_projection_sha256", "proof_sha256", "source_text", "reading_dispositions")
-    return {**{key: copy.deepcopy(packet[key]) for key in keys}, "member_count": len(packet["member_block_ids"])}
+    model = {**{key: copy.deepcopy(packet[key]) for key in keys}, "member_count": len(packet["member_block_ids"])}
+    if uses := packet.get("illustration_source_uses"):
+        text = packet["source_text"]
+        for use in reversed(uses):
+            if use["role"] not in {"instruction", "navigation", "interface"}:
+                start, end = use["text_span"]
+                text = text[:start] + text[end:]
+        model["source_text"] = text
+        model["illustration_source_uses"] = [{key: use[key] for key in ("block_id", "locator", "role")} for use in uses]
+    return model
 
 
 def _model_window(window: dict) -> dict:
     view = copy.deepcopy(window)
+    for key in ("blocks", "adjacent_context"):
+        for block in view.get(key, []):
+            _model_source_block(block)
     if "reference_context" in view:
         context = view["reference_context"]
         context["representation"] = "reading_text_only_v1"
         context["packets"] = [_model_reference_packet(packet) for packet in context["packets"]]
     return view
+
+
+def _packet_illustration_uses(members: list[dict]) -> list[dict]:
+    uses, offset = [], 0
+    for block in members:
+        end = offset + len(block["text"])
+        if use := block.get("illustration_source_use"):
+            uses.append({"block_id": block["block_id"], "locator": block["locator"],
+                         "role": use["role"], "text_span": [offset, end]})
+        offset = end + 1
+    return uses
 
 
 def _reference_context_packets(document: dict, source_blocks: list[dict], window: dict) -> dict:
@@ -378,6 +420,8 @@ def _reference_context_packets(document: dict, source_blocks: list[dict], window
                   "reading_dispositions": [{"block_id": block["block_id"], "locator": block["locator"],
                       "read_disposition": block["read_disposition"]} for block in projection if block.get("read_disposition")],
                   "blocks": [block for block in projection if block["block_id"] not in local_ids]}
+        if uses := _packet_illustration_uses(projection):
+            packet["illustration_source_uses"] = uses
         packet["proof_sha256"] = _hash(packet)
         chars = len(json.dumps(_model_reference_packet(packet), ensure_ascii=False))
         if size + chars > _REFERENCE_CONTEXT_MAX_CHARS:
@@ -398,6 +442,10 @@ def _window_context_identity(window: dict) -> dict:
                window["context_boundary_decisions"], window["source_clause_catalog"],
                window["source_table_continuations"], window["source_table_row_catalog"],
                window["caption_table_bindings"], window["reference_context"]]
+    uses = {block["block_id"]: block["illustration_source_use"] for block in window["blocks"]
+            if "illustration_source_use" in block}
+    if uses:
+        context.append(uses)
     return {"context_id": _id("CONTEXT-", context), "sha256": _hash(context),
             "scope": "context_only_not_reviewed_window_denominator"}
 
@@ -428,6 +476,7 @@ def _validate_reference_context(window: dict) -> None:
         members = [combined[key] for key in ids]
         _fail(_hash(members) != packet["member_projection_sha256"] or packet["chapter_start"] != members[0] or
               packet["source_text"] != "\n".join(block["text"] for block in members) or
+              packet.get("illustration_source_uses", []) != _packet_illustration_uses(members) or
               packet["reading_dispositions"] != [{"block_id": block["block_id"], "locator": block["locator"],
                   "read_disposition": block["read_disposition"]} for block in members if block.get("read_disposition")] or
               any(right["ordinal"] != left["ordinal"] + 1 for left, right in zip(members, members[1:])) or
@@ -451,11 +500,32 @@ def _validate_reference_context(window: dict) -> None:
                 raise PlanningError("WINDOW_REFERENCE_CONTEXT_MISMATCH")
 
 
-def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
+def extraction_window_config(config: dict) -> dict:
+    frozen = {"window_max_chars": config.get("window_max_chars", 14000),
+              "window_max_blocks": config.get("window_max_blocks", 60)}
+    if _ILLUSTRATIVE_OCR_REGIONS in config:
+        try:
+            frozen[_ILLUSTRATIVE_OCR_REGIONS] = normalize_regions(config[_ILLUSTRATIVE_OCR_REGIONS])
+        except IllustrationError as exc:
+            raise PlanningError(str(exc)) from None
+    return frozen
+
+
+def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | None = None) -> tuple[list, list]:
+    if manifest is None:
+        from .extraction_replay_scope import replay_window_inputs
+        config, manifest = replay_window_inputs(config, manifest)
     limit = config.get("window_max_chars", 14000)
     block_limit = config.get("window_max_blocks", 60)
     _fail(type(limit) is not int or not 256 <= limit <= 100000 or
           type(block_limit) is not int or not 1 <= block_limit <= 1000, "WINDOW_CONFIGURATION_INVALID")
+    try:
+        uses = illustration_source_uses(documents, config.get(_ILLUSTRATIVE_OCR_REGIONS, []), _json(manifest))
+    except IllustrationError as exc:
+        raise PlanningError(str(exc)) from None
+    if uses:
+        blocks = {key: (block | {"illustration_source_use": uses[key]}) if key in uses else block
+                  for key, block in blocks.items()}
     windows, ledger = [], []
     for document in documents:
         pending, size = [], 0
@@ -485,7 +555,8 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
                 # Binary image references and reader-specific metadata are not
                 # business fields and do not belong in a model request.
                 block = {key: value for key, value in block.items() if key not in {"image_ref", "bbox"}}
-                cost = len(json.dumps(block, ensure_ascii=False))
+                cost = len(json.dumps({key: value for key, value in block.items() if key != "illustration_source_use"},
+                                      ensure_ascii=False))
                 _fail(cost > limit, "SOURCE_BLOCK_EXCEEDS_WINDOW_LIMIT")
                 # Never mix separate native PDF chapters merely to fill capacity.
                 # This changes ownership, not original blocks or source semantics.
@@ -520,7 +591,7 @@ def _windows(documents: list, blocks: dict, config: dict) -> tuple[list, list]:
         catalog = []
         for block in source_blocks:
             text = block.get("text", "").strip()
-            if (block["kind"] == "paragraph" and len(text) <= 100 and
+            if (block["kind"] == "paragraph" and not block.get("illustration_source_use") and len(text) <= 100 and
                     (_heading_level(text) == 0 or _PLAIN_FORM_HEADING.fullmatch(text) or
                      (_heading_level(text) is not None and re.search(r"(?:表|函|书|方案|资料|材料|情况|承诺|声明|证明|清单)$", text))) and
                     not re.search(r"\.{2,}|…{2,}", text)):
@@ -614,6 +685,8 @@ def _arabic_forward_markers(source_blocks: list[dict]) -> dict:
     """A separate context view; never changes global headings or source text."""
     parent, markers = None, {}
     for block in source_blocks:
+        if block.get("illustration_source_use"):
+            continue
         text = block.get("text", "").strip()
         view = text.rstrip("：:").rstrip()
         level = _heading_level(view)
@@ -830,7 +903,8 @@ def _guard_heading_only_requirement(requirement, available, safe_skips):
     if block["kind"] != "paragraph" or citation["quote"].strip() != block["text"].strip() or not _heading_only_text(block["text"]):
         return
     following = sorted((item for item in available.values() if item["source_id"] == block["source_id"] and
-                        item["ordinal"] > block["ordinal"] and item["block_id"] not in safe_skips), key=lambda item: item["ordinal"])
+                        item["ordinal"] > block["ordinal"] and item["block_id"] not in safe_skips and
+                        not is_context_only(item)), key=lambda item: item["ordinal"])
     if following and following[0]["kind"] == "paragraph" and _CONSTRAINT.search(following[0].get("text", "")):
         raise PlanningError("HEADING_ONLY_REQUIREMENT_MISSES_CONSTRAINT", {"field": "citation", "adjacent_block_id": following[0]["block_id"]})
 
@@ -844,6 +918,7 @@ def _citation(citation: dict, available: dict, safe_skips: dict | None = None,
     ids = citation.get("block_ids") or [citation["block_id"]]
     _fail(ids[0] != citation["block_id"] or len(set(ids)) != len(ids) or any(key not in available for key in ids), "CITATION_SPAN_ID_INVALID")
     span = [available[key] for key in ids]
+    _fail(any(is_context_only(value) for value in span), "ILLUSTRATION_CONTEXT_NOT_CITABLE")
     if citation.get("table_row_id"):
         rows = [row for row in table_rows or [] if row["table_row_id"] == citation["table_row_id"]]
         _fail(len(rows) != 1 or bool(citation.get("clause_id")), "TABLE_ROW_ID_NOT_IN_FROZEN_CATALOG")
@@ -995,7 +1070,7 @@ def _require_proven_table_tails(window: dict, proofs: list[dict]) -> None:
     unresolved = []
     for block in window["blocks"]:
         rows = block.get("rows")
-        if (block.get("kind") == "table" and isinstance(rows, list) and len(rows) >= 2 and
+        if (block.get("kind") == "table" and not is_context_only(block) and isinstance(rows, list) and len(rows) >= 2 and
                 rows[0] == ["条款号", "条款名称", "编列内容"] and len(rows[1]) == 3 and
                 rows[1][0] == rows[1][1] == "" and rows[1][2] and block["block_id"] not in proved):
             unresolved.append(block["block_id"])
@@ -1051,6 +1126,11 @@ def _validate_window(raw: dict, window: dict) -> dict:
                   any(selected_ids[0] in proof["block_ids"] for proof in table_continuations),
                   "TABLE_CONTINUATION_SELECTION_REQUIRED")
             requirement["citation"] = _citation(requirement["citation"], available, safe_skips, clause_catalog, table_continuations, table_rows)
+            if any(available[key].get("illustration_source_use") for key in selected_ids):
+                _fail(requirement["category"] != "procedure" or requirement["response_mode"] != "procedure" or
+                      requirement["format_status"] != "not_prescribed" or requirement["format_title"] is not None or
+                      any(requirement[field] for field in ("required_fact_labels", "attachment_keywords", "reference_keywords")),
+                      "ILLUSTRATION_INSTRUCTION_PROCEDURE_ONLY")
             if requirement["category"] == "technical" and requirement["response_mode"] == "writing":
                 _guard_clause_selection(requirement["citation"], available, clause_catalog)
             quote = requirement["citation"]["quote"]
@@ -1071,10 +1151,13 @@ def _validate_window(raw: dict, window: dict) -> dict:
             _fail(bool(chapter["citation"].get("table_row_id")), "FORMAT_TABLE_ROW_SELECTION_FORBIDDEN")
             _fail(chapter["citation"]["block_id"] not in targets, "FORMAT_ANCHOR_OUTSIDE_REVIEW_WINDOW")
             chapter["citation"] = _citation(chapter["citation"], available, safe_skips)
+            anchor_ids = chapter["citation"]["block_ids"] or [chapter["citation"]["block_id"]]
+            _fail(any(available[key].get("illustration_source_use") for key in anchor_ids), "ILLUSTRATION_FORMAT_NOT_ALLOWED")
             if chapter["title"] not in chapter["citation"]["quote"]:
                 raise PlanningError("FORMAT_HEADING_NOT_GROUNDED", {"field": "title"})
             ids = chapter["content_block_ids"]
             _fail(len(set(ids)) != len(ids) or any(key not in targets for key in ids), "FORMAT_CONTENT_REFERENCE_INVALID")
+            _fail(any(targets[key].get("illustration_source_use") for key in ids), "ILLUSTRATION_FORMAT_NOT_ALLOWED")
             _fail(ids != sorted(ids, key=lambda key: available[key]["ordinal"]), "FORMAT_CONTENT_ORDER_INVALID")
             _fail(any(type(i) is not int or not 0 <= i < len(data["requirements"]) for i in chapter["requirement_indices"]),
                   "FORMAT_REQUIREMENT_REFERENCE_INVALID")
@@ -1104,12 +1187,14 @@ def _window_processing_ledger(window: dict, unresolved_block_ids: list[str]) -> 
             status, basis = "ignored_by_frozen_reader", "unit.coverage.ignored_objects"
         elif block["block_id"] in safe:
             status, basis = "safe_footer", "frozen_window.safe_skip_blocks"
+        elif is_context_only(block):
+            status, basis = "illustration_context", "frozen_window.illustration_source_use"
         rows.append({"block_id": block["block_id"], "source_id": block["source_id"], "locator": block["locator"],
                      "status": status, "basis": basis, "self_reported_unresolved": block["block_id"] in unresolved_block_ids})
     adjacent = {block["block_id"]: block for block in window.get("adjacent_context", [])}
     deferred = [{"block_id": identity, "source_id": adjacent[identity]["source_id"], "locator": adjacent[identity]["locator"],
                  "status": "deferred_context", "basis": "frozen_window.adjacent_context"}
-                for identity in unresolved_block_ids if identity in adjacent]
+                for identity in unresolved_block_ids if identity in adjacent and not is_context_only(adjacent[identity])]
     return {"window_id": window["window_id"], "basis": "application_frozen_input_accounting_v1",
             "processing_declaration": "processed_not_semantically_accepted" if rows else "no_model_call_empty_window",
             "semantic_review": "requires_source_review",
@@ -1404,10 +1489,25 @@ _EXTRACT_INSTRUCTIONS = (
 )
 
 
+_ILLUSTRATION_INSTRUCTIONS = (
+    "illustration_source_use按已核截图区域及位置分配。instruction仅是经原图定位的屏内操作指引；"
+    "如需保留，按procedure/procedure记录，三类labels/keywords均为空，format_status=not_prescribed、format_title=null。"
+    "其它角色仅交代界面或示例背景，不可作为要求或响应格式的引文/内容，不必报告未决。"
+    "示例主体、记录或无记录结果、筛选值、计数和浏览器页面内容不得转成资格条件、证明义务、我司事实或待填字段。"
+    "示例文字可在模型视图中省略，原文、坐标和读取分母均保留在冻结来源。"
+    "真实的招标查询、截图、提供凭证等要求，从它们自己的完整招标条款提取，保留条件、否定、例外和证明方式。"
+)
+
+
 def extraction_window_payload(window: dict, window_config: dict) -> dict:
     """Build the same frozen request for full extraction and isolated diagnostics."""
-    return {"producer_version": EXTRACTION_VERSION, "window_config": window_config,
-            "task_instructions": _EXTRACT_INSTRUCTIONS, "output_contract": source_selected_output_contract(),
+    instructions = _EXTRACT_INSTRUCTIONS
+    if (any(block.get("illustration_source_use") for block in [*window["blocks"], *window.get("adjacent_context", [])]) or
+            any(packet.get("illustration_source_uses") for packet in window.get("reference_context", {}).get("packets", []))):
+        instructions += _ILLUSTRATION_INSTRUCTIONS
+    model_config = {key: value for key, value in window_config.items() if key != _ILLUSTRATIVE_OCR_REGIONS}
+    return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
+            "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
 
 
@@ -1418,7 +1518,7 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
     def execute():
         _capture(ctx, "n2-window-partition", {"window_id": window["window_id"],
             "rule": "native_pdf_chapter_then_bounded_capacity_v1", "source_sha256": window["source_sha256"],
-            "source_window_sha256": _hash(window), "window_config": window_config,
+            "source_window_sha256": _hash(window), "window_config": payload["window_config"],
             "target_block_ids": [block["block_id"] for block in window["blocks"]],
             "scope": "one_window_not_whole_extraction_or_semantic_acceptance"})
         # Deterministic source faults must stop before a paid request.
@@ -1505,9 +1605,8 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
     manifest = _json(manifest)
     blocks, units, documents = _index(parsed, manifest)
     _fail(parsed.get("coverage", {}).get("required_complete") is False, "TENDER_READING_INCOMPLETE")
-    window_config = {"window_max_chars": config.get("window_max_chars", 14000),
-                     "window_max_blocks": config.get("window_max_blocks", 60)}
-    windows, ledger = _windows(documents, blocks, window_config)
+    window_config = extraction_window_config(config)
+    windows, ledger = _windows(documents, blocks, window_config, manifest=manifest)
     concurrency = config.get("window_concurrency", 1)
     from .unit_concurrency import MAX_WINDOW_CONCURRENCY
     _fail(type(concurrency) is not int or not 1 <= concurrency <= MAX_WINDOW_CONCURRENCY, "WINDOW_CONCURRENCY_INVALID")

@@ -102,6 +102,27 @@ def test_two_official_ocr_consumers_share_caps_with_offline_chat():
         validate_pipeline_ocr_budget(value)
 
 
+def test_offline_n1_retains_its_historical_cap_when_only_n2_can_spend(tmp_path):
+    value = {'pipeline': 'automatic', 'run_purpose': 'diagnostic_replay',
+             'provider': {'mode': 'prepared'}, 'structured_provider': config()['provider'],
+             'ocr': {**tender_config(max_run_calls=5, max_run_usd='0.0075'), 'recorded_targets': []}}
+    executor = build_executor(tmp_path, value)
+    assert executor.execution_config['ocr']['max_run_calls'] == 5
+    assert executor.execution_config['structured_provider']['max_run_calls'] == 100
+    value['ocr']['live_targets'] = []
+    with pytest.raises(ProviderFailure):
+        build_executor(tmp_path, value)
+
+
+def test_replayed_n1_cannot_relax_live_n3_ocr_cap(tmp_path):
+    value = config()
+    value.update(pipeline='automatic', run_purpose='diagnostic_replay',
+                 ocr={**tender_config(max_run_calls=5), 'recorded_targets': []})
+    value['structured_provider'] = {**value['provider'], 'max_run_calls': 101}
+    with pytest.raises(ProviderFailure, match='MATERIAL_OCR_SHARED_RUN_BUDGET_MISMATCH'):
+        build_executor(tmp_path, value)
+
+
 def purchase_stub(root):
     dispatches = []
     provider = tender_config()

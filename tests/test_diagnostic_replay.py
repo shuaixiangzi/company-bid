@@ -280,6 +280,30 @@ def failed_without_http(result):
     assert state["error_code"].startswith("DIAGNOSTIC_REPLAY_"), state.get("error_code")
 
 
+def test_invalid_illustration_region_stops_mixed_preflight_before_an_unbound_window(source_run):
+    source = {**source_run, "extraction": {**source_run.get("extraction", {}),
+                                            "illustrative_ocr_regions": [{"source_id": "unbound"}]}}
+    spec = {**replay_config(source), "bindings": {}}
+    result = target_run(source, spec=spec)
+    failed_without_http(result)
+    assert result[2]["error_code"] == "DIAGNOSTIC_REPLAY_PREFLIGHT_FAILED"
+
+
+def test_mixed_replay_resolves_origin_with_its_own_region_scope(source_run, monkeypatch):
+    source = {**source_run, "extraction": {**source_run.get("extraction", {}), "illustrative_ocr_regions": []}}
+    manifests = []
+    original = extraction.illustration_source_uses
+
+    def record_scope(documents, regions, manifest):
+        manifests.append(manifest is not None)
+        return original(documents, regions, manifest)
+
+    monkeypatch.setattr(extraction, "illustration_source_uses", record_scope)
+    _, _, state, calls, _ = target_run(source)
+    assert state["status"] == "succeeded" and calls == []
+    assert manifests[0] and False in manifests[1:] and manifests[-1]
+
+
 def replace_capture(source, prefix, change):
     executor = source["executor"]
     state = executor.inspect(source["run"])

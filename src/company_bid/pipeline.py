@@ -33,6 +33,7 @@ def _version(*names: str) -> str:
                     "tender_ocr_replay.py": ("material_ocr_replay.py",),
                     "reading_source_review.py": ("reading_review_origin.py",),
                     "reading_review_origin.py": ("tender_ocr_replay.py", "material_ocr_quality.py"),
+                    "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py"),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
                     "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py", "project_identity.py", "commitment_planning.py", "reviewed_source_actions.py", "material_recall.py"),
@@ -89,7 +90,17 @@ def build_executor(root: Path, config: dict) -> Executor:
             and config.get("pipeline") != "automatic"):
         raise PipelineFailure("PROJECT_REVIEW_REQUIRES_AUTOMATIC_PIPELINE")
     from .material_ocr_budget import validate_pipeline_ocr_budget
-    validate_pipeline_ocr_budget(config)
+    budget_config = config
+    tender_ocr = config.get("ocr")
+    if (config.get("run_purpose") == "diagnostic_replay" and isinstance(tender_ocr, dict)
+            and tender_ocr.get("engine") == "deepseek_ocr" and isinstance(tender_ocr.get("recorded_targets"), list)):
+        from .ocr import official_tender_options
+
+        # N1 rejects every unbound image in recorded-only mode. Keep its
+        # original configuration for authentication, including its historic cap.
+        official_tender_options(tender_ocr)
+        budget_config = {**config, "ocr": None}
+    validate_pipeline_ocr_budget(budget_config)
     if config.get("pipeline") == "library":
         from .library_pipeline import build_library_executor
         return build_library_executor(root, config, _version)

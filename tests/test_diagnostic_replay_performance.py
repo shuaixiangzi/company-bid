@@ -23,9 +23,9 @@ def test_all_windows_share_one_authenticated_source_index(tmp_path, monkeypatch)
     windows = extraction._windows
     calls = []
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         calls.append(1)
-        return windows(*args)
+        return windows(*args, **kwargs)
 
     monkeypatch.setattr(extraction, "_windows", counted)
     _, _, state, http, gateways = target_run(source, spec=spec)

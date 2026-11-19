@@ -1322,10 +1322,10 @@ class JsonTaskGateway:
         self.transport = transport
         self.replay = None
         if options.get("mode") == "diagnostic_mixed":
-            from .diagnostic_replay import DiagnosticReplay
+            from .extraction_replay_scope import ExtractionDiagnosticReplay
             config = ChatConfig(**{key: value for key, value in options.items()
                                    if key not in {"mode", "validation_repair_attempts"}})
-            self.replay = DiagnosticReplay(diagnostic_replay, config)
+            self.replay = ExtractionDiagnosticReplay(diagnostic_replay, config)
 
     def preflight(self, ctx, value):
         if self.replay is None:

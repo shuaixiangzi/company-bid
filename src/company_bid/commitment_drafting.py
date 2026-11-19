@@ -222,7 +222,7 @@ def _review_rebuild_repaired_n2(n1, old_n2):
     _require("source_clause_repairs" not in extracted and extracted["parsed_hash"] == digest(n1["parsed"]),
              "REVIEW_REBIND_N2_SOURCE_CHANGED")
     blocks, _, documents = _index(n1["parsed"], n1["manifest"])
-    windows, _ = _windows(documents, blocks, extracted["window_config"])
+    windows, _ = _windows(documents, blocks, extracted["window_config"], manifest=n1["manifest"])
     results = extracted["window_results"]
     _require([window["window_id"] for window in windows] == [result["window_id"] for result in results],
              "REVIEW_REBIND_N2_WINDOWS_CHANGED")
