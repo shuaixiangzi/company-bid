@@ -35,7 +35,7 @@ def _version(*names: str) -> str:
                     "reading_review_origin.py": ("tender_ocr_replay.py", "material_ocr_quality.py"),
                     "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py", "price_scoring_sources.py",
                                       "scoring_row_sources.py", "response_cover_sources.py", "response_review_table_sources.py",
-                                      "response_letter_sources.py"),
+                                      "response_letter_sources.py", "response_cell_reflow_sources.py", "response_authority_tail.py"),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py",),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
@@ -84,6 +84,10 @@ def build_executor(root: Path, config: dict) -> Executor:
     cover_keys = {"response_cover_source_resolution", "failed_response_cover_replay"}
     review_keys = {"response_review_table_source_resolution", "failed_response_review_table_replay"}
     letter_keys = {"response_letter_source_resolution", "failed_response_letter_replay"}
+    reflow_keys = {"response_cell_reflow_source_resolution", "failed_response_cell_reflow_replay"}
+    if isinstance(extraction, dict) and reflow_keys.intersection(extraction):
+        if not (reflow_keys | letter_keys).issubset(extraction):
+            raise PipelineFailure("FAILED_RESPONSE_CELL_REFLOW_CONFIG_INVALID")
     if isinstance(extraction, dict) and letter_keys.intersection(extraction):
         if not (letter_keys | review_keys).issubset(extraction):
             raise PipelineFailure("FAILED_RESPONSE_LETTER_CONFIG_INVALID")

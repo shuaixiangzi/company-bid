@@ -7,6 +7,7 @@ import re
 
 from .diagnostic_replay import _id, _one, _require
 from .provider import ProviderFailure
+from .response_cell_reflow_sources import RESPONSE_CELL_REFLOW_CONFIG_KEY as RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY
 from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY as RESPONSE_COVER_SOURCE_CONFIG_KEY
 from .storage import digest
 
@@ -18,6 +19,7 @@ FAILED_RESPONSE_REVIEW_TABLE_REPLAY = "failed_response_review_table_replay"
 RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY = "response_review_table_source_resolution"
 FAILED_RESPONSE_LETTER_REPLAY = "failed_response_letter_replay"
 RESPONSE_LETTER_SOURCE_CONFIG_KEY = "response_letter_source_resolution"
+FAILED_RESPONSE_CELL_REFLOW_REPLAY = "failed_response_cell_reflow_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -30,6 +32,7 @@ _COVER_INVALID = "FAILED_RESPONSE_COVER_SOURCE_INVALID"
 _COVER_CONFIG = "FAILED_RESPONSE_COVER_CONFIG_INVALID"
 _REVIEW_TABLE_KEYS = {FAILED_RESPONSE_REVIEW_TABLE_REPLAY, RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY}
 _LETTER_KEYS = {FAILED_RESPONSE_LETTER_REPLAY, RESPONSE_LETTER_SOURCE_CONFIG_KEY}
+_CELL_REFLOW_KEYS = {FAILED_RESPONSE_CELL_REFLOW_REPLAY, RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY}
 
 
 class FailedScoringReplay:
@@ -60,7 +63,7 @@ class FailedScoringReplay:
                                   if key not in {FAILED_SCORING_REPLAY, PRICE_SCORING_CONFIG_KEY,
                                                  FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                                  FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
-                                                 *_REVIEW_TABLE_KEYS, *_LETTER_KEYS}}
+                                                 *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -83,6 +86,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in table.actual_units(replay))
         if letter := getattr(replay, "_failed_response_letter", None):
             expected_bindings.update(_TASK + unit for unit in letter.actual_units(replay))
+        if cell := getattr(replay, "_failed_response_cell_reflow", None):
+            expected_bindings.update(_TASK + unit for unit in cell.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -249,7 +254,7 @@ class FailedScoringRowsReplay:
         source_extraction = {key: value for key, value in replay._target_extraction.items()
                              if key not in {FAILED_SCORING_ROWS_REPLAY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                             FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
-                                            *_REVIEW_TABLE_KEYS, *_LETTER_KEYS}}
+                                            *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -617,6 +622,10 @@ class FailedResponseLetterReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_response_review_table
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_response_cell_reflow", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(len(order) == 59 and order[9] == self.predecessor.unit_id and order[10] == self.unit_id and
@@ -638,6 +647,45 @@ class FailedResponseLetterReplay(_StoppedResponseReplay):
                  proof.get("owner_window_id") == self.predecessor.unit_id and
                  isinstance(selected, list) and bool(selected) and selected == context.get("block_ids") and
                  selected[0] == context.get("block_id"),
+                 self.proof_error)
+
+    def predecessor_windows(self):
+        return self.predecessor.enriched_windows()
+
+
+class FailedResponseCellReflowReplay(_StoppedResponseReplay):
+    """Authenticate the unchanged eleven-window prefix and W12's first response."""
+
+    replay_key = FAILED_RESPONSE_CELL_REFLOW_REPLAY
+    proof_key = RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY
+    config_error = "FAILED_RESPONSE_CELL_REFLOW_CONFIG_INVALID"
+    source_error = "FAILED_RESPONSE_CELL_REFLOW_SOURCE_INVALID"
+    proof_error = "FAILED_RESPONSE_CELL_REFLOW_PROOF_MISMATCH"
+    cold_error = "FAILED_RESPONSE_CELL_REFLOW"
+    historical_failure = "EXTRACTION_LABEL_NOT_GROUNDED"
+    lineage_basis = "authenticated_response_cell_reflow_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_response_letter
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[10] == self.predecessor.unit_id and order[11] == self.unit_id and
+                 replay.windows[self.unit_id]["blocks"], self.config_error)
+        return (self.unit_id,)
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_response_cell_reflow_resolution
+
+        return _verified_response_cell_reflow_resolution(raw, window)
+
+    def check_proof_context(self, proof, context):
+        _require(isinstance(context, dict) and context.get("candidate_type") == "requirement" and
+                 context.get("field") == "attachment_keywords" and
+                 digest(proof.get("original_error")) ==
+                 digest({"error_code": self.historical_failure, "diagnostic_context": context}),
                  self.proof_error)
 
     def predecessor_windows(self):

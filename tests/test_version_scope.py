@@ -6,6 +6,18 @@ from company_bid.pipeline import build_executor
 
 
 @pytest.mark.parametrize("keys", [
+    ("response_cell_reflow_source_resolution",),
+    ("failed_response_cell_reflow_replay",),
+    ("response_cell_reflow_source_resolution", "failed_response_cell_reflow_replay"),
+])
+def test_cell_reflow_recovery_requires_its_proof_and_authenticated_predecessor(tmp_path, keys):
+    from company_bid.pipeline import PipelineFailure
+
+    with pytest.raises(PipelineFailure, match="FAILED_RESPONSE_CELL_REFLOW_CONFIG_INVALID"):
+        build_executor(tmp_path, {"pipeline": "automatic", "extraction": {key: {} for key in keys}})
+
+
+@pytest.mark.parametrize("keys", [
     ("response_letter_source_resolution",),
     ("failed_response_letter_replay",),
     ("response_letter_source_resolution", "failed_response_letter_replay"),
@@ -79,6 +91,8 @@ def test_review_table_recovery_requires_source_proof_and_prior_cover_replay(tmp_
     ("response_cover_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("response_review_table_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("response_letter_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
+    ("response_cell_reflow_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
+    ("response_authority_tail.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("source_clauses.py", {"N2", "N3"}),
     ("table_continuations.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("material_matching.py", {"N3"}),

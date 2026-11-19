@@ -9,11 +9,13 @@ from contextvars import ContextVar
 
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
-    FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY, FAILED_RESPONSE_REVIEW_TABLE_REPLAY,
+    FAILED_RESPONSE_CELL_REFLOW_REPLAY, FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY,
+    FAILED_RESPONSE_REVIEW_TABLE_REPLAY,
     FAILED_SCORING_REPLAY, FAILED_SCORING_ROWS_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
+    RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY,
     RESPONSE_LETTER_SOURCE_CONFIG_KEY, RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
-    FailedResponseCoverReplay, FailedResponseLetterReplay, FailedResponseReviewTableReplay, FailedScoringReplay,
-    FailedScoringRowsReplay,
+    FailedResponseCellReflowReplay, FailedResponseCoverReplay, FailedResponseLetterReplay,
+    FailedResponseReviewTableReplay, FailedScoringReplay, FailedScoringRowsReplay,
 )
 from .extraction_illustrations import CONFIG_KEY
 from .provider import ProviderFailure
@@ -51,6 +53,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_response_cover = None
     _failed_response_review_table = None
     _failed_response_letter = None
+    _failed_response_cell_reflow = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -61,6 +64,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_response_cover = None
         self._failed_response_review_table = None
         self._failed_response_letter = None
+        self._failed_response_cell_reflow = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -87,6 +91,11 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  (FAILED_RESPONSE_LETTER_REPLAY in self._target_extraction), "FAILED_RESPONSE_LETTER_CONFIG_INVALID")
         if FAILED_RESPONSE_LETTER_REPLAY in self._target_extraction:
             self._failed_response_letter = FailedResponseLetterReplay(self, ctx)
+        _require((RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_RESPONSE_CELL_REFLOW_REPLAY in self._target_extraction),
+                 "FAILED_RESPONSE_CELL_REFLOW_CONFIG_INVALID")
+        if FAILED_RESPONSE_CELL_REFLOW_REPLAY in self._target_extraction:
+            self._failed_response_cell_reflow = FailedResponseCellReflowReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
             return super().preflight(ctx, value)
 
@@ -119,6 +128,17 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        cell = self._failed_response_cell_reflow
+        if cell is None:
+            return self._read_before_response_cell_reflow(binding, task, full_window)
+        cell.verify_history(self)
+        if binding["unit_id"] == cell.unit_id:
+            return cell.read_failure(self, binding, task, full_window)
+        entry = self._read_before_response_cell_reflow(binding, task, full_window)
+        cell.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_before_response_cell_reflow(self, binding, task, full_window):
         letter = self._failed_response_letter
         if letter is None:
             return self._read_before_response_letter(binding, task, full_window)
@@ -219,7 +239,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_response_letter is not None:
+        if self._failed_response_cell_reflow is not None:
+            self._failed_response_cell_reflow.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_response_letter is not None:
             self._failed_response_letter.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_response_review_table is not None:
             self._failed_response_review_table.allow_candidate(self, ctx, task_type, unit_id)
