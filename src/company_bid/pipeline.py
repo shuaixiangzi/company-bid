@@ -75,6 +75,12 @@ def validate_sources(prepared: PreparedBid) -> None:
 
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
+    extraction = config.get("extraction")
+    if isinstance(extraction, dict) and "failed_cell_wrap_replay" in extraction:
+        provider = config.get("structured_provider", config.get("provider"))
+        if (config.get("pipeline") != "automatic" or config.get("run_purpose") != "diagnostic_replay"
+                or not isinstance(provider, dict) or provider.get("mode") != "diagnostic_mixed"):
+            raise PipelineFailure("FAILED_CELL_WRAP_REPLAY_MODE_REQUIRED")
     reading = config.get("reading")
     if isinstance(reading, dict) and reading.get("pdf_region_reviews"):
         ocr = config.get("ocr")

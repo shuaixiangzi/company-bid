@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from company_bid import chain, extraction, planning
-from company_bid.pipeline import build_executor
+from company_bid.pipeline import PipelineFailure, build_executor
 from company_bid.provider import ProviderFailure
 from company_bid.sample import create_synthetic_sample
 
@@ -15,6 +15,19 @@ def config():
             "provider": {"mode": "prepared"}, "structured_provider": {"mode": "diagnostic_mixed"},
             "mapping_provider": {"mode": "recorded"},
             "diagnostic_replay": {"schema_version": "diagnostic-replay-v1", "sources": {}, "bindings": {}}}
+
+
+@pytest.mark.parametrize("override", [
+    {"structured_provider": {"mode": "chat_completions"}},
+    {"structured_provider": {"mode": "recorded"}},
+    {"pipeline": "library"},
+    {"run_purpose": "production"},
+])
+def test_declared_failed_response_replay_requires_mixed_n2(tmp_path, override):
+    settings = {**config(), "extraction": {"failed_cell_wrap_replay": {}}, **override}
+    with pytest.raises(PipelineFailure, match="FAILED_CELL_WRAP_REPLAY_MODE_REQUIRED"):
+        build_executor(tmp_path / "runtime", settings)
+    assert not (tmp_path / "runtime").exists()
 
 
 @pytest.mark.parametrize("change", ["missing_purpose", "ordinary_purpose", "missing_mapping", "mixed_mapping", "mixed_writer"])

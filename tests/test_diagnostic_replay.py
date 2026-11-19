@@ -48,7 +48,8 @@ def snapshot(root):
             for path in root.rglob("*") if path.is_file()}
 
 
-def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False, two_windows=False):
+def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False, two_windows=False,
+                    failed_cell_label=False):
     input_dir = tmp_path / "source-input"
     input_dir.mkdir()
     manifest, parsed = fixture(input_dir)
@@ -56,9 +57,16 @@ def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False
     source = block(parsed, "B1", SOURCE_CANARY, page=1, origin="native")
     source["locator"] = "pdf/page[1]/line[0]"
     source["page"] = 1
+    if failed_cell_label:
+        source.update(kind="table", locator="pdf/page[1]/table[0]", text="事项\t要求\n材料\t须提供合成材料\n证明。",
+                      rows=[["事项", "要求"], ["材料", "须提供合成材料\n证明。"]],
+                      merges=[], column_widths=[1, 3], header_rows=[0])
     if two_windows:
         item = block(parsed, "B2", "合成第二页应保留检查记录及异常报告。", page=2, origin="native")
         item["locator"], item["page"] = "pdf/page[2]/line[0]", 2
+    if failed_cell_label:
+        item = block(parsed, "B3", "合成第三页应保留验收记录。", page=3, origin="native")
+        item["locator"], item["page"] = "pdf/page[3]/line[0]", 3
     if repaired:
         for index, (identity, text) in enumerate([
             ("TITLE", "5.2 开启程序"), ("LITERAL", "/"),
@@ -84,7 +92,10 @@ def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False
     def transport(endpoint, payload, secret, timeout):
         calls.append(copy.deepcopy(payload))
         raw = candidate(json.loads(payload["messages"][-1]["content"]))
-        if repaired and len(calls) == 1:
+        if failed_cell_label:
+            raw["requirements"][0].update(category="qualification", response_mode="attachment",
+                                          attachment_keywords=["合成材料证明"])
+        elif repaired and len(calls) == 1:
             raw["unresolved_block_ids"] = ["LITERAL"]
         elif repaired:
             raw["requirements"].append({"citation": {"block_ids": ["TITLE", "LITERAL"]},
@@ -114,14 +125,20 @@ def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False
     ], {"structured_provider": options, "extraction": extraction_config, "debug_capture": True})
     value = {"manifest": manifest, "parsed": parsed, "source_artifacts": [], "input_kind": "automatic"}
     run = executor.create_run(value)
-    state = executor.execute(run)
+    with monkeypatch.context() as historical:
+        if failed_cell_label:
+            def reject_unjoined_label(requirement, available, window):
+                raise PlanningError("EXTRACTION_LABEL_NOT_GROUNDED", {"field": "attachment_keywords", "label_index": 0})
+
+            historical.setattr(extraction, "_label_grounding", reject_unjoined_label)
+        state = executor.execute(run)
     assert state["status"] == ("failed" if failed_first else "succeeded"), state.get("error_code")
     if failed_first:
-        assert state["error_code"] == "LIVE_REQUIRED_BLOCK_UNRESOLVED"
+        assert state["error_code"] == ("EXTRACTION_LABEL_NOT_GROUNDED" if failed_cell_label else "LIVE_REQUIRED_BLOCK_UNRESOLVED")
     unit_ids = list(state["nodes"][2]["units"])
     unit_id = unit_ids[0]
-    assert len(unit_ids) == (2 if two_windows else 1)
-    expected_calls = 2 if two_windows or repaired and not failed_first else 1
+    assert len(unit_ids) == (2 if two_windows and not failed_first else 1)
+    expected_calls = 2 if (two_windows or repaired) and not failed_first else 1
     assert len(calls) == expected_calls
     assert inspect_diagnostics(executor.store.root, run)["actual_call_attempts"] == expected_calls
     return {"executor": executor, "run": run, "value": executor.output(run, "N1"), "options": options, "unit_id": unit_id,
@@ -278,6 +295,120 @@ def failed_without_http(result):
     assert state["status"] == "failed", state
     assert calls == []
     assert state["error_code"].startswith("DIAGNOSTIC_REPLAY_"), state.get("error_code")
+
+
+@pytest.fixture
+def source_failed_cell_wrap(tmp_path, monkeypatch):
+    source = make_source_run(tmp_path, monkeypatch, failed_first=True, two_windows=True, failed_cell_label=True)
+    root = source["executor"].store.run_dir(source["run"])
+    terminal = next(row for row in rows(root / "events.jsonl") if row["event"] == "call.failed")
+    source["extraction"] = {**source["extraction"], "failed_cell_wrap_replay": {
+        "unit_id": source["unit_id"], "call_id": terminal["call_id"],
+        "source_state_sha256": hashlib.sha256((root / "state.json").read_bytes()).hexdigest()}}
+    return source, root, terminal
+
+
+def test_failed_cell_wrap_revalidates_unchanged_candidate_then_allows_later_windows(source_failed_cell_wrap):
+    source, root, terminal = source_failed_cell_wrap
+    before = snapshot(root)
+    historical_state = source["executor"].inspect(source["run"])
+    historical_attempt = historical_state["nodes"][2]["attempts"][0]
+    reference = next(item["ref"] for item in historical_attempt["captures"]
+                     if item["name"] == f"response-{terminal['call_id']}-1")
+    old_candidate = json.loads(source["executor"].store.read_json(reference)["choices"][0]["message"]["content"])
+
+    def second(wire):
+        task = json.loads(wire["messages"][-1]["content"])
+        assert task["window"]["window_id"] != source["unit_id"]
+        return response(candidate(task))
+
+    executor, run, state, calls, _ = target_run(source, transport=second)
+    assert state["status"] == "succeeded", state.get("error_code")
+    assert len(calls) == 2
+    node = state["nodes"][0]
+    checkpoint = node["units"][source["unit_id"]]["output_ref"]
+    assert executor.store.read_json(checkpoint)["data"]["raw_model_candidate"] == old_candidate
+    audit = executor.output(run, "N2")["diagnostic_replay"]
+    origin = audit["origins"][0]
+    assert audit["revalidated_count"] == 1 and audit["live_miss_count"] == 2
+    assert audit["historical_calls_charged_again"] == 0
+    assert origin["candidate_sha256"] == digest(old_candidate)
+    assert origin["calls"][0]["response_sha256"] == terminal["output_hash"]
+    assert origin["lineage_notes"][0]["historical_status"] == "failed"
+    assert origin["lineage_notes"][0]["cell_proof"]["column"] == 1
+    events = rows(executor.store.run_dir(run) / "events.jsonl")
+    checkpoint_position = next(index for index, row in enumerate(events) if row["event"] == "unit.checkpointed")
+    paid_position = next(index for index, row in enumerate(events) if row["event"] == "call.started")
+    assert events[checkpoint_position]["unit_id"] == source["unit_id"]
+    assert checkpoint_position < paid_position
+    assert snapshot(root) == before
+
+
+def test_failed_cell_wrap_same_run_resume_reuses_checkpoints_without_rebuying_failed_live_window(source_failed_cell_wrap):
+    source, root, _ = source_failed_cell_wrap
+    before = snapshot(root)
+
+    def live(wire):
+        task = json.loads(wire["messages"][-1]["content"])
+        if task["window"]["blocks"][0]["block_id"] == "B3":
+            raise URLError("synthetic live failure")
+        return response(candidate(task))
+
+    executor, run, failed, calls, _ = target_run(source, transport=live)
+    assert failed["error_code"] == "PROVIDER_NETWORK_ERROR"
+    assert len(calls) == 2
+    before_units = failed["nodes"][0]["units"]
+    assert [unit["status"] for unit in before_units.values()].count("succeeded") == 2
+    reserved = copy.deepcopy(failed["call_budget"]["reservations"])
+    assert len(reserved) == 2
+
+    resumed = executor.resume(run)
+    assert resumed["error_code"] == "DIAGNOSTIC_REPLAY_FAILED_CELL_WRAP_LIVE_WINDOW_ALREADY_RESERVED"
+    assert len(calls) == 2 and resumed["call_budget"]["reservations"] == reserved
+    after_units = resumed["nodes"][0]["units"]
+    assert all(after_units[key] == unit for key, unit in before_units.items() if unit["status"] == "succeeded")
+    assert snapshot(root) == before
+
+
+@pytest.mark.parametrize("alteration", ["no_authorization", "no_binding", "wrong_call", "parallel", "response", "terminal_trace",
+                                         "state", "new_proof_absent"])
+def test_failed_cell_wrap_cannot_buy_a_request_when_binding_or_evidence_invalid(source_failed_cell_wrap, alteration, monkeypatch):
+    source, root, terminal = source_failed_cell_wrap
+    spec = replay_config(source)
+    authorization = source["extraction"]["failed_cell_wrap_replay"]
+    if alteration == "no_authorization":
+        del source["extraction"]["failed_cell_wrap_replay"]
+    elif alteration == "no_binding":
+        spec["bindings"] = {}
+    elif alteration == "wrong_call":
+        authorization["call_id"] = "1" * 32
+    elif alteration == "parallel":
+        source["extraction"]["window_concurrency"] = 2
+    elif alteration == "response":
+        state = source["executor"].inspect(source["run"])
+        reference = next(item["ref"] for item in state["nodes"][2]["attempts"][0]["captures"]
+                         if item["name"] == f"response-{terminal['call_id']}-1")
+        path = source["executor"].store.root / reference["path"]
+        path.write_bytes(path.read_bytes() + b"\n")
+    elif alteration == "terminal_trace":
+        path = root / "spans.jsonl"
+        spans = rows(path)
+        span = next(row for row in spans if row["span_id"] == terminal["span_id"])
+        span["attributes"]["output_hash"] = "f" * 64
+        path.write_text("".join(json.dumps(row) + "\n" for row in spans), encoding="utf-8")
+    elif alteration == "state":
+        path = root / "state.json"
+        path.write_bytes(path.read_bytes() + b"\n")
+    else:
+        current = extraction.validate_live_window
+
+        def validate(raw, window):
+            result = current(raw, window)
+            result["requirements"][0]["citation"]["label_grounding"] = []
+            return result
+
+        monkeypatch.setattr(extraction, "validate_live_window", validate)
+    failed_without_http(target_run(source, spec=spec))
 
 
 def test_invalid_illustration_region_stops_mixed_preflight_before_an_unbound_window(source_run):

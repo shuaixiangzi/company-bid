@@ -831,7 +831,103 @@ def _native_pdf_line_edges(document, blocks):
     return edges
 
 
-def _label_grounding(requirement, available, window):
+def _cited_table_parts(citation, available):
+    """Locate parent table grids in the quote, restricting row citations to their selected rows."""
+    offset = 0
+    if parts := citation.get("table_row_parts"):
+        for part in parts:
+            end = offset + len(part["quote"])
+            yield available[part["block_id"]], offset - part["start"], part["row"], (offset, end)
+            offset = end + 1
+        return
+    offset = -citation["start"]
+    for identity in citation.get("block_ids") or [citation["block_id"]]:
+        block = available[identity]
+        end = offset + len(block["text"])
+        if block["kind"] == "table":
+            yield block, offset, None, (offset, end)
+        offset = end + 1
+
+
+def _table_cell_positions(rows, offset, selected_row):
+    for row, values in enumerate(rows):
+        for column, cell in enumerate(values):
+            if cell and (selected_row is None or row == selected_row):
+                yield row, column, cell, offset
+            offset += len(cell) + 1
+
+
+def _attachment_table_intervals(citation, available):
+    tables, cells = [], []
+    for block, offset, selected_row, (start, end) in _cited_table_parts(citation, available):
+        # Include an adjoining block or row-part separator in the table range.
+        # That separator never belongs to any of its cells.
+        tables.append((start - 1, end + 1))
+        rows, _, covered = _raw_grid(block)
+        if block["text"] == "\n".join("\t".join(row) for row in rows):
+            cells.extend((position, position + len(cell)) for row, col, cell, position in
+                         _table_cell_positions(rows, offset, selected_row) if (row, col) not in covered)
+    return tables, cells
+
+
+def _native_pdf_attachment_cell_match(label, citation, available, window):
+    """Locate a unique original cell substring differing only by visible line breaks."""
+    source_id, source_hash = window["source_id"], window.get("source_sha256")
+    quote = citation["quote"]
+    if (window.get("source_format") != "pdf" or citation["source_id"] != source_id or
+            not isinstance(source_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", source_hash) or source_hash == "0" * 64 or
+            not 2 <= len(label) < len(quote) or any(ch in label for ch in "\r\n\t") or not citation.get("cell_refs")):
+        return None
+    # The native reader projects glyphs inside each physical cell into lines.
+    # Allow one actual LF inside a word. All punctuation and other whitespace
+    # in the label must match exactly, and a blank line cannot be joined.
+    parts = [re.escape(label[0])]
+    for left, right in zip(label, label[1:]):
+        if left.isalnum() and right.isalnum():
+            parts.append(r"\n?")
+        parts.append(re.escape(right))
+    pattern = re.compile(r"(?=(" + "".join(parts) + r"))")
+    found = None
+    for block, offset, selected_row, _ in _cited_table_parts(citation, available):
+        page = block.get("page")
+        if (block.get("source_id") != source_id or block.get("kind") != "table" or block.get("origin") != "native" or
+                block.get("text_basis") != "table_rows_tsv_v1" or block.get("read_disposition") or
+                block.get("illustration_source_use") or not block.get("unit_id") or not block.get("column_widths") or
+                type(page) is not int or page < 1 or not re.fullmatch(rf"pdf/page\[{page}\]/table\[\d+\]", block["locator"])):
+            continue
+        rows, merges, covered = _raw_grid(block)
+        if block["text"] != "\n".join("\t".join(row) for row in rows):
+            continue
+        for row, column, cell, cell_offset in _table_cell_positions(rows, offset, selected_row):
+            if (row, column) in covered:
+                continue
+            start, end = max(0, cell_offset), min(len(quote), cell_offset + len(cell))
+            if start >= end or quote[start:end] != cell[start - cell_offset:end - cell_offset]:
+                continue
+            for match in pattern.finditer(quote, start, end):
+                original = match[1]
+                if "\n" not in original:
+                    continue
+                if found is not None:
+                    return None
+                a, b = match.span(1)
+                line_breaks = [a + i for i, ch in enumerate(original) if ch == "\n"]
+                cell_proof = {"rule": "native_pdf_cell_lf_join_v1", "source_id": source_id, "source_sha256": source_hash,
+                              "block_id": block["block_id"], "unit_id": block["unit_id"], "page": page,
+                              "locator": block["locator"], "row": row, "column": column,
+                              "cell_start": a - cell_offset, "cell_end": b - cell_offset,
+                              "source_text": original, "cell_sha256": hashlib.sha256(cell.encode()).hexdigest(),
+                              "grid_sha256": _hash({"rows": rows, "merges": merges, "column_widths": block["column_widths"],
+                                                   "header_rows": block.get("header_rows", [])}),
+                              "quote_sha256": citation["quote_sha256"], "quote_start": a, "quote_end": b,
+                              "removed_lf_offsets": line_breaks}
+                spans = zip([a, *(i + 1 for i in line_breaks)], [*line_breaks, b])
+                found = {"quote_spans": [list(span) for span in spans],
+                         "cell_proof": {**cell_proof, "proof_sha256": _hash(cell_proof)}}
+    return found
+
+
+def _label_grounding(requirement, available, window, *, allow_native_cell_join=True):
     citation = requirement["citation"]
     quote = citation["quote"]
     selected = citation.get("block_ids") or [citation["block_id"]]
@@ -870,15 +966,33 @@ def _label_grounding(requirement, available, window):
         removals = [(offset - left, identity) for offset, identity in removals if left < offset < right]
     joined = "".join(view)
     result = []
+    table_intervals = None
     for field in ("required_fact_labels", "attachment_keywords", "reference_keywords"):
         for label_index, label in enumerate(requirement[field]):
             exact = label in quote
             text = quote if exact else joined
             if not exact and (not can_join or label not in joined):
+                if allow_native_cell_join and field == "attachment_keywords":
+                    match = _native_pdf_attachment_cell_match(label, citation, available, window)
+                    if match is not None:
+                        result.append({"field": field, "label": label, "label_index": label_index,
+                                       "basis": "native_pdf_cell_lf_join_v1", "matches": [match]})
+                        continue
                 raise PlanningError("EXTRACTION_LABEL_NOT_GROUNDED", {"field": field, "label_index": label_index})
             matches, start = [], 0
+            constrain_table = field == "attachment_keywords" and ("\n" in label or "\t" in label)
+            if constrain_table and table_intervals is None:
+                table_intervals = _attachment_table_intervals(citation, available)
             while (found := text.find(label, start)) >= 0:
-                positions = list(range(found, found + len(label))) if exact else offsets[found:found + len(label)]
+                start = found + 1
+                end = found + len(label)
+                positions = list(range(found, end)) if exact else offsets[found:end]
+                if constrain_table:
+                    tables, cells = table_intervals
+                    first, last = positions[0], positions[-1] + 1
+                    if (any(first < right and left < last for left, right in tables) and
+                            not any(left <= first and last <= right for left, right in cells)):
+                        continue
                 spans = []
                 for position in positions:
                     if spans and spans[-1][1] == position:
@@ -888,7 +1002,8 @@ def _label_grounding(requirement, available, window):
                 used = [identity for offset, identity in removals if not exact and positions[0] < offset < positions[-1]]
                 _fail(not exact and not used, "EXTRACTION_LABEL_NOT_GROUNDED")
                 matches.append({"quote_spans": spans, "edge_sha256s": used})
-                start = found + 1
+            if not matches:
+                raise PlanningError("EXTRACTION_LABEL_NOT_GROUNDED", {"field": field, "label_index": label_index})
             result.append({"field": field, "label": label, "basis": "exact_quote" if exact else "native_pdf_line_join_v1", "matches": matches})
     return result
 

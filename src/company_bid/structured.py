@@ -615,7 +615,10 @@ def _existing_inventory_is_grounded(candidate: dict, window: dict, editable_titl
             item["citation"] = _citation(item["citation"], available, skips, clauses, continuations, rows)
             _guard_heading_only_requirement(item, available, skips)
             try:
-                _label_grounding(item, available, window)
+                # The paid calibration inventory uses the model view and its
+                # existing exact-label restore contract. Same-cell joins are
+                # proved by the validator on the complete frozen source view.
+                _label_grounding(item, available, window, allow_native_cell_join=False)
             except PlanningError as error:
                 if label_failure is not None and error.code == "EXTRACTION_LABEL_NOT_GROUNDED":
                     label_failure.update(candidate_index=index, **error.diagnostic_context)
