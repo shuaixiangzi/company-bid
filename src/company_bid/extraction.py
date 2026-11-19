@@ -24,6 +24,7 @@ from .extraction_illustrations import (
     normalize_regions,
 )
 from .source_clauses import build_clause_catalog
+from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
 from .table_continuations import (
     build_table_continuations, build_table_row_catalog, scoring_table_continuation_issues,
 )
@@ -349,7 +350,7 @@ def _model_reference_packet(packet: dict) -> dict:
 
 
 def _model_window(window: dict) -> dict:
-    view = copy.deepcopy(window)
+    view = copy.deepcopy({key: value for key, value in window.items() if key != PRICE_SCORING_CONFIG_KEY})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -508,6 +509,11 @@ def extraction_window_config(config: dict) -> dict:
             frozen[_ILLUSTRATIVE_OCR_REGIONS] = normalize_regions(config[_ILLUSTRATIVE_OCR_REGIONS])
         except IllustrationError as exc:
             raise PlanningError(str(exc)) from None
+    if PRICE_SCORING_CONFIG_KEY in config:
+        try:
+            frozen[PRICE_SCORING_CONFIG_KEY] = normalize_price_scoring_config(config[PRICE_SCORING_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -653,7 +659,36 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
             window["safe_skip_blocks"] = local_skips
             window["reference_context"] = _reference_context_packets(document, source_blocks, window)
             window["context_identity"] = _window_context_identity(window)
+    if PRICE_SCORING_CONFIG_KEY in config:
+        _bind_price_scoring_source(windows, documents, blocks, footer_skips, config[PRICE_SCORING_CONFIG_KEY])
     return windows, ledger
+
+
+def _bind_price_scoring_source(windows, documents, blocks, footer_skips, config):
+    try:
+        config = normalize_price_scoring_config(config)
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    matches = [document for document in documents if document["source_id"] == config["source_id"]]
+    _fail(len(matches) != 1 or matches[0].get("format") != "pdf" or matches[0]["sha256"] != config["source_sha256"],
+          "PRICE_SCORING_SOURCE_DOCUMENT_MISMATCH")
+    selected = [blocks.get(config[key]) for key in ("heading_block_id", "table_block_id", "continuation_block_id")]
+    _fail(any(block is None for block in selected), "PRICE_SCORING_SOURCE_BLOCK_MISSING")
+    heading, left, right = selected
+    intervening = [block for block in blocks.values() if left["ordinal"] < block["ordinal"] < right["ordinal"]]
+    _fail(len(intervening) != 1, "PRICE_SCORING_SOURCE_CONTINUATION_UNPROVEN")
+    footer = intervening[0]
+    footer_proof = footer_skips.get(footer["block_id"])
+    native_blocks = [heading, left, footer, right]
+    _fail(prove_price_scoring_source(config, native_blocks, footer_proof) is None,
+          "PRICE_SCORING_SOURCE_CONTINUATION_UNPROVEN")
+    owners = {block["block_id"]: window for window in windows for block in window["blocks"]}
+    owner = owners[left["block_id"]]
+    tail_owner = owners[right["block_id"]]
+    _fail(any(owners[block["block_id"]] is not owner for block in (heading, footer)) or tail_owner is owner,
+          "PRICE_SCORING_SOURCE_WINDOW_SCOPE_MISMATCH")
+    owner[PRICE_SCORING_CONFIG_KEY] = {"config": copy.deepcopy(config), "native_blocks": copy.deepcopy(native_blocks),
+        "footer_proof": copy.deepcopy(footer_proof), "continuation_owner_window_id": tail_owner["window_id"]}
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -1400,6 +1435,48 @@ def _capture_source_selection(ctx, record: dict) -> None:
         observer.check()
 
 
+def _verified_price_scoring_resolution(raw: dict, window: dict) -> dict | None:
+    """Check one immutable replay response, then derive its independent supplement."""
+    if PRICE_SCORING_CONFIG_KEY not in window:
+        return None
+    context = window[PRICE_SCORING_CONFIG_KEY]
+    _fail(not isinstance(context, dict) or set(context) != {"config", "native_blocks", "footer_proof", "continuation_owner_window_id"},
+          "PRICE_SCORING_SOURCE_WINDOW_SCOPE_MISMATCH")
+    try:
+        config = normalize_price_scoring_config(context["config"])
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    heading, left, tail = (config[key] for key in ("heading_block_id", "table_block_id", "continuation_block_id"))
+    _fail(not isinstance(raw, dict) or _hash(raw) != config["raw_candidate_sha256"] or
+          raw.get("window_id") != window["window_id"] or raw.get("unresolved_block_ids") != [heading, left],
+          "PRICE_SCORING_SOURCE_RAW_RESPONSE_MISMATCH")
+    _fail(window.get("source_format") != "pdf" or window.get("source_id") != config["source_id"] or
+          window.get("source_sha256") != config["source_sha256"], "PRICE_SCORING_SOURCE_DOCUMENT_MISMATCH")
+    native = context["native_blocks"]
+    proof = prove_price_scoring_source(config, native, context["footer_proof"])
+    _fail(proof is None, "PRICE_SCORING_SOURCE_CONTINUATION_UNPROVEN")
+    targets = {block["block_id"]: block for block in window["blocks"]}
+    seen = set(targets) | {block["block_id"] for block in window.get("adjacent_context", [])}
+    tail_owner = context["continuation_owner_window_id"]
+    _fail(tail in seen or not isinstance(tail_owner, str) or not tail_owner or tail_owner == window["window_id"] or
+          any(targets.get(block["block_id"]) != {key: value for key, value in block.items() if key not in {"bbox", "image_ref"}}
+              for block in native[:3]) or context["footer_proof"] not in window.get("safe_skip_blocks", []),
+          "PRICE_SCORING_SOURCE_WINDOW_SCOPE_MISMATCH")
+    available = {block["block_id"]: block for block in native}
+    heading_block = available[heading]
+    selector = {key: heading_block[key] for key in ("source_id", "block_id", "locator")}
+    citation = _citation({**selector, "block_ids": proof["block_ids"], "clause_id": None, "table_row_id": None},
+                         available, {native[2]["block_id"]: context["footer_proof"]},
+                         table_continuations=[proof["table_continuation"]])
+    requirement = _validate_response_schema({"citation": selector | {"block_ids": proof["block_ids"]},
+        "category": "commercial", "response_mode": "procedure", "mandatory": True, "confidence": "high",
+        "format_status": "not_prescribed"}, _Requirement)
+    requirement["citation"] = {**citation, "label_grounding": []}
+    return {"proof": proof, "raw_candidate_sha256": config["raw_candidate_sha256"], "resolved_block_ids": [heading, left],
+            "continuation_owner_window_id": tail_owner, "requirement": requirement,
+            "basis": "application_frozen_source_not_supplied_to_model"}
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -1422,7 +1499,8 @@ def validate_live_window(raw: dict, window: dict) -> dict:
         raise PlanningError("LIVE_UNRESOLVED_BLOCK_IDS_INVALID", {"field": "unresolved_block_ids", "block_ids": unresolved[:60]})
     processing = _window_processing_ledger(window, unresolved)
     critical = [row["block_id"] for row in processing["blocks"] if row["status"] == "supplied" and row["self_reported_unresolved"]]
-    if critical:
+    resolution = _verified_price_scoring_resolution(raw, window)
+    if critical and (resolution is None or critical != resolution["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
     # not repaired model-reported IDs. Recorded/internal v1-v4 remains strict.
@@ -1461,6 +1539,9 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
           "EXTRACTION_HINT_NORMALIZATION_MISMATCH")
     _fail(result.get("source_selection_normalization") != _normalize_source_selectors(raw or {}, window)[1],
           "EXTRACTION_SOURCE_SELECTION_NORMALIZATION_MISMATCH")
+    resolution = _verified_price_scoring_resolution(raw, window)
+    _fail((PRICE_SCORING_CONFIG_KEY in result) != (resolution is not None) or result.get(PRICE_SCORING_CONFIG_KEY) != resolution,
+          "EXTRACTION_PRICE_SCORING_RESOLUTION_MISMATCH")
     return validated
 
 
@@ -1620,7 +1701,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
     if (any(block.get("illustration_source_use") for block in [*window["blocks"], *window.get("adjacent_context", [])]) or
             any(packet.get("illustration_source_uses") for packet in window.get("reference_context", {}).get("packets", []))):
         instructions += _ILLUSTRATION_INSTRUCTIONS
-    model_config = {key: value for key, value in window_config.items() if key != _ILLUSTRATIVE_OCR_REGIONS}
+    model_config = {key: value for key, value in window_config.items() if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -1694,6 +1775,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
             # fields so the same check works with either caller convention.
             candidate = _wire_candidate(candidate)
         validated = _validate_window(candidate, window)
+        resolution = _verified_price_scoring_resolution(raw_model_candidate, window)
+        supplement = {PRICE_SCORING_CONFIG_KEY: resolution} if resolution is not None else {}
+        if resolution is not None:
+            _capture(ctx, "n2-price-scoring-source-resolution", resolution)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -1702,7 +1787,7 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
             "live_confirmation": live_confirmation,
             "raw_model_candidate": raw_model_candidate,
             "processing": processing, "inactive_reference_hints": inactive_hints,
-            "source_selection_normalization": source_selection, "validated": validated})
+            "source_selection_normalization": source_selection, "validated": validated, **supplement})
         return {"window_id": window["window_id"], "unit_ids": window["unit_ids"],
                 "candidate": candidate, "candidate_origin": "application_normalized",
                 "format_status_scope": "window_target_blocks", "none_verified_means": "none_in_this_window",
@@ -1710,7 +1795,7 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
                 "raw_model_candidate": raw_model_candidate,
                 "live_confirmation": live_confirmation, "processing": processing, "inactive_reference_hints": inactive_hints,
                 "source_selection_normalization": source_selection,
-                "validated": validated, "status": "complete"}
+                "validated": validated, "status": "complete", **supplement}
 
     return ctx.run_unit(window["window_id"], payload, execute)
 
@@ -1893,7 +1978,9 @@ def _merge_results(results: list) -> tuple[list, list]:
     for result in results:
         data = result["validated"]
         local_ids = []
-        for candidate in data["requirements"]:
+        resolution = result.get(PRICE_SCORING_CONFIG_KEY)
+        candidates = data["requirements"] if resolution is None else [*data["requirements"], resolution["requirement"]]
+        for candidate in candidates:
             semantics = {key: value for key, value in candidate.items() if key != "citation"}
             semantics["text"] = candidate["citation"]["quote"]
             key = _hash(semantics)

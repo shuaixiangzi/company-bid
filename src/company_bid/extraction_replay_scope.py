@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
+from .extraction_failed_scoring_replay import FAILED_SCORING_REPLAY, FailedScoringReplay
 from .extraction_illustrations import CONFIG_KEY
 from .provider import ProviderFailure
 from .storage import digest
@@ -39,14 +40,22 @@ def replay_window_inputs(config, manifest):
 
 class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_cell_wrap = None
+    _failed_scoring = None
 
     def preflight(self, ctx, value):
         self._ready = None
         self._scope_caches = {}
         self._failed_cell_wrap = None
+        self._failed_scoring = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
+        from .extraction import PRICE_SCORING_CONFIG_KEY
+
+        _require((PRICE_SCORING_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_SCORING_REPLAY in self._target_extraction), "FAILED_SCORING_CONFIG_INVALID")
+        if FAILED_SCORING_REPLAY in self._target_extraction:
+            self._failed_scoring = FailedScoringReplay(self, ctx.execution_config)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
             return super().preflight(ctx, value)
 
@@ -79,9 +88,17 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        scoring = self._failed_scoring
+        if scoring is not None:
+            scoring.verify_history(self)
+            if binding["unit_id"] == scoring.unit_id:
+                return scoring.read_failure(self, binding, task, full_window)
         options = self._failed_cell_wrap
         if options is None or binding["unit_id"] != options["unit_id"]:
-            return super()._read_entry(binding, task, full_window)
+            entry = super()._read_entry(binding, task, full_window)
+            if scoring is not None:
+                scoring.verify_success(self, binding, entry, full_window)
+            return entry
         unit_id = binding["unit_id"]
         _require(unit_id == next(iter(self.windows)), "FAILED_CELL_WRAP_CONFIG_INVALID")
         run = self._run(binding["alias"], binding["run_id"])
@@ -90,7 +107,8 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  hashlib.sha256(run.state_raw).hexdigest() == options["source_state_sha256"],
                  "FAILED_CELL_WRAP_SOURCE_INVALID")
         frozen_config = run.state["execution_config"]
-        source_extraction = {key: value for key, value in self._target_extraction.items() if key != FAILED_CELL_WRAP_REPLAY}
+        source_extraction = (scoring.source_extraction if scoring is not None else self._target_extraction)
+        source_extraction = {key: value for key, value in source_extraction.items() if key != FAILED_CELL_WRAP_REPLAY}
         _require(run.state.get("config_hash") == digest(frozen_config) and
                  digest(frozen_config.get("extraction", {})) == digest(source_extraction), "SCOPE_MISMATCH")
         node, unit, payload, _, _ = run.unit("N2", unit_id, successful=False)
@@ -98,7 +116,8 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  "REQUEST_MISMATCH")
         _, n1 = self._source_window(run, payload, unit_id)
         _require(n1["output_hash"] == digest(self.current), "SCOPE_MISMATCH")
-        attempt = _failed_unit_attempt(run, node, unit, n1)
+        _require(set(node["units"]) == {unit_id}, "FAILED_CELL_WRAP_SOURCE_INVALID")
+        attempt = _failed_unit_attempt(run, node, unit, n1, _LABEL_FAILURE, "FAILED_CELL_WRAP_SOURCE_INVALID")
         call = _failed_cell_wrap_call(run, node, unit_id, attempt, options["call_id"])
         self._wire(run, call, task)
         proof = _failed_label_proof(call, full_window)
@@ -115,10 +134,15 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                                      "historical_diagnostic_context": call["validation"]["diagnostic_context"],
                                      "source_N1_output_hash": n1["output_hash"],
                                      "source_state_sha256": options["source_state_sha256"], "cell_proof": proof}]}
-        return {"candidate": copy.deepcopy(call["candidate"]), "request_sha256": digest(task), "origin": origin}
+        entry = {"candidate": copy.deepcopy(call["candidate"]), "request_sha256": digest(task), "origin": origin}
+        if scoring is not None:
+            scoring.verify_success(self, binding, entry, full_window)
+        return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_cell_wrap is not None and unit_id != self._failed_cell_wrap["unit_id"]:
+        if self._failed_scoring is not None:
+            self._failed_scoring.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_cell_wrap is not None and unit_id != self._failed_cell_wrap["unit_id"]:
             replay_unit = ctx._record.get("units", {}).get(self._failed_cell_wrap["unit_id"], {})
             _require(replay_unit.get("status") == "succeeded", "FAILED_CELL_WRAP_CHECKPOINT_REQUIRED")
             if task_type + ":" + unit_id not in self.config["bindings"]:
@@ -128,12 +152,12 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return super().candidate(ctx, task_type, unit_id, request, validate)
 
 
-def _failed_unit_attempt(run, node, unit, n1):
+def _failed_unit_attempt(run, node, unit, n1, error_code, invalid_reason):
     job = _one(run.state["execution_attempts"])
     node_attempt = _one(node["attempts"])
     attempt = _one(unit["attempts"])
-    _require(node["status"] == unit["status"] == "failed" and set(node["units"]) == {unit["unit_id"]} and
-             all(item.get("status") == "failed" and item.get("ended_at") and item.get("error_code") == _LABEL_FAILURE
+    _require(node["status"] == unit["status"] == "failed" and
+             all(item.get("status") == "failed" and item.get("ended_at") and item.get("error_code") == error_code
                  for item in (job, node_attempt, attempt)) and
              job.get("trace_status") == "captured" and node_attempt.get("job_attempt_id") == job["attempt_id"] and
              attempt.get("node_attempt_id") == node_attempt["attempt_id"] and
@@ -141,7 +165,7 @@ def _failed_unit_attempt(run, node, unit, n1):
              node_attempt.get("input_hash") == n1["output_hash"] and
              attempt.get("trace_id") == node_attempt.get("trace_id") == job["trace_id"] and
              not any(record.get("output_ref") or record.get("output_hash") for record in (node, unit, attempt)),
-             "FAILED_CELL_WRAP_SOURCE_INVALID")
+             invalid_reason)
     unit_span = run.span(attempt["trace_id"], attempt["span_id"])
     node_span = run.span(node_attempt["trace_id"], node_attempt["span_id"])
     _require(unit_span["name"] == "unit.N2" and node_span["name"] == "node.N2" and
@@ -156,10 +180,10 @@ def _failed_unit_attempt(run, node, unit, n1):
     node_failed = _one(item for item in run.events if item["event"] == "node.failed" and
                        item.get("node_attempt_id") == node_attempt["attempt_id"])
     for event, record in ((unit_failed, attempt), (node_failed, node_attempt)):
-        _require(event.get("error_code") == _LABEL_FAILURE and event.get("node_key") == "N2" and
+        _require(event.get("error_code") == error_code and event.get("node_key") == "N2" and
                  event.get("job_attempt_id") == job["attempt_id"] and
                  event.get("span_id") == record["span_id"] and event.get("trace_id") == record["trace_id"],
-                 "FAILED_CELL_WRAP_SOURCE_INVALID")
+                 invalid_reason)
     return attempt
 
 

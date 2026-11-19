@@ -33,7 +33,8 @@ def _version(*names: str) -> str:
                     "tender_ocr_replay.py": ("material_ocr_replay.py",),
                     "reading_source_review.py": ("reading_review_origin.py",),
                     "reading_review_origin.py": ("tender_ocr_replay.py", "material_ocr_quality.py"),
-                    "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py"),
+                    "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py", "price_scoring_sources.py"),
+                    "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py",),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
                     "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py", "project_identity.py", "commitment_planning.py", "reviewed_source_actions.py", "material_recall.py"),
@@ -76,11 +77,16 @@ def validate_sources(prepared: PreparedBid) -> None:
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
     extraction = config.get("extraction")
+    scoring_keys = {"price_scoring_source_resolution", "failed_scoring_replay"}
+    if isinstance(extraction, dict) and scoring_keys.intersection(extraction):
+        if not scoring_keys.issubset(extraction) or "failed_cell_wrap_replay" not in extraction:
+            raise PipelineFailure("FAILED_SCORING_CONFIG_INVALID")
     if isinstance(extraction, dict) and "failed_cell_wrap_replay" in extraction:
         provider = config.get("structured_provider", config.get("provider"))
         if (config.get("pipeline") != "automatic" or config.get("run_purpose") != "diagnostic_replay"
                 or not isinstance(provider, dict) or provider.get("mode") != "diagnostic_mixed"):
-            raise PipelineFailure("FAILED_CELL_WRAP_REPLAY_MODE_REQUIRED")
+            raise PipelineFailure("FAILED_SCORING_REPLAY_MODE_REQUIRED" if "failed_scoring_replay" in extraction
+                                  else "FAILED_CELL_WRAP_REPLAY_MODE_REQUIRED")
     reading = config.get("reading")
     if isinstance(reading, dict) and reading.get("pdf_region_reviews"):
         ocr = config.get("ocr")

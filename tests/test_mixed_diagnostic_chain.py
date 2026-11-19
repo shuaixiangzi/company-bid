@@ -30,6 +30,24 @@ def test_declared_failed_response_replay_requires_mixed_n2(tmp_path, override):
     assert not (tmp_path / "runtime").exists()
 
 
+@pytest.mark.parametrize("mode", ["chat_completions", "recorded"])
+def test_price_scoring_review_cannot_dispatch_standalone(tmp_path, mode):
+    settings = {**config(), "structured_provider": {"mode": mode}, "extraction": {
+        "price_scoring_source_resolution": {}, "failed_scoring_replay": {}, "failed_cell_wrap_replay": {}}}
+    with pytest.raises(PipelineFailure, match="FAILED_SCORING_REPLAY_MODE_REQUIRED"):
+        build_executor(tmp_path / "runtime", settings)
+    assert not (tmp_path / "runtime").exists()
+
+
+@pytest.mark.parametrize("missing", ["price_scoring_source_resolution", "failed_scoring_replay", "failed_cell_wrap_replay"])
+def test_incomplete_price_scoring_recovery_is_rejected(tmp_path, missing):
+    options = {"price_scoring_source_resolution": {}, "failed_scoring_replay": {}, "failed_cell_wrap_replay": {}}
+    del options[missing]
+    with pytest.raises(PipelineFailure, match="FAILED_SCORING_CONFIG_INVALID"):
+        build_executor(tmp_path / "runtime", {**config(), "extraction": options})
+    assert not (tmp_path / "runtime").exists()
+
+
 @pytest.mark.parametrize("change", ["missing_purpose", "ordinary_purpose", "missing_mapping", "mixed_mapping", "mixed_writer"])
 def test_mixed_mode_cannot_accidentally_apply_to_writing_or_inherited_mapping(tmp_path, change):
     settings = config()

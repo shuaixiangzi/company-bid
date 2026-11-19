@@ -15,6 +15,7 @@ from .models import (PreparedBid, SourceRef, SourceContextProof, RequirementSour
                      context_digest, source_context_operator)
 from .slots import has_fill_marker, whole_cell_slot
 from .source_clauses import build_clause_catalog
+from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY
 from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
@@ -1277,6 +1278,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     table_rows = [row for document in documents for row in build_table_row_catalog(
         document, [block for block in blocks.values() if block["source_id"] == document["source_id"]],
         [proof for proof in table_continuations if proof["source_id"] == document["source_id"]])]
+    # The source-resolution proof was reconstructed above with the full N1.
+    # It is available for citation verification without becoming a model row.
+    price_continuations = {proof["proof_sha256"]: proof for result in verified_results
+                           if PRICE_SCORING_CONFIG_KEY in result
+                           for proof in [result[PRICE_SCORING_CONFIG_KEY]["proof"]["table_continuation"]]}
 
     input_data = {"producer_version": PLANNING_VERSION, "extracted": extracted, "manifest": source_manifest,
                   "parsed_hash": _hash(parsed), "config": config}
@@ -1470,7 +1476,9 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         factual_response_reports = []
 
         def scoped_source(citation):
-            checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks), list(clause_by_id.values()), table_continuations, table_rows)
+            price_proof = price_continuations.get(citation.get("table_continuation_proof_sha256"))
+            checked = _citation(_wire_citation(citation), blocks, _pdf_footer_skips(blocks), list(clause_by_id.values()),
+                                table_continuations + [price_proof] if price_proof else table_continuations, table_rows)
             source_id = _id("SCOPE-", checked)
             if source_id not in source_map:
                 parent = source_map[checked["source_id"]]
