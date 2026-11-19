@@ -9,12 +9,13 @@ from pydantic import ValidationError
 import pytest
 from reportlab.pdfgen import canvas
 
-from company_bid.extraction import _citation
+from company_bid.extraction import PlanningError, _citation, _id
 from company_bid.models import PreparedBid
 from company_bid.pipeline import build_executor
 from company_bid.reading import SourceDocument, ReadingConfig, _read_pdf_page
 from company_bid.source_format import _recover_one, _fill_line
 from company_bid.source_format_contracts import format_digest
+from company_bid.source_format_scope import recover_all
 from test_source_format import Context
 
 
@@ -93,6 +94,33 @@ def test_cross_page_format_preserves_explicit_break_and_has_only_one_heading(tmp
     second=next(i for i,e in enumerate(body) if 'Continuation of the protected condition.' in ''.join(e.itertext()))
     assert first<second and any(e.xpath('.//w:sectPr') for e in body[first:second])
     assert 'Signatory:' in '\n'.join(p.text for p in doc.paragraphs)
+
+
+@pytest.mark.parametrize("overrides, owns_heading", [
+    ({}, True), ({"render_body": False}, False), ({"document_role": "review"}, False),
+])
+def test_delegated_heading_uses_section_defaults_and_exact_source(tmp_path, overrides, owns_heading):
+    data, _, chapter, blocks, source, scoped, manifest = scope_fixture(tmp_path, partial=True)
+    heading, delegated = (blocks[key] for key in chapter["content_block_ids"])
+    section = data["sections"][0]
+    section["section_id"] = _id("SEC-", "FORMAT")
+    ref = section["fixed_content"].pop()["source_refs"][0]
+    source_map = {item["source_id"]: item for item in data["sources"]}
+    candidate = {"section_id": "S", "title": delegated["text"], "source_refs": [ref],
+                 "fixed_content": [], **overrides}
+    wrong = {**candidate, "section_id": "other", "source_refs": [source["source_id"]]}
+    form = {**chapter, "format_id": "FORMAT",
+            "citation": {"block_id": heading["block_id"], "source_id": source["source_id"]}}
+    args = (Context(), [section, wrong, candidate], [form], blocks, source_map, [], [], manifest, scoped)
+    if not owns_heading:
+        with pytest.raises(PlanningError, match="NATIVE_SCOPE_UNACCOUNTED_SOURCE_BLOCK"):
+            recover_all(*args)
+        return
+    report = recover_all(*args)
+    assert report["source_ownership"][0]["owners"] == [
+        {"block_id": heading["block_id"], "section_id": section["section_id"]},
+        {"block_id": delegated["block_id"], "section_id": "S"},
+    ]
 
 
 def test_heading_only_source_scope_is_visible_but_empty_house_section_still_fails(tmp_path):

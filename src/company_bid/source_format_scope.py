@@ -198,8 +198,12 @@ def recover_all(ctx, sections, formats, blocks, source_map, tables, facts, manif
     for key in sorted(allowed,key=lambda k:blocks[k]["ordinal"]):
         block=blocks[key]
         if block["kind"] != "paragraph" or key in format_head_ids:continue
-        candidates=[s for s in sections if s["section_id"] not in main_ids and s["document_role"]=="response" and s["render_body"] and s["title"]==block["text"] and
-                    any(_quote_ref(ref,block,source_map) for ref in s["source_refs"])]
+        # Planning can pass sections before SectionPlan supplies its defaults.
+        candidates = [s for s in sections
+                      if s["section_id"] not in main_ids and s["title"] == block["text"]
+                      and s.get("document_role", "response") == "response"
+                      and s.get("render_body", True)
+                      and any(_quote_ref(ref, block, source_map) for ref in s["source_refs"])]
         if len(candidates)>1:raise PlanningError("NATIVE_SCOPE_HEADING_OWNER_AMBIGUOUS")
         if len(candidates)==1:
             section=candidates[0];sid=section["section_id"]
