@@ -2759,6 +2759,9 @@ _ILLUSTRATION_INSTRUCTIONS = (
 
 def extraction_window_payload(window: dict, window_config: dict) -> dict:
     """Build the same frozen request for full extraction and isolated diagnostics."""
+    from .extraction_replay_scope import replay_window_policy
+
+    window_config = replay_window_policy(window_config)
     instructions = _EXTRACT_INSTRUCTIONS
     if (any(block.get("illustration_source_use") for block in [*window["blocks"], *window.get("adjacent_context", [])]) or
             any(packet.get("illustration_source_uses") for packet in window.get("reference_context", {}).get("packets", []))):
@@ -2909,6 +2912,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
                 "source_selection_normalization": source_selection,
                 "validated": validated, "status": "complete", **supplement}
 
+    if ctx is None:
+        # Replay preflight computes the expected result from a saved response
+        # before opening any durable unit. Runtime executions supply a context.
+        return execute()
     return ctx.run_unit(window["window_id"], payload, execute)
 
 

@@ -49,7 +49,7 @@ def snapshot(root):
 
 
 def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False, two_windows=False,
-                    failed_cell_label=False):
+                    failed_cell_label=False, packing=None):
     input_dir = tmp_path / "source-input"
     input_dir.mkdir()
     manifest, parsed = fixture(input_dir)
@@ -106,6 +106,8 @@ def make_source_run(tmp_path, monkeypatch, *, repaired=False, failed_first=False
 
     gateway = JsonTaskGateway(options, transport=transport)
     extraction_config = {"window_max_blocks": 1} if two_windows else {}
+    if packing is not None:
+        extraction_config["contract_window_packing"] = packing
 
     def extract(ctx, value):
         return {**value, "extracted": extract_requirements(ctx, value["parsed"], value["manifest"], gateway, extraction_config)}
@@ -1017,3 +1019,15 @@ def test_unknown_correction_relation_schema_never_falls_back_to_http(source_repa
     replace_capture(source_repaired, "validation-repair-scheduled-", lambda value: value.update(schema_version=schema))
     failed_without_http(target_run(source_repaired))
 
+
+
+def test_extraction_replay_recreates_the_source_runs_frozen_packing_policy(tmp_path, monkeypatch):
+    from company_bid.contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
+
+    source = make_source_run(tmp_path, monkeypatch, packing=WHOLE_CLAUSES)
+    _, _, state, sends, gateways = target_run(source)
+    assert state["status"] == "succeeded" and not sends
+    assert gateways[0].summary()["revalidated_count"] == 1
+    # Identical visible blocks alone cannot authenticate a different wire.
+    source["extraction"] = {key: value for key, value in source["extraction"].items() if key != POLICY_KEY}
+    failed_without_http(target_run(source))

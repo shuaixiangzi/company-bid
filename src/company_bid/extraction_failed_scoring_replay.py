@@ -28,6 +28,7 @@ FAILED_ILLUSTRATION_REPLAY = "failed_illustration_replay"
 FAILED_CONTRACT_ANNEX_REPLAY = "failed_contract_annex_replay"
 FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY = "failed_contract_interested_parties_replay"
 FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY = "failed_contract_insurance_acceptance_replay"
+FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY = "failed_numbered_contract_clause_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -80,7 +81,8 @@ class FailedScoringReplay:
                                                  *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS,
                                                  *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
                                                  *_CONTRACT_INTERESTED_PARTIES_KEYS,
-                                                 *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS}}
+                                                 *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
+                                                 FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -113,6 +115,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in interested_parties.actual_units(replay))
         if insurance_acceptance := getattr(replay, "_failed_contract_insurance_acceptance", None):
             expected_bindings.update(_TASK + unit for unit in insurance_acceptance.actual_units(replay))
+        if numbered_clause := getattr(replay, "_failed_numbered_contract_clause", None):
+            expected_bindings.update(_TASK + unit for unit in numbered_clause.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -282,7 +286,8 @@ class FailedScoringRowsReplay:
                                             *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS,
                                             *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
                                             *_CONTRACT_INTERESTED_PARTIES_KEYS,
-                                            *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS}}
+                                            *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
+                                            FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -378,10 +383,13 @@ class FailedScoringRowsReplay:
 
 class _StoppedResponseReplay:
     """Authenticate an immutable failed parent and its ordered N2 prefix."""
+    extra_option_keys = frozenset()
+
     def __init__(self, replay, ctx):
         extraction = ctx.execution_config["extraction"]
         options = extraction[self.replay_key]
-        _require(isinstance(options, dict) and set(options) == {"unit_id", "call_id", "source_state_sha256"} and
+        _require(isinstance(options, dict) and
+                 set(options) == {"unit_id", "call_id", "source_state_sha256"} | self.extra_option_keys and
                  isinstance(options["unit_id"], str) and _id(options["call_id"]) and
                  isinstance(options["source_state_sha256"], str) and
                  re.fullmatch(r"[0-9a-f]{64}", options["source_state_sha256"]), self.config_error)
@@ -491,11 +499,10 @@ class _StoppedResponseReplay:
             entry["origin"].setdefault("lineage_notes", []).append({"historical_actual_checkpoint_sha256": output_hash})
         self.prior_checkpoint_hashes[unit_id] = output_hash
 
-    def read_failure(self, replay, binding, task, full_window):
-        from .extraction import (PlanningError, _index, _windows, extraction_window_config,
-                                 extraction_window_payload, validate_live_window)
+    def read_original_failure(self, replay, unit_id, task, full_window):
+        from .extraction import PlanningError, validate_live_window
 
-        run, unit_id = self.run, binding["unit_id"]
+        run = self.run
         unit, call = _read_failed_call(replay, run, self.n1, unit_id, self.call_id, task,
                                        self.historical_failure, self.source_error)
         raw = call["candidate"]
@@ -506,7 +513,15 @@ class _StoppedResponseReplay:
             _require(error.code == self.historical_failure and error.diagnostic_context == context, self.source_error)
         else:
             _require(False, self.source_error)
+        return unit, call, context
 
+    def read_failure(self, replay, binding, task, full_window):
+        from .extraction import (_index, _windows, extraction_window_config, extraction_window_payload,
+                                 validate_live_window)
+
+        unit_id = binding["unit_id"]
+        unit, call, context = self.read_original_failure(replay, unit_id, task, full_window)
+        raw = call["candidate"]
         value = replay.current
         blocks, _, docs = _index(value["parsed"], value["manifest"])
         window_config = extraction_window_config(replay._target_extraction)
@@ -524,8 +539,11 @@ class _StoppedResponseReplay:
             raise ProviderFailure("DIAGNOSTIC_REPLAY_VALIDATION_FAILED") from error
         _require(isinstance(proof, dict) and proof.get("raw_candidate_sha256") == digest(raw), self.proof_error)
         self.verify_source_resolution(proof, context)
-        terminal = call["terminal"]
         self.window = window
+        return self.failure_entry(unit, call, context, task, proof)
+
+    def failure_entry(self, unit, call, context, task, proof):
+        run, unit_id, raw, terminal = self.run, self.unit_id, call["candidate"], call["terminal"]
         origin = {"source_alias": run.alias, "run_id": run.run_id, "node_key": "N2", "unit_id": unit_id,
                   "historical_producer_version": unit["version"], "candidate_sha256": digest(raw),
                   "base_request_sha256": digest(task), "actual_final_wire_sha256": digest(call["request"]),
@@ -897,6 +915,10 @@ class FailedContractInsuranceAcceptanceReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_contract_interested_parties
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_numbered_contract_clause", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(len(order) == 59 and order[25] == self.predecessor.unit_id and order[29] == self.unit_id and
@@ -1004,7 +1026,7 @@ def _read_failed_call(replay, run, n1, unit_id, call_id, task, failure, invalid)
 
 
 def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_windows, error_prefix, prior_hashes=None,
-                          *, verify_cold_identity=False):
+                          *, verify_cold_identity=False, terminal_result_hash=None):
     _require(replay._ready == (ctx.run_id, ctx.attempt_id, digest(ctx.execution_config)), "PREFLIGHT_REQUIRED")
     if task_type + ":" + unit_id in replay._entries:
         return
@@ -1033,6 +1055,7 @@ def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_window
     if not gate.checkpoints_verified:
         from .extraction import _validate_normalized_window_result
 
+        preceding_checkpoint = None
         for unit in gate.prefix:
             checkpoint = ctx.executor._checkpoint_data(units[unit])
             entry = replay._entries[_TASK + unit]
@@ -1040,5 +1063,11 @@ def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_window
             _require(prior_hashes is None or unit not in prior_hashes or digest(checkpoint) == prior_hashes[unit], required)
             if verify_cold_identity:
                 _require(checkpoint.get("status") == "complete" and checkpoint.get("window_id") == unit, required)
-            _validate_normalized_window_result(checkpoint, enriched_windows.get(unit, replay.windows[unit]))
+            window = enriched_windows.get(unit, replay.windows[unit])
+            if terminal_result_hash is not None and unit == gate.unit_id:
+                _require(digest(checkpoint) == terminal_result_hash, required)
+                _validate_normalized_window_result(checkpoint, window, predecessor_result=preceding_checkpoint)
+            else:
+                _validate_normalized_window_result(checkpoint, window)
+            preceding_checkpoint = checkpoint
         gate.checkpoints_verified = True

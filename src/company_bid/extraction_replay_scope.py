@@ -11,6 +11,7 @@ from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
     CONTRACT_ANNEX_SOURCE_CONFIG_KEY, FAILED_CONTRACT_ANNEX_REPLAY, FailedContractAnnexReplay,
     CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY,
+    FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
     CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY,
     FAILED_ILLUSTRATION_REPLAY, FailedIllustrationReplay,
     FAILED_RESPONSE_CELL_REFLOW_REPLAY, FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY,
@@ -22,7 +23,9 @@ from .extraction_failed_scoring_replay import (
     FailedResponseCellReflowReplay, FailedResponseCoverReplay, FailedResponseLetterReplay,
     FailedResponseReviewTableReplay, FailedScoringReplay, FailedScoringRowsReplay,
 )
+from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
 from .extraction_illustrations import CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY
+from .extraction_numbered_clause_replay import FailedNumberedContractClauseReplay
 from .provider import ProviderFailure
 from .storage import digest
 
@@ -34,8 +37,9 @@ _window_inputs = ContextVar("replay_window_inputs", default=None)
 
 
 @contextmanager
-def _scope(regions, manifest):
-    token = _window_inputs.set((regions, manifest) if regions is not None else None)
+def _scope(regions, manifest, packing=None):
+    _require(packing is None or packing == WHOLE_CLAUSES, "CONFIG_INVALID")
+    token = _window_inputs.set((regions, manifest, packing))
     try:
         yield
     finally:
@@ -47,8 +51,17 @@ def replay_window_inputs(config, manifest):
     scope = _window_inputs.get()
     if manifest is not None or scope is None:
         return config, manifest
-    regions, authenticated_manifest = scope
-    return {**config, CONFIG_KEY: regions}, authenticated_manifest
+    regions, authenticated_manifest, _ = scope
+    config = replay_window_policy(config)
+    return ({**config, CONFIG_KEY: regions} if regions is not None else config), authenticated_manifest
+
+
+def replay_window_policy(config):
+    """Apply the active N2 run's frozen packing decision to the reconstructed wire."""
+    scope = _window_inputs.get()
+    if scope is None or scope[2] is None:
+        return config
+    return {**config, POLICY_KEY: scope[2]}
 
 
 class ExtractionDiagnosticReplay(DiagnosticReplay):
@@ -63,6 +76,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_contract_annex = None
     _failed_contract_interested_parties = None
     _failed_contract_insurance_acceptance = None
+    _failed_numbered_contract_clause = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -78,6 +92,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_contract_annex = None
         self._failed_contract_interested_parties = None
         self._failed_contract_insurance_acceptance = None
+        self._failed_numbered_contract_clause = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -127,16 +142,20 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  FailedContractInsuranceAcceptanceReplay.config_error)
         if FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY in self._target_extraction:
             self._failed_contract_insurance_acceptance = FailedContractInsuranceAcceptanceReplay(self, ctx)
-        with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
+        if FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY in self._target_extraction:
+            self._failed_numbered_contract_clause = FailedNumberedContractClauseReplay(self, ctx)
+        with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"], self._target_extraction.get(POLICY_KEY)):
             return super().preflight(ctx, value)
 
     def _source_window(self, run, payload, unit_id):
         # The same N1 may have several N2 children with different reviews.
         # Authenticate a binding against that historical run's own decisions.
-        regions = run.state["execution_config"].get("extraction", {}).get(CONFIG_KEY)
-        manifest = self._n1(run)[0]["manifest"] if regions is not None else None
-        with _scope(regions, manifest):
-            self._source_windows = self._scope_caches.setdefault(digest(regions), {})
+        settings = run.state["execution_config"].get("extraction", {})
+        regions, packing = settings.get(CONFIG_KEY), settings.get(POLICY_KEY)
+        _require(payload["window_config"].get(POLICY_KEY) == packing, "SOURCE_WINDOW_MISMATCH")
+        manifest = self._n1(run)[0]["manifest"] if regions is not None or packing is not None else None
+        with _scope(regions, manifest, packing):
+            self._source_windows = self._scope_caches.setdefault(digest([regions, packing]), {})
             return super()._source_window(run, payload, unit_id)
 
     def _failed_cell_wrap_options(self, config):
@@ -159,6 +178,21 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        numbered = self._failed_numbered_contract_clause
+        if numbered is None:
+            return self._read_before_numbered_clause(binding, task, full_window)
+        numbered.verify_history(self)
+        unit_id = binding["unit_id"]
+        if unit_id == numbered.unit_id:
+            return numbered.read_failure(self, binding, task, full_window)
+        if unit_id in numbered.predecessor.prefix:
+            entry = self._read_before_numbered_clause(binding, task, full_window)
+        else:
+            entry = super()._read_entry(binding, task, full_window)
+        numbered.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_before_numbered_clause(self, binding, task, full_window):
         insurance_acceptance = self._failed_contract_insurance_acceptance
         if insurance_acceptance is None:
             return self._read_before_contract_insurance_acceptance(binding, task, full_window)
@@ -330,7 +364,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_contract_insurance_acceptance is not None:
+        if self._failed_numbered_contract_clause is not None:
+            self._failed_numbered_contract_clause.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_contract_insurance_acceptance is not None:
             self._failed_contract_insurance_acceptance.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_contract_interested_parties is not None:
             self._failed_contract_interested_parties.allow_candidate(self, ctx, task_type, unit_id)
