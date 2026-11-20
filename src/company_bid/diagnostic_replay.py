@@ -662,6 +662,10 @@ class DiagnosticReplay:
             extraction = ctx.execution_config.get("extraction", {})
             window_config = {"window_max_chars": extraction.get("window_max_chars", 14000),
                              "window_max_blocks": extraction.get("window_max_blocks", 60)}
+            from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
+            if POLICY_KEY in extraction:
+                _require(extraction[POLICY_KEY] == WHOLE_CLAUSES, "CONFIG_INVALID")
+                window_config[POLICY_KEY] = WHOLE_CLAUSES
             self.window_config = window_config
             windows, _ = _windows(documents, blocks, window_config)
             self.windows = {window["window_id"]: window for window in windows}

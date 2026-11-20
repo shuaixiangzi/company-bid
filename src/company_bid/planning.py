@@ -22,12 +22,13 @@ from .response_review_table_sources import (
     response_review_native_blocks,
 )
 from .scoring_row_sources import SCORING_ROW_SOURCE_CONFIG_KEY
+from .contract_clause_packing import POLICY_KEY as CONTRACT_PACKING
 from .extraction import (
     EXTRACTION_VERSION, PlanningError, Text, _Strict, _WindowResponse,
     _EXTRACT_INSTRUCTIONS, _json, _hash, _id, _fail, _capture, _index, _windows,
     _citation, _validate_window, _merge_results, _wire_candidate, _raw_grid, extraction_window_config,
     _heading_level, _pdf_footer_skips, extract_requirements, _validate_normalized_window_result, _close_deferred_context,
-    _chapter_boundary, _repair_numbered_procedure_spans,
+    _chapter_boundary, _repair_numbered_procedure_spans, build_contract_clause_indexes, CONTRACT_CLAUSE_INDEX_OUTPUT_KEY,
 )
 from .table_continuations import build_table_continuations, build_table_row_catalog
 from .preparation_rules import preparation_rule, manual_signing_submission, proof_compilation
@@ -1310,7 +1311,14 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
     frozen_window_config = extracted.get("window_config")
     _fail(not isinstance(frozen_window_config, dict) or extraction_window_config(frozen_window_config) != frozen_window_config,
           "EXTRACTION_WINDOW_CONFIGURATION_MISSING")
-    windows, denominator = _windows(documents, blocks, frozen_window_config, manifest=source_manifest)
+    indexes = None
+    _fail(CONTRACT_PACKING in frozen_window_config and CONTRACT_CLAUSE_INDEX_OUTPUT_KEY not in extracted,
+          "EXTRACTION_CONTRACT_CLAUSE_INDEX_MISMATCH")
+    if CONTRACT_CLAUSE_INDEX_OUTPUT_KEY in extracted:
+        indexes = build_contract_clause_indexes(documents, blocks)
+        _fail(extracted[CONTRACT_CLAUSE_INDEX_OUTPUT_KEY] != indexes, "EXTRACTION_CONTRACT_CLAUSE_INDEX_MISMATCH")
+    windows, denominator = _windows(documents, blocks, frozen_window_config, manifest=source_manifest,
+                                   contract_clause_indexes=indexes)
     expected_coverage = {"status": "complete", "semantic_review": "requires_source_review", "tender_unit_count": len(denominator), "window_count": len(windows),
                          "completed_window_count": len(windows), "units": denominator}
     for row in denominator:
@@ -1322,10 +1330,14 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
           extracted.get("source_hashes") != {d["source_id"]: d["sha256"] for d in documents},
           "EXTRACTION_DENOMINATOR_MISMATCH")
     by_window = {window["window_id"]: window for window in windows}
+    by_result = {result["window_id"]: result for result in extracted["window_results"]}
+    predecessor_by_window = {current["window_id"]: previous["window_id"] for previous, current in zip(windows, windows[1:])}
     verified_results = []
     for result in extracted["window_results"]:
         _fail(result.get("status") != "complete", "EXTRACTION_COVERAGE_INCOMPLETE")
-        validated = _validate_normalized_window_result(result, by_window[result["window_id"]])
+        identity = result["window_id"]
+        validated = _validate_normalized_window_result(
+            result, by_window[identity], predecessor_result=by_result.get(predecessor_by_window.get(identity)))
         verified_results.append({**result, "validated": validated})
     _fail(extracted.get("deferred_context_closure") != _close_deferred_context(windows, verified_results),
           "EXTRACTION_DEFERRED_CLOSURE_MISMATCH")

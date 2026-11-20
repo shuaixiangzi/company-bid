@@ -37,7 +37,8 @@ def _version(*names: str) -> str:
                                       "scoring_row_sources.py", "response_cover_sources.py", "response_review_table_sources.py",
                                       "response_letter_sources.py", "response_cell_reflow_sources.py", "response_authority_tail.py",
                                       "contract_annex_sources.py", "contract_interested_parties_sources.py",
-                                      "contract_acceptance_sources.py"),
+                                      "contract_acceptance_sources.py", "contract_clause_index.py",
+                                      "contract_clause_resolution.py", "contract_clause_packing.py"),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py",),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
@@ -81,6 +82,14 @@ def validate_sources(prepared: PreparedBid) -> None:
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
     extraction = config.get("extraction")
+    from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
+
+    structured = config.get("structured_provider", config.get("provider", {}))
+    if (config.get("pipeline") == "automatic" and isinstance(structured, dict)
+            and structured.get("mode") == "chat_completions" and not config.get("diagnostic_replay")
+            and (extraction is None or isinstance(extraction, dict) and POLICY_KEY not in extraction)):
+        extraction = {**(extraction or {}), POLICY_KEY: WHOLE_CLAUSES}
+        config = {**config, "extraction": extraction}
     scoring_keys = {"price_scoring_source_resolution", "failed_scoring_replay"}
     row_keys = {"scoring_row_source_resolution", "failed_scoring_rows_replay"}
     cover_keys = {"response_cover_source_resolution", "failed_response_cover_replay"}

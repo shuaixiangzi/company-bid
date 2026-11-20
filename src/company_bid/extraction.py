@@ -39,6 +39,13 @@ from .extraction_illustrations import (
     verify_context_proof,
 )
 from .source_clauses import build_clause_catalog
+from .contract_clause_packing import POLICY_KEY as CONTRACT_PACKING, WHOLE_CLAUSES, block_cost, clause_reservations
+from .contract_clause_resolution import (
+    INDEX_OUTPUT_KEY as CONTRACT_CLAUSE_INDEX_OUTPUT_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
+    RESOLUTION_KEY as CONTRACT_CLAUSE_RESOLUTION_KEY,
+    bind_contract_clause_windows, resolve_contract_clause_boundaries, verify_contract_clause_predecessor,
+)
 from .response_authority_tail import authority_tail_proof
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
 from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY, build_response_cover_proof, normalize_response_cover_config
@@ -387,7 +394,7 @@ def _model_window(window: dict) -> dict:
                                          RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
                                          RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
                                          CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
-                                         CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY}})
+                                         CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -541,6 +548,9 @@ def _validate_reference_context(window: dict) -> None:
 def extraction_window_config(config: dict) -> dict:
     frozen = {"window_max_chars": config.get("window_max_chars", 14000),
               "window_max_blocks": config.get("window_max_blocks", 60)}
+    if CONTRACT_PACKING in config:
+        _fail(config[CONTRACT_PACKING] != WHOLE_CLAUSES, "CONTRACT_WINDOW_PACKING_INVALID")
+        frozen[CONTRACT_PACKING] = WHOLE_CLAUSES
     if _ILLUSTRATIVE_OCR_REGIONS in config:
         try:
             frozen[_ILLUSTRATIVE_OCR_REGIONS] = normalize_regions(config[_ILLUSTRATIVE_OCR_REGIONS])
@@ -601,7 +611,15 @@ def extraction_window_config(config: dict) -> dict:
     return frozen
 
 
-def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | None = None) -> tuple[list, list]:
+def build_contract_clause_indexes(documents: list, blocks: dict) -> list:
+    """Build a source-position index independent of extraction windows."""
+    from .contract_clause_index import build_contract_clause_index
+
+    return [build_contract_clause_index(document, blocks) for document in documents]
+
+
+def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | None = None,
+             contract_clause_indexes: list | None = None) -> tuple[list, list]:
     if manifest is None:
         from .extraction_replay_scope import replay_window_inputs
         config, manifest = replay_window_inputs(config, manifest)
@@ -617,9 +635,15 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         blocks = {key: (block | {"illustration_source_use": uses[key]}) if key in uses else block
                   for key, block in blocks.items()}
     windows, ledger = [], []
+    packing = {}
+    if config.get(CONTRACT_PACKING) == WHOLE_CLAUSES:
+        indexes = contract_clause_indexes if contract_clause_indexes is not None else build_contract_clause_indexes(documents, blocks)
+        packing = {index["source_id"]: index for index in indexes}
     for document in documents:
         pending, size = [], 0
         source_id = document["source_id"]
+        reservations = (clause_reservations(packing[source_id], document, blocks, limit, block_limit)
+                        if source_id in packing else {})
 
         def flush():
             nonlocal pending, size
@@ -645,18 +669,22 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
                 # Binary image references and reader-specific metadata are not
                 # business fields and do not belong in a model request.
                 block = {key: value for key, value in block.items() if key not in {"image_ref", "bbox"}}
-                cost = len(json.dumps({key: value for key, value in block.items() if key != "illustration_source_use"},
-                                      ensure_ascii=False))
+                cost = block_cost(block)
                 _fail(cost > limit, "SOURCE_BLOCK_EXCEEDS_WINDOW_LIMIT")
                 # Never mix separate native PDF chapters merely to fill capacity.
                 # This changes ownership, not original blocks or source semantics.
                 if pending and document.get("format") == "pdf" and _chapter_boundary(block):
                     flush()
+                reservation = reservations.get(block["block_id"])
+                if pending and reservation:
+                    count, chars = reservation
+                    if len(pending) + count > block_limit or size + chars > limit:
+                        flush()
                 if pending and (size + cost > limit or len(pending) >= block_limit):
                     binding = _caption_table_binding(document, pending[-1], block)
                     if binding:
                         caption = pending[-1]
-                        caption_cost = len(json.dumps(caption, ensure_ascii=False))
+                        caption_cost = block_cost(caption)
                         _fail(caption_cost + cost > limit or block_limit < 2,
                               "CAPTION_TABLE_PAIR_EXCEEDS_WINDOW_LIMIT")
                         pending.pop()
@@ -763,6 +791,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_contract_interested_parties_source(windows, documents, blocks, config[CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY])
     if CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY in config:
         _bind_contract_insurance_acceptance_source(windows, documents, blocks, config[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY])
+    if contract_clause_indexes:
+        bind_contract_clause_windows(windows, contract_clause_indexes, blocks, footer_skips)
     return windows, ledger
 
 
@@ -1739,8 +1769,11 @@ def _inactive_reference_hints(raw: dict) -> dict:
 def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
     """Derive omitted coordinates from canonical IDs; never repair supplied ones."""
     normalized = copy.deepcopy(raw)
+    # The document-wide index authenticates a separate source proof. Adding it
+    # does not change which raw blocks were available to the original caller.
+    selector_window = {key: value for key, value in window.items() if key != CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
-              "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(window),
+              "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
               "context_identity": copy.deepcopy(window.get("context_identity")), "selections": []}
     available = {block["block_id"]: block for block in [*window["blocks"], *window.get("adjacent_context", [])]}
     if not isinstance(normalized, dict):
@@ -2383,7 +2416,21 @@ def verify_contract_insurance_acceptance_predecessor(predecessor_result: dict, p
           hashlib.sha256(citation["quote"].encode()).hexdigest() != prior["quote_sha256"], error)
 
 
-def validate_live_window(raw: dict, window: dict) -> dict:
+def _contract_boundary_resolution(raw, window, predecessor_result, *, data=None, critical=None):
+    if not window.get(CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY) or any(key in window for key in (
+            PRICE_SCORING_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY, CONTRACT_ANNEX_SOURCE_CONFIG_KEY,
+            CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY)):
+        return None
+    if data is None:
+        normalized, _ = _normalize_source_selectors(raw, window)
+        data = _validate_response_schema(normalized, _LiveWindowResponse)
+    if critical is None:
+        processing = _window_processing_ledger(window, data["unresolved_block_ids"])
+        critical = [row["block_id"] for row in processing["blocks"] if row["status"] == "supplied" and row["self_reported_unresolved"]]
+    return resolve_contract_clause_boundaries(raw, data, window, critical, predecessor_result)
+
+
+def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
         _fail("reviewed_block_ids" in raw, "LIVE_REVIEWED_BLOCK_IDS_FORBIDDEN")
@@ -2411,7 +2458,8 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     annex = _verified_contract_annex_resolution(raw, window)
     continuation = _verified_contract_interested_parties_resolution(raw, window)
     acceptance = _verified_contract_insurance_acceptance_resolution(raw, window)
-    resolved = resolution or cover or annex or continuation or acceptance
+    resolved = resolution or cover or annex or continuation or acceptance or _contract_boundary_resolution(
+        raw, window, predecessor_result, data=data, critical=critical)
     if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
@@ -2465,7 +2513,7 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     return validated
 
 
-def _validate_normalized_window_result(result: dict, window: dict) -> dict:
+def _validate_normalized_window_result(result: dict, window: dict, *, predecessor_result=None) -> dict:
     """N3 reconstructs confirmation and frozen accounting from source."""
     _fail(result.get("candidate_origin") != "application_normalized" or
           result.get("unit_ids") != window["unit_ids"] or
@@ -2474,7 +2522,7 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     raw, confirmation = result.get("raw_model_candidate"), result.get("live_confirmation")
     if window["blocks"]:
         _fail(not isinstance(raw, dict) or not isinstance(confirmation, dict), "EXTRACTION_LIVE_CONFIRMATION_MISSING")
-        validated = validate_live_window(raw, window)
+        validated = validate_live_window(raw, window, predecessor_result=predecessor_result)
         expected = {key: raw[key] for key in ("window_id", "processing_declaration", "unresolved_block_ids")}
         expected["raw_structured_candidate_sha256"] = _hash(raw)
         location = CALLER_CANDIDATE_LOCATION
@@ -2524,6 +2572,10 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     key = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
     _fail((key in result) != (acceptance is not None) or result.get(key) != acceptance,
           "EXTRACTION_CONTRACT_INSURANCE_ACCEPTANCE_RESOLUTION_MISMATCH")
+    boundary = _contract_boundary_resolution(raw, window, predecessor_result)
+    key = CONTRACT_CLAUSE_RESOLUTION_KEY
+    _fail((key in result) != (boundary is not None) or result.get(key) != boundary,
+          "EXTRACTION_CONTRACT_CLAUSE_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2581,10 +2633,12 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                         next((identity for index, identity in enumerate(result_ids) if identity not in by_window or identity in result_ids[:index]), None))
         guard(True, "DEFERRED_CONTEXT_OWNER_INCOMPLETE", **incomplete_context(identity))
     by_result = {result["window_id"]: result for result in results}
-    for identity, result in by_result.items():
+    for index, (identity, window) in enumerate(by_window.items()):
+        result = by_result[identity]
+        predecessor = by_result.get(windows[index - 1]["window_id"]) if index else None
         guard(result.get("status") != "complete", "DEFERRED_CONTEXT_OWNER_INCOMPLETE", **incomplete_context(identity))
         try:
-            _validate_normalized_window_result(result, by_window[identity])
+            _validate_normalized_window_result(result, window, predecessor_result=predecessor)
         except PlanningError as exc:
             context = {"window_id": identity[:120], "source_id": by_window[identity]["source_id"][:120]}
             if exc.code == "EXTRACTION_PROCESSING_LEDGER_MISMATCH":
@@ -2627,7 +2681,8 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                 verify_contract_insurance_acceptance_predecessor(by_result.get(proof["predecessor"]["window_id"], {}), proof)
             resolved_sources = (("owner_target_source_proven_cover", cover), ("owner_target_source_proven_annex_reference", annex),
                                 ("owner_target_source_proven_contract_continuation", continuation),
-                                ("owner_target_source_proven_contract_insurance_acceptance", acceptance))
+                                ("owner_target_source_proven_contract_insurance_acceptance", acceptance),
+                                ("owner_target_source_proven_numbered_contract_clause", owner_result.get(CONTRACT_CLAUSE_RESOLUTION_KEY)))
             source_resolved = next((basis for basis, source in resolved_sources
                                     if source is not None and deferred["block_id"] in source["resolved_block_ids"]), None)
             guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
@@ -2719,13 +2774,14 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
 
 
-def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> dict:
+def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, predecessor_result=None) -> dict:
     """Execute one durable unit; this alone never declares the full N2 complete."""
     payload = extraction_window_payload(window, window_config)
 
     def execute():
         _capture(ctx, "n2-window-partition", {"window_id": window["window_id"],
-            "rule": "native_pdf_chapter_then_bounded_capacity_v1", "source_sha256": window["source_sha256"],
+            "rule": (WHOLE_CLAUSES if window_config.get(CONTRACT_PACKING) == WHOLE_CLAUSES
+                     else "native_pdf_chapter_then_bounded_capacity_v1"), "source_sha256": window["source_sha256"],
             "source_window_sha256": _hash(window), "window_config": payload["window_config"],
             "target_block_ids": [block["block_id"] for block in window["blocks"]],
             "scope": "one_window_not_whole_extraction_or_semantic_acceptance"})
@@ -2768,7 +2824,7 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
                 nonlocal processing, live_confirmation, raw_model_candidate, source_selection
                 selection = _normalize_source_selectors(value, window)[1]
                 _capture_source_selection(ctx, selection)
-                result = validate_live_window(value, window)
+                result = validate_live_window(value, window, predecessor_result=predecessor_result)
                 source_selection = selection
                 raw_model_candidate = copy.deepcopy(value)
                 processing = _window_processing_ledger(window, value["unresolved_block_ids"])
@@ -2831,6 +2887,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
         if acceptance is not None:
             supplement[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY] = acceptance
             _capture(ctx, "n2-contract-insurance-acceptance-source-resolution", acceptance)
+        boundary = _contract_boundary_resolution(raw_model_candidate, window, predecessor_result)
+        if boundary is not None:
+            supplement[CONTRACT_CLAUSE_RESOLUTION_KEY] = boundary
+            _capture(ctx, "n2-contract-clause-source-resolution", boundary)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2852,23 +2912,60 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
     return ctx.run_unit(window["window_id"], payload, execute)
 
 
+def _parallel_contract_predecessor(ctx, window, predecessor):
+    """Load the immutable preceding result only when a fragment needs it."""
+    snapshot = getattr(ctx, "prior_unit_record", None)
+    if not callable(snapshot) or not predecessor or not window.get(CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY):
+        return None
+
+    from .runtime import CheckpointInvalidError
+    from .storage import ArtifactIntegrityError
+
+    loaded = []
+
+    def read():
+        if not loaded:
+            record = snapshot()
+            previous = record.get("units", {}).get(predecessor["window_id"], {})
+            if previous.get("status") != "succeeded" or previous.get("version") != record.get("version"):
+                return None
+            try:
+                envelope = ctx.executor.store.read_json(previous["output_ref"])
+                if (envelope.get("run_id") != ctx.run_id or envelope.get("node_key") != ctx.node_key or
+                        envelope.get("unit_id") != predecessor["window_id"]):
+                    raise ArtifactIntegrityError("Preceding checkpoint belongs to another unit.")
+                loaded.append(ctx.executor._checkpoint_data(previous))
+            except (ArtifactIntegrityError, KeyError, TypeError) as error:
+                raise CheckpointInvalidError(ctx.node_key) from error
+        return loaded[0]
+
+    return read
+
+
 def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: dict) -> dict:
     """N2: extract every tender window, then merge only identical assertions."""
     manifest = _json(manifest)
     blocks, units, documents = _index(parsed, manifest)
     _fail(parsed.get("coverage", {}).get("required_complete") is False, "TENDER_READING_INCOMPLETE")
     window_config = extraction_window_config(config)
-    windows, ledger = _windows(documents, blocks, window_config, manifest=manifest)
+    indexes = build_contract_clause_indexes(documents, blocks)
+    _capture(ctx, "n2-contract-clause-indexes", {"items": indexes})
+    _fail(bool(getattr(ctx, "_capture_failed", False)), "DIAGNOSTICS_CAPTURE_FAILED")
+    windows, ledger = _windows(documents, blocks, window_config, manifest=manifest, contract_clause_indexes=indexes)
     concurrency = config.get("window_concurrency", 1)
     from .unit_concurrency import MAX_WINDOW_CONCURRENCY
     _fail(type(concurrency) is not int or not 1 <= concurrency <= MAX_WINDOW_CONCURRENCY, "WINDOW_CONCURRENCY_INVALID")
     if concurrency == 1:
-        results = [run_extraction_window(ctx, window, window_config, call_json) for window in windows]
+        results = []
+        for window in windows:
+            predecessor = results[-1] if results else None
+            results.append(run_extraction_window(ctx, window, window_config, call_json, predecessor_result=predecessor))
     else:
         _fail(not callable(getattr(ctx, "run_parallel_units", None)), "WINDOW_CONCURRENCY_UNSUPPORTED")
         results = ctx.run_parallel_units([(window["window_id"],
-            lambda child, window=window: run_extraction_window(child, window, window_config, call_json))
-            for window in windows], concurrency)
+            lambda child, window=window, predecessor=predecessor: run_extraction_window(
+                child, window, window_config, call_json, predecessor_result=_parallel_contract_predecessor(child, window, predecessor)))
+            for window, predecessor in zip(windows, [None, *windows[:-1]], strict=True)], concurrency)
 
     try:
         deferred_closure = _close_deferred_context(windows, results)
@@ -2885,6 +2982,7 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
     output = {"schema_version": "1.0", "producer_version": EXTRACTION_VERSION,
               "parsed_hash": _hash(parsed), "window_config": window_config,
               "source_hashes": {d["source_id"]: d["sha256"] for d in documents},
+              CONTRACT_CLAUSE_INDEX_OUTPUT_KEY: indexes,
               "requirements": requirements, "format_chapters": formats, "window_results": results,
               "deferred_context_closure": deferred_closure,
               "coverage": {"status": "complete", "semantic_review": "requires_source_review", "tender_unit_count": len(ledger),
@@ -3084,6 +3182,10 @@ def _merge_results(results: list) -> tuple[list, list]:
         acceptance = result.get(CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY)
         if acceptance is not None:
             verify_contract_insurance_acceptance_predecessor(results[result_index - 1] if result_index else {}, acceptance["proof"])
+        boundary = result.get(CONTRACT_CLAUSE_RESOLUTION_KEY)
+        if boundary is not None:
+            _fail(not verify_contract_clause_predecessor(results[result_index - 1] if result_index else None, boundary),
+                  "EXTRACTION_CONTRACT_CLAUSE_PREDECESSOR_MISMATCH")
         resolution = result.get(PRICE_SCORING_CONFIG_KEY)
         review_table = result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY)
         letter = result.get(RESPONSE_LETTER_CONFIG_KEY)
@@ -3093,6 +3195,8 @@ def _merge_results(results: list) -> tuple[list, list]:
         candidates = data["requirements"] if resolution is None else [*data["requirements"], resolution["requirement"]]
         if acceptance is not None:
             candidates = [*candidates, acceptance["requirement"]]
+        if boundary is not None:
+            candidates = [*candidates, *(item["requirement"] for item in boundary["items"] if "requirement" in item)]
         annex_owner = annex_owners.get(result["window_id"])
         acceptance_owner = acceptance_successors.get(result["window_id"])
         for candidate in candidates:
