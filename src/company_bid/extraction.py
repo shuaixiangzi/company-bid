@@ -19,6 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from .contract_annex_sources import (
     CONTRACT_ANNEX_SOURCE_CONFIG_KEY, build_contract_annex_proof, contract_annex_pages, normalize_contract_annex_config,
 )
+from .contract_acceptance_sources import (
+    CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, SOURCE_ERROR as CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_ERROR,
+    build_contract_insurance_acceptance_proof, normalize_contract_insurance_acceptance_config,
+)
 from .contract_interested_parties_sources import (
     CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, build_contract_interested_parties_proof,
     normalize_contract_interested_parties_config,
@@ -382,7 +386,8 @@ def _model_window(window: dict) -> dict:
                           if key not in {PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY,
                                          RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
                                          RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
-                                         CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY}})
+                                         CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
+                                         CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -587,6 +592,12 @@ def extraction_window_config(config: dict) -> dict:
                 config[CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_contract_insurance_acceptance_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -750,6 +761,8 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_contract_annex_source(windows, documents, blocks, footer_skips, config[CONTRACT_ANNEX_SOURCE_CONFIG_KEY])
     if CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY in config:
         _bind_contract_interested_parties_source(windows, documents, blocks, config[CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY])
+    if CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY in config:
+        _bind_contract_insurance_acceptance_source(windows, documents, blocks, config[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY])
     return windows, ledger
 
 
@@ -953,6 +966,40 @@ def _bind_contract_interested_parties_source(windows, documents, blocks, config)
           "CONTRACT_INTERESTED_PARTIES_SOURCE_PROOF_MISMATCH")
     window[CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY] = {"config": copy.deepcopy(config), "lines": lines}
     _contract_interested_parties_proof(window)
+
+
+def _bind_contract_insurance_acceptance_source(windows, documents, blocks, config):
+    error = "CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_WINDOW_SCOPE_MISMATCH"
+    index = next((i for i, window in enumerate(windows) if window["window_id"] == config["window_id"]), 0)
+    _fail(not 0 < index < len(windows) - 1, error)
+    prior, window, following = windows[index - 1:index + 2]
+    insurance, acceptance = (config[field + "_block_ids"] for field in ("insurance", "acceptance"))
+    previous_targets = [line["block_id"] for line in prior["blocks"]]
+    following_targets = [line["block_id"] for line in following["blocks"]]
+    _fail(prior["window_id"] != config["predecessor_window_id"] or following["window_id"] != config["successor_window_id"] or
+          any(owner.get("source_format") != "pdf" or any(owner.get(key) != config[key] for key in ("source_id", "source_sha256"))
+              for owner in (prior, window, following)) or previous_targets[-2:] != insurance[:2] or
+          following_targets[:len(acceptance) - 2] != acceptance[2:] or
+          not set(insurance[2:4]) <= {line["block_id"] for line in prior.get("adjacent_context", [])} or
+          acceptance[1] not in {line["block_id"] for line in following.get("adjacent_context", [])} or
+          any(key in window for key in (PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY,
+              RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY, RESPONSE_CELL_REFLOW_CONFIG_KEY,
+              ILLUSTRATION_SOURCE_CONFIG_KEY, CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY)),
+          error)
+    context = {"config": copy.deepcopy(config)}
+    source_error = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_ERROR
+    for field, ids in (("insurance", insurance), ("acceptance", acceptance)):
+        lines = [blocks.get(identity) for identity in ids]
+        _fail(any(line is None for line in lines), source_error)
+        coverage = [unit["coverage"] for document in documents if document["source_id"] == config["source_id"]
+                    for unit in document["units"] if unit.get("page") == config[field + "_page"] and
+                    unit["unit_id"] == lines[0]["unit_id"]]
+        _fail(len(coverage) != 1 or coverage[0].get("origin") != "native" or coverage[0].get("status") != "read" or
+              any(coverage[0].get(key) for key in ("ignored_objects", "unread_objects", "unmapped_glyphs", "transformations",
+                                                  "error_code", "table_count", "image_count")), source_error)
+        context[field] = lines
+    window[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY] = context
+    _contract_insurance_acceptance_proof(window)
 
 
 _CONSTRAINT = re.compile(r"应当|必须|不得|须|应|不超过|不少于|不低于|不高于|限价|最高|最低|工作日|日历天|\d+(?:\.\d+)?\s*(?:万元|元|天|日|月|年|%)")
@@ -1522,6 +1569,8 @@ def _window_source_catalogs(window: dict):
     """Rebuild source evidence before paying for inference and when consuming it."""
     if CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY in window:
         _contract_interested_parties_proof(window)
+    if CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY in window:
+        _contract_insurance_acceptance_proof(window)
     targets = {b["block_id"]: b for b in window["blocks"]}
     available = {b["block_id"]: b for b in [*window["blocks"], *window.get("adjacent_context", [])]}
     safe_skips = {row["block_id"]: row for row in window.get("safe_skip_blocks", [])}
@@ -2260,6 +2309,80 @@ def verify_contract_interested_parties_predecessor(predecessor_result: dict, pro
           citation.get("locator") != prior["start_locator"] or citation.get("end_locator") != prior["end_locator"], error)
 
 
+def _contract_insurance_acceptance_proof(window):
+    error = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_ERROR
+    context = window[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY]
+    _fail(not isinstance(context, dict) or set(context) != {"config", "insurance", "acceptance"}, error)
+    try:
+        config = normalize_contract_insurance_acceptance_config(context["config"])
+        insurance, acceptance = context["insurance"], context["acceptance"]
+        proof = build_contract_insurance_acceptance_proof(config, insurance, acceptance)
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise PlanningError(error) from None
+
+    def visible(lines):
+        return [{key: value for key, value in line.items() if key not in {"bbox", "image_ref"}} for line in lines]
+
+    adjacent = window.get("adjacent_context", [])
+    reported = next(line for line in acceptance[2:-1] if line["block_id"] == config["adjacent_unresolved_block_id"])
+    _fail(window.get("source_format") != "pdf" or any(window.get(key) != config[key] for key in ("source_id", "source_sha256", "window_id")) or
+          window["blocks"][:3] != visible(insurance[2:]) or window["blocks"][-2:] != visible(acceptance[:2]) or
+          any(line not in adjacent for line in visible([*insurance[:2], reported])) or
+          proof["proof_sha256"] != config["source_proof_sha256"], error)
+    return config, proof
+
+
+def _verified_contract_insurance_acceptance_resolution(raw: dict, window: dict) -> dict | None:
+    key = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
+    if key not in window:
+        return None
+    config, proof = _contract_insurance_acceptance_proof(window)
+    resolved = [*config["insurance_block_ids"][2:4], config["acceptance_block_ids"][1]]
+    _fail(not isinstance(raw, dict) or _hash(raw) != config["raw_candidate_sha256"] or
+          raw.get("unresolved_block_ids") != [*resolved, config["adjacent_unresolved_block_id"]] or
+          not isinstance(raw.get("requirements"), list) or len(raw["requirements"]) != 9 or
+          raw.get("format_chapters") != [] or raw.get("format_status") != "none_verified",
+          "CONTRACT_INSURANCE_ACCEPTANCE_RAW_RESPONSE_MISMATCH")
+    original_window = {field: value for field, value in window.items() if field != key}
+    historical_error = "CONTRACT_INSURANCE_ACCEPTANCE_HISTORICAL_FAILURE_MISMATCH"
+    expected = {"error_code": "LIVE_REQUIRED_BLOCK_UNRESOLVED",
+                "diagnostic_context": {"field": "unresolved_block_ids", "block_ids": resolved}}
+    try:
+        validate_live_window(raw, original_window)
+    except PlanningError as exc:
+        original_error = {"error_code": exc.code, "diagnostic_context": exc.diagnostic_context}
+        _fail(original_error != expected, historical_error)
+    else:
+        raise PlanningError(historical_error)
+    body_ids = proof["acceptance"]["block_ids"]
+    body = {line["block_id"]: line for line in window[key]["acceptance"][1:-1]}
+    selector = {field: body[body_ids[0]][field] for field in ("source_id", "block_id", "locator")}
+    requirement = _validate_response_schema({"citation": {**selector, "block_ids": body_ids}, "category": "commercial",
+        "response_mode": "procedure", "mandatory": True, "confidence": "high", "format_status": "not_prescribed"}, _Requirement)
+    requirement["citation"] = {**_citation(requirement["citation"], body), "label_grounding": []}
+    _fail(requirement["citation"]["quote_sha256"] != proof["acceptance"]["quote_sha256"], CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_ERROR)
+    return {"proof": proof, "raw_candidate_sha256": config["raw_candidate_sha256"], "resolved_block_ids": resolved,
+            "original_error": original_error, "requirement": requirement}
+
+
+def verify_contract_insurance_acceptance_predecessor(predecessor_result: dict, proof: dict) -> None:
+    """Require the prior successful quote to cover both insurance sentences in full."""
+    error = "CONTRACT_INSURANCE_ACCEPTANCE_PREDECESSOR_MISMATCH"
+    prior = proof["predecessor"]
+    _fail(predecessor_result.get("window_id") != prior["window_id"] or predecessor_result.get("status") != "complete", error)
+    matches = [requirement for requirement in predecessor_result.get("validated", {}).get("requirements", [])
+               if requirement.get("citation", {}).get("block_ids") == prior["block_ids"]]
+    _fail(len(matches) != 1, error)
+    requirement = matches[0]
+    citation = requirement["citation"]
+    _fail(_hash(requirement) != prior["requirement_sha256"] or requirement.get("category") != "commercial" or
+          requirement.get("response_mode") != "procedure" or requirement.get("mandatory") is not True or
+          citation.get("source_id") != proof["source_id"] or citation.get("quote_sha256") != prior["quote_sha256"] or
+          citation.get("locator") != prior["start_locator"] or citation.get("end_locator") != prior["end_locator"] or
+          citation.get("start") != 0 or citation.get("end") != prior["quote_length"] or
+          hashlib.sha256(citation["quote"].encode()).hexdigest() != prior["quote_sha256"], error)
+
+
 def validate_live_window(raw: dict, window: dict) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2287,7 +2410,8 @@ def validate_live_window(raw: dict, window: dict) -> dict:
     _fail(resolution is not None and cover is not None, "RESPONSE_COVER_SOURCE_WINDOW_SCOPE_MISMATCH")
     annex = _verified_contract_annex_resolution(raw, window)
     continuation = _verified_contract_interested_parties_resolution(raw, window)
-    resolved = resolution or cover or annex or continuation
+    acceptance = _verified_contract_insurance_acceptance_resolution(raw, window)
+    resolved = resolution or cover or annex or continuation or acceptance
     if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
@@ -2331,6 +2455,13 @@ def validate_live_window(raw: dict, window: dict) -> dict:
         _fail(any(ids.intersection(citation["block_ids"]) for citation in citations) or
               not any(citation["block_id"] == proof["following_block_id"] for citation in citations),
               "CONTRACT_INTERESTED_PARTIES_REQUIREMENT_BOUNDARY_MISMATCH")
+    if acceptance is not None:
+        proof = acceptance["proof"]
+        reviewed = set(proof["predecessor"]["block_ids"]) | set(proof["acceptance"]["block_ids"])
+        citations = [requirement["citation"] for requirement in validated["requirements"]]
+        _fail(any(reviewed.intersection(citation["block_ids"]) for citation in citations) or
+              not any(citation["block_id"] == proof["predecessor"]["members"][-1]["block_id"] for citation in citations),
+              "CONTRACT_INSURANCE_ACCEPTANCE_REQUIREMENT_BOUNDARY_MISMATCH")
     return validated
 
 
@@ -2389,6 +2520,10 @@ def _validate_normalized_window_result(result: dict, window: dict) -> dict:
     _fail((CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY in result) != (continuation is not None) or
           result.get(CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY) != continuation,
           "EXTRACTION_CONTRACT_INTERESTED_PARTIES_RESOLUTION_MISMATCH")
+    acceptance = _verified_contract_insurance_acceptance_resolution(raw, window)
+    key = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
+    _fail((key in result) != (acceptance is not None) or result.get(key) != acceptance,
+          "EXTRACTION_CONTRACT_INSURANCE_ACCEPTANCE_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2486,12 +2621,23 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
             if continuation is not None:
                 proof = continuation["proof"]
                 verify_contract_interested_parties_predecessor(by_result.get(proof["predecessor"]["window_id"], {}), proof)
+            acceptance = owner_result.get(CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY)
+            if acceptance is not None:
+                proof = acceptance["proof"]
+                verify_contract_insurance_acceptance_predecessor(by_result.get(proof["predecessor"]["window_id"], {}), proof)
             resolved_sources = (("owner_target_source_proven_cover", cover), ("owner_target_source_proven_annex_reference", annex),
-                                ("owner_target_source_proven_contract_continuation", continuation))
+                                ("owner_target_source_proven_contract_continuation", continuation),
+                                ("owner_target_source_proven_contract_insurance_acceptance", acceptance))
             source_resolved = next((basis for basis, source in resolved_sources
                                     if source is not None and deferred["block_id"] in source["resolved_block_ids"]), None)
             guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
                   "DEFERRED_CONTEXT_OWNER_TARGET_UNRESOLVED", **context)
+            if acceptance := result.get(CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY):
+                proof = acceptance["proof"]
+                if deferred["block_id"] == proof["adjacent_unresolved_block_id"]:
+                    guard(owner["window_id"] != proof["acceptance"]["continuation_window_id"],
+                          "DEFERRED_CONTEXT_OWNER_SOURCE_MISMATCH", **context)
+                    source_resolved = "owner_target_processed_with_complete_preceding_acceptance_clause"
             items.append({"block_id": block["block_id"], "source_id": block["source_id"], "locator": block["locator"],
                           "source_sha256": by_window[owner["window_id"]]["source_sha256"],
                           "deferred_from_window_id": identity, "owner_window_id": owner["window_id"],
@@ -2566,7 +2712,8 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                     if key not in {_ILLUSTRATIVE_OCR_REGIONS, PRICE_SCORING_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
                                    RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
                                    RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
-                                   CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY}}
+                                   CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
+                                   CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -2680,6 +2827,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json) -> 
         if continuation is not None:
             supplement[CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY] = continuation
             _capture(ctx, "n2-contract-interested-parties-source-resolution", continuation)
+        acceptance = _verified_contract_insurance_acceptance_resolution(raw_model_candidate, window)
+        if acceptance is not None:
+            supplement[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY] = acceptance
+            _capture(ctx, "n2-contract-insurance-acceptance-source-resolution", acceptance)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2901,10 +3052,28 @@ def _same_contract_annex_scope(requirement: dict, citation: dict, annex: dict, *
     return re.sub(r"\s+", "", text) == re.sub(r"\s+", "", source["quote"])
 
 
+def _same_contract_acceptance_scope(candidate: dict, canonical: dict) -> bool:
+    """Fold an exact contained list fragment while keeping adjoining clauses independent."""
+    citation = candidate["citation"]
+    source = canonical["citations"][0]
+    ids = citation["block_ids"] or [citation["block_id"]]
+    source_ids = source["block_ids"]
+    if (citation["source_id"] != source["source_id"] or not set(ids) <= set(source_ids) or
+            citation.get("clause_id") or citation.get("table_row_id") or citation.get("skipped_block_ids") or
+            any(candidate[field] != canonical[field] for field in (
+                "category", "response_mode", "mandatory", "format_status", "format_title",
+                "required_fact_labels", "attachment_keywords", "reference_keywords"))):
+        return False
+    index = source_ids.index(ids[0])
+    return (source_ids[index:index + len(ids)] == ids and
+            citation["quote"] == "\n".join(source["quote"].split("\n")[index:index + len(ids)]))
+
+
 def _merge_results(results: list) -> tuple[list, list]:
     requirements, formats, by_key = [], [], {}
     source_covers, source_letters = {}, {}
     annex_owners = {}
+    acceptance_successors = {}
     for result_index, result in enumerate(results):
         data = result["validated"]
         local_ids = []
@@ -2912,6 +3081,9 @@ def _merge_results(results: list) -> tuple[list, list]:
             verify_illustration_predecessor(results[result_index - 1] if result_index else {}, illustration)
         if continuation := result.get(CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY):
             verify_contract_interested_parties_predecessor(results[result_index - 1] if result_index else {}, continuation["proof"])
+        acceptance = result.get(CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY)
+        if acceptance is not None:
+            verify_contract_insurance_acceptance_predecessor(results[result_index - 1] if result_index else {}, acceptance["proof"])
         resolution = result.get(PRICE_SCORING_CONFIG_KEY)
         review_table = result.get(RESPONSE_REVIEW_TABLE_CONFIG_KEY)
         letter = result.get(RESPONSE_LETTER_CONFIG_KEY)
@@ -2919,8 +3091,16 @@ def _merge_results(results: list) -> tuple[list, list]:
             _fail(_RESPONSE_REVIEW_MERGE_PROJECTION not in result, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
             data = result[_RESPONSE_REVIEW_MERGE_PROJECTION]["validated"]
         candidates = data["requirements"] if resolution is None else [*data["requirements"], resolution["requirement"]]
+        if acceptance is not None:
+            candidates = [*candidates, acceptance["requirement"]]
         annex_owner = annex_owners.get(result["window_id"])
+        acceptance_owner = acceptance_successors.get(result["window_id"])
         for candidate in candidates:
+            if acceptance_owner is not None and _same_contract_acceptance_scope(candidate, acceptance_owner):
+                if result["window_id"] not in acceptance_owner["window_ids"]:
+                    acceptance_owner["window_ids"].append(result["window_id"])
+                local_ids.append(acceptance_owner["requirement_id"])
+                continue
             semantics = {key: value for key, value in candidate.items() if key != "citation"}
             semantics["text"] = candidate["citation"]["quote"]
             key = _hash(semantics)
@@ -2939,6 +3119,8 @@ def _merge_results(results: list) -> tuple[list, list]:
             if result["window_id"] not in requirement["window_ids"]:
                 requirement["window_ids"].append(result["window_id"])
             local_ids.append(requirement["requirement_id"])
+            if acceptance is not None and candidate is acceptance["requirement"]:
+                acceptance_successors[acceptance["proof"]["acceptance"]["continuation_window_id"]] = requirement
         if annex := result.get(CONTRACT_ANNEX_SOURCE_CONFIG_KEY):
             source_requirement = annex["requirement"]
             prior = [item for item in requirements if any(

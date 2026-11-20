@@ -36,7 +36,8 @@ def _version(*names: str) -> str:
                     "extraction.py": ("extraction_illustrations.py", "extraction_replay_scope.py", "price_scoring_sources.py",
                                       "scoring_row_sources.py", "response_cover_sources.py", "response_review_table_sources.py",
                                       "response_letter_sources.py", "response_cell_reflow_sources.py", "response_authority_tail.py",
-                                      "contract_annex_sources.py", "contract_interested_parties_sources.py"),
+                                      "contract_annex_sources.py", "contract_interested_parties_sources.py",
+                                      "contract_acceptance_sources.py"),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py",),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
@@ -89,6 +90,11 @@ def build_executor(root: Path, config: dict) -> Executor:
     illustration_keys = {"illustration_source_resolution", "failed_illustration_replay"}
     annex_keys = {"contract_annex_source_resolution", "failed_contract_annex_replay"}
     interested_parties_keys = {"contract_interested_parties_source_resolution", "failed_contract_interested_parties_replay"}
+    insurance_acceptance_keys = {"contract_insurance_acceptance_source_resolution",
+                                 "failed_contract_insurance_acceptance_replay"}
+    if isinstance(extraction, dict) and insurance_acceptance_keys.intersection(extraction):
+        if not (insurance_acceptance_keys | interested_parties_keys).issubset(extraction):
+            raise PipelineFailure("FAILED_CONTRACT_INSURANCE_ACCEPTANCE_CONFIG_INVALID")
     if isinstance(extraction, dict) and interested_parties_keys.intersection(extraction):
         if not (interested_parties_keys | annex_keys).issubset(extraction):
             raise PipelineFailure("FAILED_CONTRACT_INTERESTED_PARTIES_CONFIG_INVALID")

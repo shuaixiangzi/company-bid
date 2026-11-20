@@ -5,6 +5,7 @@ import copy
 import hashlib
 import re
 
+from .contract_acceptance_sources import CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
 from .contract_annex_sources import CONTRACT_ANNEX_SOURCE_CONFIG_KEY
 from .contract_interested_parties_sources import CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY
 from .diagnostic_replay import _id, _one, _require
@@ -26,6 +27,7 @@ FAILED_RESPONSE_CELL_REFLOW_REPLAY = "failed_response_cell_reflow_replay"
 FAILED_ILLUSTRATION_REPLAY = "failed_illustration_replay"
 FAILED_CONTRACT_ANNEX_REPLAY = "failed_contract_annex_replay"
 FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY = "failed_contract_interested_parties_replay"
+FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY = "failed_contract_insurance_acceptance_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -43,6 +45,8 @@ _ILLUSTRATION_KEYS = {FAILED_ILLUSTRATION_REPLAY, ILLUSTRATION_SOURCE_CONFIG_KEY
 _CONTRACT_ANNEX_KEYS = {FAILED_CONTRACT_ANNEX_REPLAY, CONTRACT_ANNEX_SOURCE_CONFIG_KEY}
 _CONTRACT_INTERESTED_PARTIES_KEYS = {FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY,
                                    CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY}
+_CONTRACT_INSURANCE_ACCEPTANCE_KEYS = {FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY,
+                                       CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY}
 
 
 class FailedScoringReplay:
@@ -75,7 +79,8 @@ class FailedScoringReplay:
                                                  FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
                                                  *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS,
                                                  *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
-                                                 *_CONTRACT_INTERESTED_PARTIES_KEYS}}
+                                                 *_CONTRACT_INTERESTED_PARTIES_KEYS,
+                                                 *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -106,6 +111,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in annex.actual_units(replay))
         if interested_parties := getattr(replay, "_failed_contract_interested_parties", None):
             expected_bindings.update(_TASK + unit for unit in interested_parties.actual_units(replay))
+        if insurance_acceptance := getattr(replay, "_failed_contract_insurance_acceptance", None):
+            expected_bindings.update(_TASK + unit for unit in insurance_acceptance.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -274,7 +281,8 @@ class FailedScoringRowsReplay:
                                             FAILED_RESPONSE_COVER_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
                                             *_REVIEW_TABLE_KEYS, *_LETTER_KEYS, *_CELL_REFLOW_KEYS,
                                             *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
-                                            *_CONTRACT_INTERESTED_PARTIES_KEYS}}
+                                            *_CONTRACT_INTERESTED_PARTIES_KEYS,
+                                            *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -835,6 +843,10 @@ class FailedContractInterestedPartiesReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_contract_annex
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_contract_insurance_acceptance", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(len(order) == 59 and order[23] == self.predecessor.unit_id and order[25] == self.unit_id and
@@ -864,6 +876,77 @@ class FailedContractInterestedPartiesReplay(_StoppedResponseReplay):
             verify_contract_interested_parties_predecessor(data, resolution["proof"])
         except PlanningError as error:
             raise ProviderFailure("DIAGNOSTIC_REPLAY_" + self.proof_error) from error
+
+    def predecessor_windows(self):
+        return self.predecessor.enriched_windows()
+
+
+class FailedContractInsuranceAcceptanceReplay(_StoppedResponseReplay):
+    """Authenticate W27–29's actual successes and W30's first response against v89."""
+
+    replay_key = FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY
+    proof_key = CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
+    config_error = "FAILED_CONTRACT_INSURANCE_ACCEPTANCE_CONFIG_INVALID"
+    source_error = "FAILED_CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_INVALID"
+    proof_error = "FAILED_CONTRACT_INSURANCE_ACCEPTANCE_PROOF_MISMATCH"
+    cold_error = "FAILED_CONTRACT_INSURANCE_ACCEPTANCE"
+    historical_failure = _FAILURE
+    lineage_basis = "authenticated_contract_insurance_acceptance_source_resolution"
+
+    @staticmethod
+    def previous_gate(replay):
+        return replay._failed_contract_interested_parties
+
+    def actual_units(self, replay):
+        order = tuple(replay.windows)
+        _require(len(order) == 59 and order[25] == self.predecessor.unit_id and order[29] == self.unit_id and
+                 all(replay.windows[unit]["blocks"] for unit in order[26:30]), self.config_error)
+        return order[26:30]
+
+    @staticmethod
+    def verified_proof(raw, window):
+        from .extraction import _verified_contract_insurance_acceptance_resolution
+
+        return _verified_contract_insurance_acceptance_resolution(raw, window)
+
+    def check_proof_context(self, resolution, context):
+        _require(isinstance(context, dict) and context.get("field") == "unresolved_block_ids" and
+                 isinstance(context.get("block_ids"), list) and len(context["block_ids"]) == 3 and
+                 resolution.get("resolved_block_ids") == context["block_ids"] and
+                 resolution.get("original_error") ==
+                 {"error_code": self.historical_failure, "diagnostic_context": context}, self.proof_error)
+
+    def read_failure(self, replay, binding, task, full_window):
+        from .extraction import (PlanningError, _verified_contract_insurance_acceptance_resolution,
+                                 extraction_window_payload, verify_contract_insurance_acceptance_predecessor)
+
+        entry = super().read_failure(replay, binding, task, full_window)
+        preceding_unit = self.prefix[-2]
+        resolution = _verified_contract_insurance_acceptance_resolution(entry["candidate"], self.window)
+        proof = resolution["proof"]
+        _require(proof["predecessor"]["window_id"] == preceding_unit, self.proof_error)
+        preceding_binding = replay.config["bindings"][_TASK + preceding_unit]
+        preceding_window = replay.windows[preceding_unit]
+        preceding_task = {**extraction_window_payload(preceding_window, replay.window_config),
+                          "task_type": "extract_requirements"}
+        # Authenticate the predecessor's original response and output before
+        # using it as proof, even if W30 appears before W29 in the bindings.
+        preceding_entry = replay._load_entry(preceding_binding, preceding_task, preceding_window)
+        preceding_call = _one(preceding_entry["origin"]["calls"], self.source_error)
+        _, unit, _, data, _ = self.run.unit("N2", preceding_unit)
+        _require(preceding_call.get("run_id") == self.run.run_id and
+                 self.prior_checkpoint_hashes.get(preceding_unit) == unit["output_hash"], self.source_error)
+        try:
+            verify_contract_insurance_acceptance_predecessor(data, proof)
+        except PlanningError as error:
+            raise ProviderFailure("DIAGNOSTIC_REPLAY_" + self.proof_error) from error
+        entry["origin"]["calls"].append(preceding_call)
+        entry["origin"]["lineage_notes"][0]["authenticated_predecessor"] = {
+            "unit_id": preceding_unit,
+            "checkpoint_sha256": unit["output_hash"],
+            "candidate_sha256": preceding_entry["origin"]["candidate_sha256"],
+        }
+        return entry
 
     def predecessor_windows(self):
         return self.predecessor.enriched_windows()

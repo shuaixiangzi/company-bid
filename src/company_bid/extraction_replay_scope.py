@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
     CONTRACT_ANNEX_SOURCE_CONFIG_KEY, FAILED_CONTRACT_ANNEX_REPLAY, FailedContractAnnexReplay,
+    CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY,
     CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY,
     FAILED_ILLUSTRATION_REPLAY, FailedIllustrationReplay,
     FAILED_RESPONSE_CELL_REFLOW_REPLAY, FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY,
@@ -17,7 +18,8 @@ from .extraction_failed_scoring_replay import (
     FAILED_SCORING_REPLAY, FAILED_SCORING_ROWS_REPLAY, RESPONSE_COVER_SOURCE_CONFIG_KEY,
     RESPONSE_CELL_REFLOW_SOURCE_CONFIG_KEY,
     RESPONSE_LETTER_SOURCE_CONFIG_KEY, RESPONSE_REVIEW_TABLE_SOURCE_CONFIG_KEY, SCORING_ROW_SOURCE_CONFIG_KEY,
-    FailedContractInterestedPartiesReplay, FailedResponseCellReflowReplay, FailedResponseCoverReplay, FailedResponseLetterReplay,
+    FailedContractInsuranceAcceptanceReplay, FailedContractInterestedPartiesReplay,
+    FailedResponseCellReflowReplay, FailedResponseCoverReplay, FailedResponseLetterReplay,
     FailedResponseReviewTableReplay, FailedScoringReplay, FailedScoringRowsReplay,
 )
 from .extraction_illustrations import CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY
@@ -60,6 +62,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_illustration = None
     _failed_contract_annex = None
     _failed_contract_interested_parties = None
+    _failed_contract_insurance_acceptance = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -74,6 +77,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_illustration = None
         self._failed_contract_annex = None
         self._failed_contract_interested_parties = None
+        self._failed_contract_insurance_acceptance = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -118,6 +122,11 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  FailedContractInterestedPartiesReplay.config_error)
         if FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY in self._target_extraction:
             self._failed_contract_interested_parties = FailedContractInterestedPartiesReplay(self, ctx)
+        _require((CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY in self._target_extraction),
+                 FailedContractInsuranceAcceptanceReplay.config_error)
+        if FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY in self._target_extraction:
+            self._failed_contract_insurance_acceptance = FailedContractInsuranceAcceptanceReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"]):
             return super().preflight(ctx, value)
 
@@ -150,6 +159,21 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        insurance_acceptance = self._failed_contract_insurance_acceptance
+        if insurance_acceptance is None:
+            return self._read_before_contract_insurance_acceptance(binding, task, full_window)
+        insurance_acceptance.verify_history(self)
+        unit_id = binding["unit_id"]
+        if unit_id == insurance_acceptance.unit_id:
+            return insurance_acceptance.read_failure(self, binding, task, full_window)
+        if unit_id in insurance_acceptance.predecessor.prefix:
+            entry = self._read_before_contract_insurance_acceptance(binding, task, full_window)
+        else:
+            entry = super()._read_entry(binding, task, full_window)
+        insurance_acceptance.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_before_contract_insurance_acceptance(self, binding, task, full_window):
         interested_parties = self._failed_contract_interested_parties
         if interested_parties is None:
             return self._read_before_contract_interested_parties(binding, task, full_window)
@@ -306,7 +330,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_contract_interested_parties is not None:
+        if self._failed_contract_insurance_acceptance is not None:
+            self._failed_contract_insurance_acceptance.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_contract_interested_parties is not None:
             self._failed_contract_interested_parties.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_contract_annex is not None:
             self._failed_contract_annex.allow_candidate(self, ctx, task_type, unit_id)
