@@ -11,7 +11,7 @@ from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
     CONTRACT_ANNEX_SOURCE_CONFIG_KEY, FAILED_CONTRACT_ANNEX_REPLAY, FailedContractAnnexReplay,
     CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY,
-    FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
+    FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY, FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY,
     CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY,
     FAILED_ILLUSTRATION_REPLAY, FailedIllustrationReplay,
     FAILED_RESPONSE_CELL_REFLOW_REPLAY, FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY,
@@ -26,6 +26,7 @@ from .extraction_failed_scoring_replay import (
 from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
 from .extraction_illustrations import CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY
 from .extraction_numbered_clause_replay import FailedNumberedContractClauseReplay
+from .extraction_optional_fields_replay import FailedContractOptionalFieldsReplay
 from .provider import ProviderFailure
 from .storage import digest
 
@@ -77,6 +78,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_contract_interested_parties = None
     _failed_contract_insurance_acceptance = None
     _failed_numbered_contract_clause = None
+    _failed_contract_optional_fields = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -93,6 +95,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_contract_interested_parties = None
         self._failed_contract_insurance_acceptance = None
         self._failed_numbered_contract_clause = None
+        self._failed_contract_optional_fields = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -144,6 +147,8 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
             self._failed_contract_insurance_acceptance = FailedContractInsuranceAcceptanceReplay(self, ctx)
         if FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY in self._target_extraction:
             self._failed_numbered_contract_clause = FailedNumberedContractClauseReplay(self, ctx)
+        if FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY in self._target_extraction:
+            self._failed_contract_optional_fields = FailedContractOptionalFieldsReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"], self._target_extraction.get(POLICY_KEY)):
             return super().preflight(ctx, value)
 
@@ -178,6 +183,21 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        optional = self._failed_contract_optional_fields
+        if optional is None:
+            return self._read_before_contract_optional_fields(binding, task, full_window)
+        optional.verify_history(self)
+        unit_id = binding["unit_id"]
+        if unit_id == optional.unit_id:
+            return optional.read_failure(self, binding, task, full_window)
+        if unit_id in optional.predecessor.prefix:
+            entry = self._read_before_contract_optional_fields(binding, task, full_window)
+        else:
+            entry = super()._read_entry(binding, task, full_window)
+        optional.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_before_contract_optional_fields(self, binding, task, full_window):
         numbered = self._failed_numbered_contract_clause
         if numbered is None:
             return self._read_before_numbered_clause(binding, task, full_window)
@@ -364,7 +384,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_numbered_contract_clause is not None:
+        if self._failed_contract_optional_fields is not None:
+            self._failed_contract_optional_fields.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_numbered_contract_clause is not None:
             self._failed_numbered_contract_clause.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_contract_insurance_acceptance is not None:
             self._failed_contract_insurance_acceptance.allow_candidate(self, ctx, task_type, unit_id)

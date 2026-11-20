@@ -45,6 +45,12 @@ from .contract_clause_resolution import (
     WINDOW_CONTEXT_KEY as CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
     RESOLUTION_KEY as CONTRACT_CLAUSE_RESOLUTION_KEY,
     bind_contract_clause_windows, resolve_contract_clause_boundaries, verify_contract_clause_predecessor,
+    PERFORMANCE_EVIDENCE_POLICY, performance_evidence_scopes, performance_evidence_scope,
+)
+from .contract_optional_fields import (
+    RESOLUTION_KEY as CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
+    bind_optional_contract_fields, resolve_optional_contract_fields,
 )
 from .response_authority_tail import authority_tail_proof
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
@@ -394,7 +400,8 @@ def _model_window(window: dict) -> dict:
                                          RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
                                          RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
                                          CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
-                                         CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY}})
+                                         CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
+                                         CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -793,6 +800,7 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         _bind_contract_insurance_acceptance_source(windows, documents, blocks, config[CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY])
     if contract_clause_indexes:
         bind_contract_clause_windows(windows, contract_clause_indexes, blocks, footer_skips)
+        bind_optional_contract_fields(windows, documents, contract_clause_indexes, blocks)
     return windows, ledger
 
 
@@ -1771,7 +1779,8 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
     normalized = copy.deepcopy(raw)
     # The document-wide index authenticates a separate source proof. Adding it
     # does not change which raw blocks were available to the original caller.
-    selector_window = {key: value for key, value in window.items() if key != CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY}
+    selector_window = {key: value for key, value in window.items()
+                       if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
               "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
               "context_identity": copy.deepcopy(window.get("context_identity")), "selections": []}
@@ -2430,6 +2439,16 @@ def _contract_boundary_resolution(raw, window, predecessor_result, *, data=None,
     return resolve_contract_clause_boundaries(raw, data, window, critical, predecessor_result)
 
 
+def _contract_optional_fields_resolution(raw, window):
+    if not window.get(CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY):
+        return None
+    normalized, _ = _normalize_source_selectors(raw, window)
+    data = _validate_response_schema(normalized, _LiveWindowResponse)
+    processing = _window_processing_ledger(window, data["unresolved_block_ids"])
+    critical = [row["block_id"] for row in processing["blocks"] if row["status"] == "supplied" and row["self_reported_unresolved"]]
+    return resolve_optional_contract_fields(raw, data, window, critical)
+
+
 def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2458,7 +2477,8 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
     annex = _verified_contract_annex_resolution(raw, window)
     continuation = _verified_contract_interested_parties_resolution(raw, window)
     acceptance = _verified_contract_insurance_acceptance_resolution(raw, window)
-    resolved = resolution or cover or annex or continuation or acceptance or _contract_boundary_resolution(
+    optional_fields = resolve_optional_contract_fields(raw, data, window, critical)
+    resolved = resolution or cover or annex or continuation or acceptance or optional_fields or _contract_boundary_resolution(
         raw, window, predecessor_result, data=data, critical=critical)
     if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
@@ -2576,6 +2596,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_CLAUSE_RESOLUTION_KEY
     _fail((key in result) != (boundary is not None) or result.get(key) != boundary,
           "EXTRACTION_CONTRACT_CLAUSE_RESOLUTION_MISMATCH")
+    optional_fields = _contract_optional_fields_resolution(raw, window)
+    key = CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY
+    _fail((key in result) != (optional_fields is not None) or result.get(key) != optional_fields,
+          "EXTRACTION_CONTRACT_OPTIONAL_FIELDS_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2682,7 +2706,9 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
             resolved_sources = (("owner_target_source_proven_cover", cover), ("owner_target_source_proven_annex_reference", annex),
                                 ("owner_target_source_proven_contract_continuation", continuation),
                                 ("owner_target_source_proven_contract_insurance_acceptance", acceptance),
-                                ("owner_target_source_proven_numbered_contract_clause", owner_result.get(CONTRACT_CLAUSE_RESOLUTION_KEY)))
+                                ("owner_target_source_proven_numbered_contract_clause", owner_result.get(CONTRACT_CLAUSE_RESOLUTION_KEY)),
+                                ("owner_target_source_proven_slash_marked_contract_inventory",
+                                 owner_result.get(CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY)))
             source_resolved = next((basis for basis, source in resolved_sources
                                     if source is not None and deferred["block_id"] in source["resolved_block_ids"]), None)
             guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
@@ -2894,6 +2920,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if boundary is not None:
             supplement[CONTRACT_CLAUSE_RESOLUTION_KEY] = boundary
             _capture(ctx, "n2-contract-clause-source-resolution", boundary)
+        optional_fields = _contract_optional_fields_resolution(raw_model_candidate, window)
+        if optional_fields is not None:
+            supplement[CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY] = optional_fields
+            _capture(ctx, "n2-contract-optional-field-source-resolution", optional_fields)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -2981,7 +3011,7 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
                  "status": "not_closed", "semantic_review": "requires_source_review"})
         raise
     merge_results, source_repairs = _repair_numbered_procedure_spans(windows, results)
-    requirements, formats = _merge_results(merge_results)
+    requirements, formats = _merge_results(merge_results, contract_indexes=indexes)
     for row in ledger:
         row["window_ids"] = [w["window_id"] for w in windows if row["unit_id"] in w["unit_ids"]]
         _fail(not row["window_ids"], "WINDOW_UNIT_DENOMINATOR_MISMATCH")
@@ -2989,7 +3019,7 @@ def extract_requirements(ctx, parsed: dict, manifest: dict, call_json, config: d
     output = {"schema_version": "1.0", "producer_version": EXTRACTION_VERSION,
               "parsed_hash": _hash(parsed), "window_config": window_config,
               "source_hashes": {d["source_id"]: d["sha256"] for d in documents},
-              CONTRACT_CLAUSE_INDEX_OUTPUT_KEY: indexes,
+              CONTRACT_CLAUSE_INDEX_OUTPUT_KEY: indexes, "contract_evidence_routing": PERFORMANCE_EVIDENCE_POLICY,
               "requirements": requirements, "format_chapters": formats, "window_results": results,
               "deferred_context_closure": deferred_closure,
               "coverage": {"status": "complete", "semantic_review": "requires_source_review", "tender_unit_count": len(ledger),
@@ -3174,7 +3204,8 @@ def _same_contract_acceptance_scope(candidate: dict, canonical: dict) -> bool:
             citation["quote"] == "\n".join(source["quote"].split("\n")[index:index + len(ids)]))
 
 
-def _merge_results(results: list) -> tuple[list, list]:
+def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
+    evidence_scopes = performance_evidence_scopes(contract_indexes)
     requirements, formats, by_key = [], [], {}
     source_covers, source_letters = {}, {}
     annex_owners = {}
@@ -3214,6 +3245,10 @@ def _merge_results(results: list) -> tuple[list, list]:
                 continue
             semantics = {key: value for key, value in candidate.items() if key != "citation"}
             semantics["text"] = candidate["citation"]["quote"]
+            if scope := performance_evidence_scope(candidate, evidence_scopes):
+                # Keep the model's original keyword in the window and its citation.
+                # Material matching receives only what the tender asks to submit.
+                semantics.update(attachment_keywords=[], contract_evidence_scope=scope)
             key = _hash(semantics)
             requirement = by_key.get(key)
             if annex_owner is not None and _same_contract_annex_scope(candidate, candidate["citation"], annex_owner[0], owner=True):

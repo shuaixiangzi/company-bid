@@ -29,6 +29,7 @@ FAILED_CONTRACT_ANNEX_REPLAY = "failed_contract_annex_replay"
 FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY = "failed_contract_interested_parties_replay"
 FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY = "failed_contract_insurance_acceptance_replay"
 FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY = "failed_numbered_contract_clause_replay"
+FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY = "failed_contract_optional_fields_replay"
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -82,7 +83,8 @@ class FailedScoringReplay:
                                                  *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
                                                  *_CONTRACT_INTERESTED_PARTIES_KEYS,
                                                  *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
-                                                 FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY}}
+                                                 FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
+                                                 FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -117,6 +119,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in insurance_acceptance.actual_units(replay))
         if numbered_clause := getattr(replay, "_failed_numbered_contract_clause", None):
             expected_bindings.update(_TASK + unit for unit in numbered_clause.actual_units(replay))
+        if optional_fields := getattr(replay, "_failed_contract_optional_fields", None):
+            expected_bindings.update(_TASK + unit for unit in optional_fields.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -287,7 +291,8 @@ class FailedScoringRowsReplay:
                                             *_ILLUSTRATION_KEYS, *_CONTRACT_ANNEX_KEYS,
                                             *_CONTRACT_INTERESTED_PARTIES_KEYS,
                                             *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
-                                            FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY}}
+                                            FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
+                                            FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -974,7 +979,7 @@ class FailedContractInsuranceAcceptanceReplay(_StoppedResponseReplay):
         return self.predecessor.enriched_windows()
 
 
-def _verify_replayed_checkpoint(gate, replay, unit_id, entry, window, invalid):
+def _verify_replayed_checkpoint(gate, replay, unit_id, entry, window, invalid, *, predecessor_result=None):
     from .extraction import _validate_normalized_window_result
 
     run = gate.run
@@ -986,7 +991,10 @@ def _verify_replayed_checkpoint(gate, replay, unit_id, entry, window, invalid):
              digest(data.get("raw_model_candidate")) == origin["candidate_sha256"] and data.get("status") == "complete" and
              data.get("window_id") == unit_id and
              digest({**payload, "task_type": "extract_requirements"}) == origin["base_request_sha256"], invalid)
-    _validate_normalized_window_result(data, window)
+    if predecessor_result is None:
+        _validate_normalized_window_result(data, window)
+    else:
+        _validate_normalized_window_result(data, window, predecessor_result=predecessor_result)
     captures = run.captures(node, unit_id, attempt)
     _require(not any(record["name"].startswith(("request-", "validation-repair-")) for record in captures), invalid)
     staged = run.capture(captures, "diagnostic-replay-candidate")
@@ -1064,10 +1072,11 @@ def _allow_cold_candidate(gate, replay, ctx, task_type, unit_id, enriched_window
             if verify_cold_identity:
                 _require(checkpoint.get("status") == "complete" and checkpoint.get("window_id") == unit, required)
             window = enriched_windows.get(unit, replay.windows[unit])
-            if terminal_result_hash is not None and unit == gate.unit_id:
-                _require(digest(checkpoint) == terminal_result_hash, required)
-                _validate_normalized_window_result(checkpoint, window, predecessor_result=preceding_checkpoint)
-            else:
+            if terminal_result_hash is None:
                 _validate_normalized_window_result(checkpoint, window)
+            else:
+                if unit == gate.unit_id:
+                    _require(digest(checkpoint) == terminal_result_hash, required)
+                _validate_normalized_window_result(checkpoint, window, predecessor_result=preceding_checkpoint)
             preceding_checkpoint = checkpoint
         gate.checkpoints_verified = True

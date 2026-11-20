@@ -520,6 +520,10 @@ def _proof_request(requirement: dict) -> dict:
         return result
     search_text = positive_text
     broad_heading = heading in {"资质材料", "公司资质材料", "企业资质材料", "人员要求材料", "人员材料", "项目人员资料"}
+    if (requirement.get("contract_evidence_scope", {}).get("stage") == "contract_performance"
+            and requirement.get("response_mode") == "procedure"):
+        result["rule"] = "contract_performance_evidence_for_counterparty"
+        return result
     if not broad_heading and requirement.get("response_mode") not in {"attachment", "factual_response", "table"}:
         result["rule"] = "unsupported_response_mode_for_proof_search"
         return result

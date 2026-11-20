@@ -173,3 +173,53 @@ def test_parallel_recovery_waits_for_actual_preceding_checkpoint(tmp_path):
     result = executor.output(run_id)
     assert result["coverage"]["completed_window_count"] == 3
     assert result["window_results"][1][RESOLUTION_KEY]["resolved_block_ids"] == ["P3", "N1", "N2"]
+
+
+def test_performance_evidence_keeps_both_origins_and_stays_out_of_bid_materials(tmp_path):
+    from company_bid.material_matching import material_candidate_report
+    from company_bid.material_recall import plan_recall_scope
+
+    manifest, parsed, config = _scenario(tmp_path, 4)
+    def select(_ctx, _task, _unit, payload, validate):
+        answer = _answer(payload["window"])
+        for candidate in answer["requirements"]:
+            if candidate["citation"]["block_ids"] == ["N1", "N2", "N3", "N4"]:
+                candidate["attachment_keywords"] = ["故障报告"]
+        return validate(answer)
+
+    output = extract_requirements(Context(), parsed, manifest, select, config)
+    first, opening, closing = output["window_results"]
+    scoped, = [row for row in output["requirements"] if "contract_evidence_scope" in row]
+    assert scoped["window_ids"] == [opening["window_id"], closing["window_id"]]
+    assert scoped["attachment_keywords"] == [] and scoped["contract_evidence_scope"]["document"] == "故障报告"
+    assert closing["raw_model_candidate"]["requirements"][0]["attachment_keywords"] == ["故障报告"]
+    assert len(scoped["citations"]) == 2 and scoped["citations"][1]["label_grounding"][0]["label"] == "故障报告"
+    report = material_candidate_report([scoped], [], attachments=[])
+    query, = report["proof_queries"]
+    assert query["request"]["rule"] == "contract_performance_evidence_for_counterparty"
+    assert query["status"] == "not_searched" and report["assembly_candidates"] == []
+    assert plan_recall_scope([scoped], report, {})["queries"][0]["admission_route"] == "outside_material_recall_scope"
+    prepared = plan_bid(Context(), output, parsed, manifest, no_call, {})
+    assert prepared["requirements"] and not any(scoped["requirement_id"] in a["requirement_refs"] for a in prepared["attachments"])
+
+    tampered = copy.deepcopy(output)
+    next(row for row in tampered["requirements"] if "contract_evidence_scope" in row)["attachment_keywords"] = ["故障报告"]
+    with pytest.raises(PlanningError, match="EXTRACTION_MERGE_MISMATCH"):
+        plan_bid(Context(), tampered, parsed, manifest, no_call, {})
+
+
+def test_performance_stage_requires_exact_contract_scope_and_matching_document(tmp_path):
+    from company_bid.contract_clause_resolution import performance_evidence_scopes, performance_evidence_scope
+
+    manifest, parsed, config = _scenario(tmp_path, 4)
+    output = extract_requirements(Context(), parsed, manifest, _call(), config)
+    scopes = performance_evidence_scopes(output[INDEX_OUTPUT_KEY])
+    candidate = output["window_results"][-1]["validated"]["requirements"][0]
+    assert performance_evidence_scope(candidate, scopes)
+    for changed in ({"response_mode": "attachment"}, {"category": "qualification"},
+                    {"attachment_keywords": ["设备交接记录"]},
+                    {"citation": {**candidate["citation"], "source_id": "another-source"}}):
+        assert performance_evidence_scope({**candidate, **changed}, scopes) is None
+    manifest, parsed, config = _scenario(tmp_path, 4, optional_notice=True)
+    blocks, _, docs = _index(parsed, manifest)
+    assert not performance_evidence_scopes(build_contract_clause_indexes(docs, blocks))

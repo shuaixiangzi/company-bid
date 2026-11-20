@@ -90,6 +90,44 @@ def _contract_administration_basis(clause):
     return "contract_performance_notice_evidence_and_consequence_v1"
 
 
+PERFORMANCE_EVIDENCE_POLICY = "indexed_performance_evidence_v1"
+
+
+def performance_evidence_scopes(indexes):
+    """Identify what must be furnished to the counterparty under a complete contract clause."""
+    scopes = {}
+    for index in indexes:
+        for clause in index["entries"]:
+            if not clause["complete"] or any(span["kind"] != "paragraph" for span in clause["spans"]):
+                continue
+            basis = _contract_administration_basis(clause)
+            if not basis:
+                continue
+            text = "".join(clause["quote"].split())
+            notice = _TIMED_NOTICE.search(text)
+            evidence = _TIMED_EVIDENCE.search(text, notice.end())
+            document = re.split(r"提供|提交|送交", evidence.group())[-1]
+            key = (clause["source_id"], tuple(clause["block_ids"]), clause["quote_sha256"])
+            scopes[key] = {"stage": "contract_performance", "basis": basis, "document": document,
+                           "clause_id": clause["clause_id"], "clause_proof_sha256": clause["proof_sha256"],
+                           "index_sha256": index["index_sha256"]}
+    return scopes
+
+
+def performance_evidence_scope(candidate, scopes):
+    if (not scopes or candidate["category"] != "commercial" or candidate["response_mode"] != "procedure"
+            or candidate["format_status"] != "not_prescribed" or candidate["required_fact_labels"]
+            or candidate["reference_keywords"]):
+        return None
+    citation = candidate["citation"]
+    key = (citation["source_id"], tuple(citation.get("block_ids") or [citation["block_id"]]),
+           citation.get("quote_sha256"))
+    scope = scopes.get(key)
+    if scope and all("".join(label.split()) in scope["document"] for label in candidate["attachment_keywords"]):
+        return scope
+    return None
+
+
 def _exact_clause_citation(entry, window):
     # Import locally to reuse the ordinary contiguous source-selection guard.
     from .extraction import PlanningError, _citation

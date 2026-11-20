@@ -38,8 +38,9 @@ def _version(*names: str) -> str:
                                       "response_letter_sources.py", "response_cell_reflow_sources.py", "response_authority_tail.py",
                                       "contract_annex_sources.py", "contract_interested_parties_sources.py",
                                       "contract_acceptance_sources.py", "contract_clause_index.py",
-                                      "contract_clause_resolution.py", "contract_clause_packing.py"),
-                    "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py", "extraction_numbered_clause_replay.py"),
+                                      "contract_clause_resolution.py", "contract_clause_packing.py", "contract_optional_fields.py"),
+                    "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py", "extraction_numbered_clause_replay.py",
+                                                   "extraction_optional_fields_replay.py"),
                     "source_format.py": ("source_format_scope.py",),
                     "source_response_audit.py": ("extraction.py", "table_continuations.py"),
                     "planning.py": ("plan_component_controls.py", "project_constraint_runtime.py", "format_continuation_sources.py", "contract_pending_plan.py", "contract_review_slots.py", "writing_plan.py", "response_organization.py", "project_identity.py", "commitment_planning.py", "reviewed_source_actions.py", "material_recall.py"),
@@ -83,7 +84,7 @@ def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
     extraction = config.get("extraction")
     from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
-    from .extraction_failed_scoring_replay import FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY
+    from .extraction_failed_scoring_replay import FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY
 
     structured = config.get("structured_provider", config.get("provider", {}))
     if (config.get("pipeline") == "automatic" and isinstance(structured, dict)
@@ -102,6 +103,9 @@ def build_executor(root: Path, config: dict) -> Executor:
     interested_parties_keys = {"contract_interested_parties_source_resolution", "failed_contract_interested_parties_replay"}
     insurance_acceptance_keys = {"contract_insurance_acceptance_source_resolution",
                                  "failed_contract_insurance_acceptance_replay"}
+    if isinstance(extraction, dict) and FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY in extraction:
+        if FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY not in extraction:
+            raise PipelineFailure("FAILED_CONTRACT_OPTIONAL_FIELDS_CONFIG_INVALID")
     if isinstance(extraction, dict) and FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY in extraction:
         if not insurance_acceptance_keys.issubset(extraction):
             raise PipelineFailure("FAILED_NUMBERED_CONTRACT_CLAUSE_CONFIG_INVALID")

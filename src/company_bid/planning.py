@@ -1343,7 +1343,11 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
           "EXTRACTION_DEFERRED_CLOSURE_MISMATCH")
     merge_results, source_repairs = _repair_numbered_procedure_spans(windows, verified_results)
     _fail(extracted.get("source_clause_repairs", []) != source_repairs, "EXTRACTION_SOURCE_CLAUSE_REPAIRS_MISMATCH")
-    expected_requirements, expected_formats = _merge_results(merge_results)
+    from .contract_clause_resolution import PERFORMANCE_EVIDENCE_POLICY
+    routing = extracted.get("contract_evidence_routing")
+    _fail(routing is not None and (routing != PERFORMANCE_EVIDENCE_POLICY or indexes is None),
+          "EXTRACTION_CONTRACT_EVIDENCE_ROUTING_MISMATCH")
+    expected_requirements, expected_formats = _merge_results(merge_results, contract_indexes=indexes if routing else ())
     _fail(expected_requirements != extracted.get("requirements") or expected_formats != extracted.get("format_chapters"),
           "EXTRACTION_MERGE_MISMATCH")
     uses = {block["block_id"]: block["illustration_source_use"] for window in windows for block in window["blocks"]

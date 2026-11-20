@@ -34,6 +34,10 @@ class FailedNumberedContractClauseReplay(_StoppedResponseReplay):
     def previous_gate(replay):
         return replay._failed_contract_insurance_acceptance
 
+    @staticmethod
+    def successor_gate(replay):
+        return getattr(replay, "_failed_contract_optional_fields", None)
+
     def actual_units(self, replay):
         order = tuple(replay.windows)
         _require(self.predecessor.unit_id in replay.windows and self.unit_id in replay.windows, self.config_error)
@@ -97,22 +101,8 @@ class FailedNumberedContractClauseReplay(_StoppedResponseReplay):
         return entry
 
     def rebuild_window(self, replay, full_window):
-        from .extraction import (
-            _index, _windows, build_contract_clause_indexes, extraction_window_config, extraction_window_payload,
-        )
-
-        value = replay.current
-        blocks, _, documents = _index(value["parsed"], value["manifest"])
-        window_config = extraction_window_config(replay._target_extraction)
-        indexes = build_contract_clause_indexes(documents, blocks)
-        windows, _ = _windows(documents, blocks, window_config, manifest=value["manifest"],
-                              contract_clause_indexes=indexes)
-        _require(tuple(window["window_id"] for window in windows) == tuple(replay.windows), self.proof_error)
-        for window in windows:
-            key = _TASK + window["window_id"]
-            task = {**extraction_window_payload(window, window_config), "task_type": "extract_requirements"}
-            _require(digest(task) == replay.current_requests[key], "REQUEST_MISMATCH")
-        target = _one(window for window in windows if window["window_id"] == self.unit_id)
+        windows, window_config = rebuild_frozen_contract_windows(replay, self.proof_error)
+        target = windows[self.unit_id]
         _require(target.get(WINDOW_CONTEXT_KEY) and
                  digest({key: value for key, value in target.items() if key != WINDOW_CONTEXT_KEY}) ==
                  digest(full_window), self.proof_error)
@@ -125,3 +115,22 @@ class FailedNumberedContractClauseReplay(_StoppedResponseReplay):
         _allow_cold_candidate(self, replay, ctx, task_type, unit_id, self.enriched_windows(), self.cold_error,
                               self.prior_checkpoint_hashes, verify_cold_identity=True,
                               terminal_result_hash=self.offline_proof["result_sha256"])
+
+
+def rebuild_frozen_contract_windows(replay, invalid):
+    from .extraction import (
+        _index, _windows, build_contract_clause_indexes, extraction_window_config, extraction_window_payload,
+    )
+
+    value = replay.current
+    blocks, _, documents = _index(value["parsed"], value["manifest"])
+    window_config = extraction_window_config(replay._target_extraction)
+    indexes = build_contract_clause_indexes(documents, blocks)
+    windows, _ = _windows(documents, blocks, window_config, manifest=value["manifest"],
+                          contract_clause_indexes=indexes)
+    _require(tuple(window["window_id"] for window in windows) == tuple(replay.windows), invalid)
+    for window in windows:
+        key = _TASK + window["window_id"]
+        task = {**extraction_window_payload(window, window_config), "task_type": "extract_requirements"}
+        _require(digest(task) == replay.current_requests[key], "REQUEST_MISMATCH")
+    return {window["window_id"]: window for window in windows}, window_config
