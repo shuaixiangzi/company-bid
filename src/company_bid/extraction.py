@@ -32,6 +32,13 @@ from .contract_annex_list import (
     SOURCE_ERROR as CONTRACT_ANNEX_LIST_SOURCE_ERROR,
     bind_contract_annex_list, normalize_contract_annex_list_config, resolve_contract_annex_list,
 )
+from .contract_operative_line import (
+    RESOLUTION_KEY as CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY,
+    SOURCE_CONFIG_KEY as CONTRACT_OPERATIVE_LINE_CONFIG_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
+    SOURCE_ERROR as CONTRACT_OPERATIVE_LINE_SOURCE_ERROR,
+    bind_contract_operative_line, normalize_contract_operative_line_config, resolve_contract_operative_line,
+)
 from .contract_attachment_citation_split import (
     RESOLUTION_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY,
     SOURCE_CONFIG_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY,
@@ -435,7 +442,7 @@ def _model_window(window: dict) -> dict:
                                          CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
                                          CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                          CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
-                                         CONTRACT_ANNEX_LIST_CONTEXT_KEY,
+                                         CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
                                          NATIVE_REVIEWED_LABEL_WRAP_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
@@ -674,6 +681,12 @@ def extraction_window_config(config: dict) -> dict:
             frozen[key] = normalize_contract_annex_list_config(config[key])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_OPERATIVE_LINE_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_contract_operative_line_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     key = NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY
     if key in config:
         try:
@@ -893,6 +906,13 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
             review = config[CONTRACT_ANNEX_LIST_CONFIG_KEY]
             for scope in review if isinstance(review, list) else [review]:
                 bind_contract_annex_list(windows, documents, blocks, footer_skips, manifest, scope)
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
+    if CONTRACT_OPERATIVE_LINE_CONFIG_KEY in config:
+        try:
+            review = config[CONTRACT_OPERATIVE_LINE_CONFIG_KEY]
+            for scope in review if isinstance(review, list) else [review]:
+                bind_contract_operative_line(windows, documents, blocks, footer_skips, manifest, scope)
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
     if NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY in config:
@@ -1525,7 +1545,7 @@ def _label_grounding(requirement, available, window, *, allow_native_cell_join=T
     return result
 
 
-def _guard_heading_only_requirement(requirement, available, safe_skips):
+def _guard_heading_only_requirement(requirement, available, safe_skips, *, reviewed_operative=None):
     citation = requirement["citation"]
     ids = citation.get("block_ids") or [citation["block_id"]]
     if (len(ids) != 1 or requirement["response_mode"] in {"fixed_text", "table"} or
@@ -1538,6 +1558,14 @@ def _guard_heading_only_requirement(requirement, available, safe_skips):
                         item["ordinal"] > block["ordinal"] and item["block_id"] not in safe_skips and
                         not is_context_only(item)), key=lambda item: item["ordinal"])
     if following and following[0]["kind"] == "paragraph" and _CONSTRAINT.search(following[0].get("text", "")):
+        if reviewed_operative is not None:
+            proof = reviewed_operative["proof"]
+            line = proof["operative_line"]
+            _fail(not all(citation.get(key) == line[key] for key in ("source_id", "block_id", "locator")) or
+                  citation["quote_sha256"] != line["text_sha256"] or
+                  following[0]["block_id"] != proof["following_clause_members"][0]["block_id"],
+                  CONTRACT_OPERATIVE_LINE_SOURCE_ERROR)
+            return
         raise PlanningError("HEADING_ONLY_REQUIREMENT_MISSES_CONSTRAINT", {"field": "citation", "adjacent_block_id": following[0]["block_id"]})
 
 
@@ -1749,7 +1777,7 @@ def _window_source_catalogs(window: dict):
 
 def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=(), response_cover=None,
                      response_review_table=None, response_letter=None, response_cell_reflow=None,
-                     reviewed_label_wrap=None) -> dict:
+                     reviewed_label_wrap=None, reviewed_operative=None) -> dict:
     data = _validate_response_schema(raw, _WindowResponse)
     targets, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
     table_rows.extend(reviewed_scoring_rows)
@@ -1782,7 +1810,10 @@ def _validate_window(raw: dict, window: dict, *, reviewed_scoring_rows=(), respo
             if requirement["category"] == "technical" and requirement["response_mode"] == "writing":
                 _guard_clause_selection(requirement["citation"], available, clause_catalog)
             quote = requirement["citation"]["quote"]
-            _guard_heading_only_requirement(requirement, available, safe_skips)
+            if reviewed_operative is not None and index == reviewed_operative["candidate_index"]:
+                _guard_heading_only_requirement(requirement, available, safe_skips, reviewed_operative=reviewed_operative)
+            else:
+                _guard_heading_only_requirement(requirement, available, safe_skips)
             cell_proof = (response_cell_reflow["proof"] if response_cell_reflow is not None and
                           index == response_cell_reflow["proof"]["candidate_index"] else None)
             label_wrap = (reviewed_label_wrap if reviewed_label_wrap is not None and
@@ -1901,7 +1932,7 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
                        if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
                                       CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                       CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
-                                      CONTRACT_ANNEX_LIST_CONTEXT_KEY}}
+                                      CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
               "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
               "context_identity": copy.deepcopy(window.get("context_identity")), "selections": []}
@@ -2676,6 +2707,47 @@ def _verified_contract_attachment_citation_split(raw, window, data=None):
     return resolution
 
 
+def _contract_operative_line_resolution(raw, window, data=None):
+    if CONTRACT_OPERATIVE_LINE_CONTEXT_KEY not in window:
+        return None
+    if data is None:
+        normalized, _ = _normalize_source_selectors(raw, window)
+        data = _validate_response_schema(normalized, _LiveWindowResponse)
+    try:
+        resolution = resolve_contract_operative_line(raw, data, window)
+        proof = resolution["proof"]
+        role = proof["scope"].get("role_projection")
+        wrap = proof["scope"].get("label_wrap")
+        if role or wrap:
+            _, available, safe_skips, clauses, tables, rows = _window_source_catalogs(window)
+        original_wrap = None
+        if wrap is not None:
+            from .contract_operative_line_scope import reviewed_hse_paragraph_label_grounding
+
+            original = data["requirements"][wrap["candidate_index"]]
+            _fail(original["response_mode"] != "writing" or original["reference_keywords"][wrap["label_index"]] != wrap["label"],
+                  CONTRACT_OPERATIVE_LINE_SOURCE_ERROR)
+            citation = _citation(original["citation"], available, safe_skips, clauses, tables, rows)
+            original_wrap = reviewed_hse_paragraph_label_grounding(
+                proof["label_wrap_proof"], citation, candidate_index=wrap["candidate_index"], label_index=wrap["label_index"])
+            _fail(original_wrap is None, CONTRACT_OPERATIVE_LINE_SOURCE_ERROR)
+        role_projection = None
+        if role is not None:
+            from .contract_operative_line_scope import project_hse_performance_role
+
+            candidate = data["requirements"][role["candidate_index"]]
+            citation = _citation(candidate["citation"], available, safe_skips, clauses, tables, rows)
+            original = {**candidate, "citation": citation}
+            citation["label_grounding"] = _label_grounding(original, available, window)
+            role_projection = {"candidate_index": role["candidate_index"], "original_requirement_sha256": _hash(original),
+                               "requirement": project_hse_performance_role(proof["role_projection_proof"], original)}
+        return resolution | {"original_label_wrap": original_wrap, "role_projection": role_projection}
+    except (ValueError, KeyError, TypeError, IndexError) as error:
+        if isinstance(error, PlanningError):
+            raise
+        raise PlanningError(CONTRACT_OPERATIVE_LINE_SOURCE_ERROR) from None
+
+
 def _verified_reviewed_label_wrap(raw, window, data=None):
     context = window.get(NATIVE_REVIEWED_LABEL_WRAP_CONTEXT_KEY)
     if context is None:
@@ -2751,6 +2823,10 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
     if annex_list is not None and annex_list["original_label_wrap"] is not None:
         _fail(label_wrap is not None, CONTRACT_ANNEX_LIST_SOURCE_ERROR)
         label_wrap = annex_list["original_label_wrap"]
+    operative = _contract_operative_line_resolution(raw, window, data)
+    if operative is not None and operative["original_label_wrap"] is not None:
+        _fail(label_wrap is not None, CONTRACT_OPERATIVE_LINE_SOURCE_ERROR)
+        label_wrap = operative["original_label_wrap"]
     if review_table is not None:
         for change in review_table["row_changes"]:
             internal["requirements"][change["requirement_index"]]["citation"] = copy.deepcopy(change["citation"])
@@ -2769,7 +2845,7 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
     internal["reviewed_block_ids"] = [block["block_id"] for block in window["blocks"]]
     validated = _validate_window(internal, window, reviewed_scoring_rows=reviewed_rows, response_cover=cover,
                                  response_review_table=review_table, response_letter=letter,
-                                 response_cell_reflow=cell_reflow, reviewed_label_wrap=label_wrap)
+                                 response_cell_reflow=cell_reflow, reviewed_label_wrap=label_wrap, reviewed_operative=operative)
     _response_review_table_merge_projection(validated, window, review_table)
     if continuation is not None:
         proof = continuation["proof"]
@@ -2871,6 +2947,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_ANNEX_LIST_RESOLUTION_KEY
     _fail((key in result) != (annex_list is not None) or result.get(key) != annex_list,
           "EXTRACTION_CONTRACT_ANNEX_LIST_MISMATCH")
+    operative = _contract_operative_line_resolution(raw, window)
+    key = CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY
+    _fail((key in result) != (operative is not None) or result.get(key) != operative,
+          "EXTRACTION_CONTRACT_OPERATIVE_LINE_MISMATCH")
     label_wrap = _verified_reviewed_label_wrap(raw, window)
     key = NATIVE_REVIEWED_LABEL_WRAP_RESOLUTION_KEY
     _fail((key in result) != (label_wrap is not None) or result.get(key) != label_wrap,
@@ -3085,7 +3165,8 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                                    CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
                                    CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY,
                                    CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY, CONTRACT_ANNEX_INTRO_CONFIG_KEY,
-                                   NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY, CONTRACT_ANNEX_LIST_CONFIG_KEY}}
+                                   NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY, CONTRACT_ANNEX_LIST_CONFIG_KEY,
+                                   CONTRACT_OPERATIVE_LINE_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -3166,11 +3247,13 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         cell_reflow = _verified_response_cell_reflow_resolution(raw_model_candidate, window)
         label_wrap = _verified_reviewed_label_wrap(raw_model_candidate, window)
         annex_list = _contract_annex_list_resolution(raw_model_candidate, window)
-        effective_label_wrap = (annex_list and annex_list["original_label_wrap"]) or label_wrap
+        operative = _contract_operative_line_resolution(raw_model_candidate, window)
+        effective_label_wrap = (operative and operative["original_label_wrap"]) or (annex_list and annex_list["original_label_wrap"]) or label_wrap
         reviewed_rows = row_resolution["proof"]["rows"] if row_resolution is not None else []
         validated = _validate_window(candidate, window, reviewed_scoring_rows=reviewed_rows, response_cover=cover,
                                      response_review_table=review_table, response_letter=letter,
-                                     response_cell_reflow=cell_reflow, reviewed_label_wrap=effective_label_wrap)
+                                     response_cell_reflow=cell_reflow, reviewed_label_wrap=effective_label_wrap,
+                                     reviewed_operative=operative)
         resolution = _verified_price_scoring_resolution(raw_model_candidate, window)
         supplement = {PRICE_SCORING_CONFIG_KEY: resolution} if resolution is not None else {}
         if resolution is not None:
@@ -3230,6 +3313,9 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if annex_list is not None:
             supplement[CONTRACT_ANNEX_LIST_RESOLUTION_KEY] = annex_list
             _capture(ctx, "n2-contract-annex-list-source-resolution", annex_list)
+        if operative is not None:
+            supplement[CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY] = operative
+            _capture(ctx, "n2-contract-operative-line-source-resolution", operative)
         if label_wrap is not None:
             supplement[NATIVE_REVIEWED_LABEL_WRAP_RESOLUTION_KEY] = label_wrap
             _capture(ctx, "n2-native-reviewed-label-wrap", label_wrap)
@@ -3554,6 +3640,13 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
                       "EXTRACTION_CONTRACT_ANNEX_LIST_PROJECTION_MISMATCH")
                 candidates[index] = focused
             candidates.extend(item["requirement"] for item in annex_list["items"])
+        if operative := result.get(CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY):
+            if projection := operative["role_projection"]:
+                index = projection["candidate_index"]
+                _fail(_hash(candidates[index]) != projection["original_requirement_sha256"],
+                      "EXTRACTION_CONTRACT_OPERATIVE_LINE_PROJECTION_MISMATCH")
+                candidates = list(candidates)
+                candidates[index] = projection["requirement"]
         annex_owner = annex_owners.get(result["window_id"])
         acceptance_owner = acceptance_successors.get(result["window_id"])
         citation_split = result.get(CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY)
