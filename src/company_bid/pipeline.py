@@ -39,7 +39,7 @@ def _version(*names: str) -> str:
                                       "contract_annex_sources.py", "contract_interested_parties_sources.py",
                                       "contract_acceptance_sources.py", "contract_clause_index.py",
                                       "contract_clause_resolution.py", "contract_clause_packing.py", "contract_optional_fields.py",
-                                      "contract_heading_only_annex.py", "contract_attachment_citation_split.py"),
+                                      "contract_heading_only_annex.py", "contract_attachment_citation_split.py", "contract_annex_intro.py"),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py", "extraction_numbered_clause_replay.py",
                                                    "extraction_optional_fields_replay.py", "extraction_window_lineage.py"),
                     "source_format.py": ("source_format_scope.py",),
@@ -84,13 +84,12 @@ def validate_sources(prepared: PreparedBid) -> None:
 def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
     extraction = config.get("extraction")
-    from .contract_attachment_citation_split import SOURCE_CONFIG_KEY as ATTACHMENT_CITATION_SPLIT_CONFIG_KEY
     from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
     from .contract_heading_only_annex import SOURCE_CONFIG_KEY as HEADING_ONLY_ANNEX_CONFIG_KEY
     from .extraction_failed_scoring_replay import (
         FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY, FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
     )
-    from .extraction_window_lineage import CONFIG_KEY as FAILED_WINDOW_LINEAGE
+    from .extraction_window_lineage import CONFIG_KEY as FAILED_WINDOW_LINEAGE, lineage_extraction_keys
 
     structured = config.get("structured_provider", config.get("provider", {}))
     if (config.get("pipeline") == "automatic" and isinstance(structured, dict)
@@ -110,7 +109,7 @@ def build_executor(root: Path, config: dict) -> Executor:
     insurance_acceptance_keys = {"contract_insurance_acceptance_source_resolution",
                                  "failed_contract_insurance_acceptance_replay"}
     heading_only_annex_keys = {HEADING_ONLY_ANNEX_CONFIG_KEY, FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY}
-    if isinstance(extraction, dict) and {FAILED_WINDOW_LINEAGE, ATTACHMENT_CITATION_SPLIT_CONFIG_KEY}.intersection(extraction):
+    if isinstance(extraction, dict) and lineage_extraction_keys().intersection(extraction):
         if not (heading_only_annex_keys | {FAILED_WINDOW_LINEAGE}).issubset(extraction):
             raise PipelineFailure("FAILED_WINDOW_LINEAGE_CONFIG_INVALID")
     if isinstance(extraction, dict) and heading_only_annex_keys.intersection(extraction):

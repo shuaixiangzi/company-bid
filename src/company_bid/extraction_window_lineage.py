@@ -6,6 +6,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from .contract_annex_intro import SOURCE_CONFIG_KEY as ANNEX_INTRO_SOURCE_KEY
 from .contract_attachment_citation_split import SOURCE_CONFIG_KEY
 from .diagnostic_replay import _id, _one, _require
 from .extraction_failed_scoring_replay import (
@@ -21,7 +22,7 @@ SOURCE_INVALID = "FAILED_WINDOW_LINEAGE_SOURCE_INVALID"
 PROOF_MISMATCH = "FAILED_WINDOW_LINEAGE_PROOF_MISMATCH"
 # These settings are validator inputs only. They cannot change the frozen
 # window order, source manifest, model prompt, or request body.
-_REVIEW_KEYS = (SOURCE_CONFIG_KEY,)
+_REVIEW_KEYS = (SOURCE_CONFIG_KEY, ANNEX_INTRO_SOURCE_KEY)
 
 
 def lineage_extraction_keys():

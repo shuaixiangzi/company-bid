@@ -18,28 +18,29 @@ from test_reading import pdf
 from test_source_selected_citations import block, fixture, live_candidate
 
 
-def _native_pdf(tmp_path, texts):
+def _native_pdf(tmp_path, texts, *, preceding=()):
     # A ToUnicode map supplies CJK text while keeping the synthetic file
     # independent of system fonts and their rendering versions.
-    alphabet = list(dict.fromkeys(" " + "".join(texts)))
+    pages = [preceding, texts] if preceding else [texts]
+    alphabet = list(dict.fromkeys(" " + "".join(text for page in pages for text in page)))
     codes = {character: i for i, character in enumerate(alphabet, 32)}
-    commands = []
-    for i, text in enumerate(texts):
-        raw = bytes(codes[character] for character in text)
-        commands.append(f"BT /F1 8 Tf 25 {200 - 14*i} Td <{raw.hex()}> Tj ET")
-    draft = pdf(tmp_path / "draft.pdf", ["\n".join(commands)])
+    content = ["\n".join(f"BT /F1 8 Tf 25 {200 - 14*i} Td <{bytes(codes[c] for c in text).hex()}> Tj ET"
+                         for i, text in enumerate(page)) for page in pages]
+    draft = pdf(tmp_path / "draft.pdf", content)
     writer = PdfWriter(clone_from=PdfReader(draft))
-    font = writer.pages[0]["/Resources"]["/Font"]["/F1"]
-    font[NameObject("/BaseFont")] = NameObject("/SyntheticConfidentiality")
-    font[NameObject("/FirstChar")] = NumberObject(32)
-    font[NameObject("/LastChar")] = NumberObject(max(codes.values()))
-    font[NameObject("/Widths")] = ArrayObject([NumberObject(500) for _ in alphabet])
-    font[NameObject("/FontDescriptor")] = DictionaryObject({NameObject("/MissingWidth"): NumberObject(500)})
     cmap = DecodedStreamObject()
     mappings = "\n".join(f"<{code:02x}> <{ord(character):04x}>" for character, code in codes.items())
     cmap.set_data(("1 begincodespacerange\n<00> <ff>\nendcodespacerange\n"
                    f"{len(mappings.splitlines())} beginbfchar\n{mappings}\nendbfchar\n").encode("ascii"))
-    font[NameObject("/ToUnicode")] = writer._add_object(cmap)
+    unicode_map = writer._add_object(cmap)
+    for page in writer.pages:
+        font = page["/Resources"]["/Font"]["/F1"]
+        font[NameObject("/BaseFont")] = NameObject("/SyntheticPlainText")
+        font[NameObject("/FirstChar")] = NumberObject(32)
+        font[NameObject("/LastChar")] = NumberObject(max(codes.values()))
+        font[NameObject("/Widths")] = ArrayObject([NumberObject(500) for _ in alphabet])
+        font[NameObject("/FontDescriptor")] = DictionaryObject({NameObject("/MissingWidth"): NumberObject(500)})
+        font[NameObject("/ToUnicode")] = unicode_map
     path = tmp_path / "source.pdf"
     writer.write(path)
     return path

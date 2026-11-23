@@ -23,7 +23,7 @@ def _proof(unit_id, call, state):
 
 
 @pytest.fixture
-def stopped_lineage(monkeypatch):
+def stopped_lineage(monkeypatch, request):
     order = tuple(f"W{i}" for i in range(38, 45))
     windows = {unit: {"window_id": unit, "blocks": [unit]} for unit in order}
     bindings = {lineage._TASK + unit: {"alias": "history", "run_id": f"{i:032x}", "node_key": "N2", "unit_id": unit}
@@ -33,7 +33,9 @@ def stopped_lineage(monkeypatch):
     settings = {"window_concurrency": 1, "window_max_blocks": 60}
     w40 = {"window_id": "W40", "frozen": "first-review"}
     w42 = {"window_id": "W42", "frozen": "second-review"}
-    target = {**settings, lineage.CONFIG_KEY: proofs, lineage.SOURCE_CONFIG_KEY: [w40, w42]}
+    reviews = ({lineage.SOURCE_CONFIG_KEY: w40, lineage.ANNEX_INTRO_SOURCE_KEY: w42}
+               if getattr(request, "param", None) == "separate_rules" else {lineage.SOURCE_CONFIG_KEY: [w40, w42]})
+    target = {**settings, lineage.CONFIG_KEY: proofs, **reviews}
     provider = {"mode": "diagnostic_mixed", "max_attempts": 1, "validation_repair_attempts": 0, "max_run_calls": 2}
     frozen = {"pipeline": "automatic", "run_purpose": "diagnostic_replay", "structured_provider": provider}
     current = {"manifest": "original"}
@@ -71,12 +73,23 @@ def stopped_lineage(monkeypatch):
                            first=first, second=second, proofs=proofs, settings=settings)
 
 
+@pytest.mark.parametrize("stopped_lineage", ["same_rule", "separate_rules"], indirect=True)
 def test_ordered_success_and_failure_are_bound_across_two_generations(stopped_lineage):
     gate, replay = stopped_lineage.gate, stopped_lineage.replay
     gate.verify_history(replay)
     assert gate.prefix == ("W38", "W39", "W40", "W41", "W42")
     assert [stage.actual for stage in gate.stages] == [("W39", "W40"), ("W41", "W42")]
     assert [stage.inherited for stage in gate.stages] == [("W38",), ("W38", "W39", "W40")]
+
+
+@pytest.mark.parametrize("stopped_lineage", ["separate_rules"], indirect=True)
+def test_new_source_review_cannot_be_projected_into_earlier_generation(stopped_lineage):
+    setup = stopped_lineage
+    current = setup.replay._target_extraction
+    historical = setup.second.state["execution_config"]["extraction"]
+    historical[lineage.ANNEX_INTRO_SOURCE_KEY] = current[lineage.ANNEX_INTRO_SOURCE_KEY]
+    with pytest.raises(ProviderFailure, match="SOURCE_INVALID"):
+        setup.gate.verify_history(setup.replay)
 
 
 @pytest.mark.parametrize("change", ["foreign_parent", "repaid_inherited", "missing_binding", "changed_prior_proof"])
