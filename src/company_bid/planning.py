@@ -15,6 +15,7 @@ from .models import (PreparedBid, SourceRef, SourceContextProof, RequirementSour
                      context_digest, source_context_operator)
 from .slots import has_fill_marker, whole_cell_slot
 from .source_clauses import build_clause_catalog
+from .contract_annex_list import RESOLUTION_KEY as CONTRACT_ANNEX_LIST_RESOLUTION_KEY
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY
 from .response_letter_sources import build_response_letter_proof
 from .response_review_table_sources import (
@@ -1356,11 +1357,12 @@ def plan_bid(ctx, extracted: dict, parsed: dict, manifest: dict, call_json, conf
         blocks = {key: (block | {"illustration_source_use": uses[key]}) if key in uses else block
                   for key, block in blocks.items()}
     clause_by_id = {}
-    for window in windows:
-        for clause in build_clause_catalog(window):
-            _fail(clause["clause_id"] in clause_by_id and clause_by_id[clause["clause_id"]] != clause,
-                  "CLAUSE_CATALOG_ID_CONFLICT")
-            clause_by_id[clause["clause_id"]] = clause
+    clauses = [clause for window in windows for clause in build_clause_catalog(window)]
+    clauses.extend(clause for result in verified_results if CONTRACT_ANNEX_LIST_RESOLUTION_KEY in result
+                   for clause in result[CONTRACT_ANNEX_LIST_RESOLUTION_KEY]["proof"]["focused_clause_catalog"])
+    for clause in clauses:
+        _fail(clause["clause_id"] in clause_by_id and clause_by_id[clause["clause_id"]] != clause, "CLAUSE_CATALOG_ID_CONFLICT")
+        clause_by_id[clause["clause_id"]] = clause
     table_continuations = [proof for document in documents for proof in build_table_continuations(
         document, [block for block in blocks.values() if block["source_id"] == document["source_id"]], _pdf_footer_skips(blocks))]
     table_rows = [row for document in documents for row in build_table_row_catalog(
