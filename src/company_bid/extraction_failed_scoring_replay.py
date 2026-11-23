@@ -7,6 +7,7 @@ import re
 
 from .contract_acceptance_sources import CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY
 from .contract_annex_sources import CONTRACT_ANNEX_SOURCE_CONFIG_KEY
+from .contract_heading_only_annex import SOURCE_CONFIG_KEY as HEADING_ONLY_ANNEX_CONFIG_KEY
 from .contract_interested_parties_sources import CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY
 from .diagnostic_replay import _id, _one, _require
 from .extraction_illustrations import ILLUSTRATION_SOURCE_CONFIG_KEY
@@ -30,6 +31,8 @@ FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY = "failed_contract_interested_parties_
 FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY = "failed_contract_insurance_acceptance_replay"
 FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY = "failed_numbered_contract_clause_replay"
 FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY = "failed_contract_optional_fields_replay"
+FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY = "failed_contract_heading_only_annex_replay"
+_HEADING_ONLY_ANNEX_KEYS = {FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY, HEADING_ONLY_ANNEX_CONFIG_KEY}
 SCORING_ROW_SOURCE_CONFIG_KEY = "scoring_row_source_resolution"
 _FAILURE = "LIVE_REQUIRED_BLOCK_UNRESOLVED"
 _INVALID = "FAILED_SCORING_SOURCE_INVALID"
@@ -84,7 +87,7 @@ class FailedScoringReplay:
                                                  *_CONTRACT_INTERESTED_PARTIES_KEYS,
                                                  *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
                                                  FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
-                                                 FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY}}
+                                                 FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, *_HEADING_ONLY_ANNEX_KEYS}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -121,6 +124,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in numbered_clause.actual_units(replay))
         if optional_fields := getattr(replay, "_failed_contract_optional_fields", None):
             expected_bindings.update(_TASK + unit for unit in optional_fields.actual_units(replay))
+        if heading_only_annex := getattr(replay, "_failed_contract_heading_only_annex", None):
+            expected_bindings.update(_TASK + unit for unit in heading_only_annex.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -292,7 +297,7 @@ class FailedScoringRowsReplay:
                                             *_CONTRACT_INTERESTED_PARTIES_KEYS,
                                             *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
                                             FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
-                                            FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY}}
+                                            FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, *_HEADING_ONLY_ANNEX_KEYS}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and

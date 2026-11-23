@@ -157,6 +157,7 @@ def test_review_table_recovery_requires_source_proof_and_prior_cover_replay(tmp_
     ("extraction_numbered_clause_replay.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("extraction_optional_fields_replay.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("contract_optional_fields.py", {"N2", "N3", "N4", "N5", "N6"}),
+    ("contract_heading_only_annex.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("price_scoring_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("scoring_row_sources.py", {"N2", "N3", "N4", "N5", "N6"}),
     ("response_cover_sources.py", {"N2", "N3", "N4", "N5", "N6"}),

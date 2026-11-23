@@ -38,7 +38,8 @@ def _version(*names: str) -> str:
                                       "response_letter_sources.py", "response_cell_reflow_sources.py", "response_authority_tail.py",
                                       "contract_annex_sources.py", "contract_interested_parties_sources.py",
                                       "contract_acceptance_sources.py", "contract_clause_index.py",
-                                      "contract_clause_resolution.py", "contract_clause_packing.py", "contract_optional_fields.py"),
+                                      "contract_clause_resolution.py", "contract_clause_packing.py", "contract_optional_fields.py",
+                                      "contract_heading_only_annex.py"),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py", "extraction_numbered_clause_replay.py",
                                                    "extraction_optional_fields_replay.py"),
                     "source_format.py": ("source_format_scope.py",),
@@ -84,7 +85,10 @@ def build_executor(root: Path, config: dict) -> Executor:
     root = Path(root).resolve()
     extraction = config.get("extraction")
     from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
-    from .extraction_failed_scoring_replay import FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY
+    from .contract_heading_only_annex import SOURCE_CONFIG_KEY as HEADING_ONLY_ANNEX_CONFIG_KEY
+    from .extraction_failed_scoring_replay import (
+        FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY, FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
+    )
 
     structured = config.get("structured_provider", config.get("provider", {}))
     if (config.get("pipeline") == "automatic" and isinstance(structured, dict)
@@ -103,6 +107,10 @@ def build_executor(root: Path, config: dict) -> Executor:
     interested_parties_keys = {"contract_interested_parties_source_resolution", "failed_contract_interested_parties_replay"}
     insurance_acceptance_keys = {"contract_insurance_acceptance_source_resolution",
                                  "failed_contract_insurance_acceptance_replay"}
+    heading_only_annex_keys = {HEADING_ONLY_ANNEX_CONFIG_KEY, FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY}
+    if isinstance(extraction, dict) and heading_only_annex_keys.intersection(extraction):
+        if not (heading_only_annex_keys | {FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY}).issubset(extraction):
+            raise PipelineFailure("FAILED_CONTRACT_HEADING_ONLY_ANNEX_CONFIG_INVALID")
     if isinstance(extraction, dict) and FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY in extraction:
         if FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY not in extraction:
             raise PipelineFailure("FAILED_CONTRACT_OPTIONAL_FIELDS_CONFIG_INVALID")

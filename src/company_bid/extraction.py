@@ -52,6 +52,12 @@ from .contract_optional_fields import (
     WINDOW_CONTEXT_KEY as CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
     bind_optional_contract_fields, resolve_optional_contract_fields,
 )
+from .contract_heading_only_annex import (
+    RESOLUTION_KEY as CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_KEY,
+    SOURCE_CONFIG_KEY as CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
+    bind_heading_only_annex, normalize_heading_only_annex_config, resolve_heading_only_annex,
+)
 from .response_authority_tail import authority_tail_proof
 from .price_scoring_sources import PRICE_SCORING_CONFIG_KEY, normalize_price_scoring_config, prove_price_scoring_source
 from .response_cover_sources import RESPONSE_COVER_CONFIG_KEY, build_response_cover_proof, normalize_response_cover_config
@@ -401,7 +407,7 @@ def _model_window(window: dict) -> dict:
                                          RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
                                          CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
                                          CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
-                                         CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY}})
+                                         CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -615,6 +621,12 @@ def extraction_window_config(config: dict) -> dict:
             frozen[key] = normalize_contract_insurance_acceptance_config(config[key])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_heading_only_annex_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -801,6 +813,14 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
     if contract_clause_indexes:
         bind_contract_clause_windows(windows, contract_clause_indexes, blocks, footer_skips)
         bind_optional_contract_fields(windows, documents, contract_clause_indexes, blocks)
+    if CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY in config:
+        indexes = (contract_clause_indexes if contract_clause_indexes is not None
+                   else build_contract_clause_indexes(documents, blocks))
+        try:
+            bind_heading_only_annex(windows, documents, indexes, blocks, footer_skips, manifest,
+                                    config[CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return windows, ledger
 
 
@@ -1780,7 +1800,8 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
     # The document-wide index authenticates a separate source proof. Adding it
     # does not change which raw blocks were available to the original caller.
     selector_window = {key: value for key, value in window.items()
-                       if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY}}
+                       if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
+                                      CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
               "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
               "context_identity": copy.deepcopy(window.get("context_identity")), "selections": []}
@@ -2449,6 +2470,17 @@ def _contract_optional_fields_resolution(raw, window):
     return resolve_optional_contract_fields(raw, data, window, critical)
 
 
+def _contract_heading_only_annex_resolution(raw, window):
+    if not window.get(CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY):
+        return None
+    normalized, _ = _normalize_source_selectors(raw, window)
+    data = _validate_response_schema(normalized, _LiveWindowResponse)
+    processing = _window_processing_ledger(window, data["unresolved_block_ids"])
+    critical = [row["block_id"] for row in processing["blocks"]
+                if row["status"] == "supplied" and row["self_reported_unresolved"]]
+    return resolve_heading_only_annex(raw, data, window, critical)
+
+
 def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2478,8 +2510,9 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
     continuation = _verified_contract_interested_parties_resolution(raw, window)
     acceptance = _verified_contract_insurance_acceptance_resolution(raw, window)
     optional_fields = resolve_optional_contract_fields(raw, data, window, critical)
-    resolved = resolution or cover or annex or continuation or acceptance or optional_fields or _contract_boundary_resolution(
-        raw, window, predecessor_result, data=data, critical=critical)
+    heading_only_annex = resolve_heading_only_annex(raw, data, window, critical)
+    resolved = (resolution or cover or annex or continuation or acceptance or optional_fields or heading_only_annex or
+                _contract_boundary_resolution(raw, window, predecessor_result, data=data, critical=critical))
     if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
@@ -2600,6 +2633,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY
     _fail((key in result) != (optional_fields is not None) or result.get(key) != optional_fields,
           "EXTRACTION_CONTRACT_OPTIONAL_FIELDS_RESOLUTION_MISMATCH")
+    heading_only_annex = _contract_heading_only_annex_resolution(raw, window)
+    key = CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_KEY
+    _fail((key in result) != (heading_only_annex is not None) or result.get(key) != heading_only_annex,
+          "EXTRACTION_CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2708,7 +2745,9 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                                 ("owner_target_source_proven_contract_insurance_acceptance", acceptance),
                                 ("owner_target_source_proven_numbered_contract_clause", owner_result.get(CONTRACT_CLAUSE_RESOLUTION_KEY)),
                                 ("owner_target_source_proven_slash_marked_contract_inventory",
-                                 owner_result.get(CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY)))
+                                 owner_result.get(CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY)),
+                                ("owner_target_source_proven_heading_only_contract_annex",
+                                 owner_result.get(CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_KEY)))
             source_resolved = next((basis for basis, source in resolved_sources
                                     if source is not None and deferred["block_id"] in source["resolved_block_ids"]), None)
             guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
@@ -2797,7 +2836,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                                    RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
                                    RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
                                    CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
-                                   CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY}}
+                                   CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -2924,6 +2963,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if optional_fields is not None:
             supplement[CONTRACT_OPTIONAL_FIELDS_RESOLUTION_KEY] = optional_fields
             _capture(ctx, "n2-contract-optional-field-source-resolution", optional_fields)
+        heading_only_annex = _contract_heading_only_annex_resolution(raw_model_candidate, window)
+        if heading_only_annex is not None:
+            supplement[CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_KEY] = heading_only_annex
+            _capture(ctx, "n2-contract-heading-only-annex-source-resolution", heading_only_annex)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})

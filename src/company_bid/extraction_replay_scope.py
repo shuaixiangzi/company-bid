@@ -7,11 +7,12 @@ import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+from .contract_heading_only_annex import SOURCE_CONFIG_KEY as HEADING_ONLY_ANNEX_CONFIG_KEY
 from .diagnostic_replay import DiagnosticReplay, _id, _one, _require
 from .extraction_failed_scoring_replay import (
     CONTRACT_ANNEX_SOURCE_CONFIG_KEY, FAILED_CONTRACT_ANNEX_REPLAY, FailedContractAnnexReplay,
     CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INSURANCE_ACCEPTANCE_REPLAY,
-    FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY, FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY,
+    FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY, FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY,
     CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, FAILED_CONTRACT_INTERESTED_PARTIES_REPLAY,
     FAILED_ILLUSTRATION_REPLAY, FailedIllustrationReplay,
     FAILED_RESPONSE_CELL_REFLOW_REPLAY, FAILED_RESPONSE_COVER_REPLAY, FAILED_RESPONSE_LETTER_REPLAY,
@@ -26,7 +27,7 @@ from .extraction_failed_scoring_replay import (
 from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
 from .extraction_illustrations import CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY
 from .extraction_numbered_clause_replay import FailedNumberedContractClauseReplay
-from .extraction_optional_fields_replay import FailedContractOptionalFieldsReplay
+from .extraction_optional_fields_replay import FailedContractHeadingOnlyAnnexReplay, FailedContractOptionalFieldsReplay
 from .provider import ProviderFailure
 from .storage import digest
 
@@ -79,6 +80,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_contract_insurance_acceptance = None
     _failed_numbered_contract_clause = None
     _failed_contract_optional_fields = None
+    _failed_contract_heading_only_annex = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -96,6 +98,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_contract_insurance_acceptance = None
         self._failed_numbered_contract_clause = None
         self._failed_contract_optional_fields = None
+        self._failed_contract_heading_only_annex = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -149,6 +152,11 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
             self._failed_numbered_contract_clause = FailedNumberedContractClauseReplay(self, ctx)
         if FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY in self._target_extraction:
             self._failed_contract_optional_fields = FailedContractOptionalFieldsReplay(self, ctx)
+        _require((HEADING_ONLY_ANNEX_CONFIG_KEY in self._target_extraction) ==
+                 (FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY in self._target_extraction),
+                 FailedContractHeadingOnlyAnnexReplay.config_error)
+        if FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY in self._target_extraction:
+            self._failed_contract_heading_only_annex = FailedContractHeadingOnlyAnnexReplay(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"], self._target_extraction.get(POLICY_KEY)):
             return super().preflight(ctx, value)
 
@@ -183,6 +191,17 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        heading_only_annex = self._failed_contract_heading_only_annex
+        if heading_only_annex is None:
+            return self._read_before_heading_only_annex(binding, task, full_window)
+        heading_only_annex.verify_history(self)
+        if binding["unit_id"] == heading_only_annex.unit_id:
+            return heading_only_annex.read_failure(self, binding, task, full_window)
+        entry = self._read_before_heading_only_annex(binding, task, full_window)
+        heading_only_annex.verify_success(self, binding, entry, full_window)
+        return entry
+
+    def _read_before_heading_only_annex(self, binding, task, full_window):
         optional = self._failed_contract_optional_fields
         if optional is None:
             return self._read_before_contract_optional_fields(binding, task, full_window)
@@ -384,7 +403,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_contract_optional_fields is not None:
+        if self._failed_contract_heading_only_annex is not None:
+            self._failed_contract_heading_only_annex.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_contract_optional_fields is not None:
             self._failed_contract_optional_fields.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_numbered_contract_clause is not None:
             self._failed_numbered_contract_clause.allow_candidate(self, ctx, task_type, unit_id)
