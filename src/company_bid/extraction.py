@@ -32,6 +32,14 @@ from .contract_annex_list import (
     SOURCE_ERROR as CONTRACT_ANNEX_LIST_SOURCE_ERROR,
     bind_contract_annex_list, normalize_contract_annex_list_config, resolve_contract_annex_list,
 )
+from .contract_annex_numbered_items import (
+    RESOLUTION_KEY as CONTRACT_ANNEX_NUMBERED_ITEMS_RESOLUTION_KEY,
+    SOURCE_CONFIG_KEY as CONTRACT_ANNEX_NUMBERED_ITEMS_CONFIG_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_ANNEX_NUMBERED_ITEMS_CONTEXT_KEY,
+    SOURCE_ERROR as CONTRACT_ANNEX_NUMBERED_ITEMS_SOURCE_ERROR,
+    NumberedItemSelectionError, bind_contract_annex_numbered_items, normalize_contract_annex_numbered_items_config,
+    resolve_contract_annex_numbered_items,
+)
 from .contract_annex_predecessor import (
     RESOLUTION_KEY as CONTRACT_ANNEX_PREDECESSOR_RESOLUTION_KEY,
     SOURCE_CONFIG_KEY as CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY,
@@ -456,7 +464,8 @@ def _model_window(window: dict) -> dict:
                                          CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
                                          CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                          CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
-                                         CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
+                                         CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_ANNEX_NUMBERED_ITEMS_CONTEXT_KEY,
+                                         CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
                                          CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY, CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY,
                                          NATIVE_REVIEWED_LABEL_WRAP_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
@@ -702,6 +711,12 @@ def extraction_window_config(config: dict) -> dict:
             frozen[key] = normalize_contract_annex_predecessor_config(config[key])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_ANNEX_NUMBERED_ITEMS_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_contract_annex_numbered_items_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     key = CONTRACT_OPERATIVE_LINE_CONFIG_KEY
     if key in config:
         try:
@@ -940,6 +955,13 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
             review = config[CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY]
             for scope in review if isinstance(review, list) else [review]:
                 bind_contract_annex_predecessor(windows, documents, blocks, footer_skips, manifest, scope)
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
+    if CONTRACT_ANNEX_NUMBERED_ITEMS_CONFIG_KEY in config:
+        try:
+            review = config[CONTRACT_ANNEX_NUMBERED_ITEMS_CONFIG_KEY]
+            for scope in review if isinstance(review, list) else [review]:
+                bind_contract_annex_numbered_items(windows, documents, blocks, footer_skips, manifest, scope)
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
     if CONTRACT_OPERATIVE_LINE_CONFIG_KEY in config:
@@ -1974,6 +1996,7 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
                                       CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                       CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
                                       CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY,
+                                      CONTRACT_ANNEX_NUMBERED_ITEMS_CONTEXT_KEY,
                                       CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
                                       CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
@@ -2751,6 +2774,31 @@ def _verified_contract_attachment_citation_split(raw, window, data=None):
     return resolution
 
 
+def _verified_contract_annex_numbered_items(raw, window, data=None):
+    if CONTRACT_ANNEX_NUMBERED_ITEMS_CONTEXT_KEY not in window:
+        return None
+    if data is None:
+        normalized, _ = _normalize_source_selectors(raw, window)
+        data = _validate_response_schema(normalized, _LiveWindowResponse)
+    try:
+        resolution = resolve_contract_annex_numbered_items(raw, data, window)
+    except NumberedItemSelectionError as exc:
+        raise PlanningError(str(exc), exc.diagnostic_context) from None
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    except (TypeError, KeyError, IndexError):
+        raise PlanningError(CONTRACT_ANNEX_NUMBERED_ITEMS_SOURCE_ERROR) from None
+    _, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
+    for projection in resolution["projections"]:
+        native_scope = {row["block_id"]: row for row in projection["context_members"]}
+        projection["context_citation"] = _citation({**projection["context_selector"], "quote": None, "clause_id": None,
+                                                   "table_row_id": None}, native_scope)
+        primary = _citation({**projection["operative_selector"], "quote": None, "clause_id": None, "table_row_id": None},
+                            available, safe_skips, clause_catalog, table_continuations, table_rows)
+        _fail(primary["quote_sha256"] != projection["operative_quote_sha256"], CONTRACT_ANNEX_NUMBERED_ITEMS_SOURCE_ERROR)
+    return resolution
+
+
 def _contract_operative_line_resolution(raw, window, data=None):
     if CONTRACT_OPERATIVE_LINE_CONTEXT_KEY not in window:
         return None
@@ -2926,6 +2974,10 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
     citation_split = _verified_contract_attachment_citation_split(raw, window, data)
     if citation_split is not None:
         internal["requirements"][citation_split["candidate_index"]]["citation"] = citation_split["operative_selector"]
+    numbered_items = _verified_contract_annex_numbered_items(raw, window, data)
+    if numbered_items is not None:
+        for projection in numbered_items["projections"]:
+            internal["requirements"][projection["candidate_index"]]["citation"] = projection["operative_selector"]
     for requirement in internal["requirements"]:
         if requirement["response_mode"] != "writing":
             requirement["reference_keywords"] = []
@@ -3027,6 +3079,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY
     _fail((key in result) != (citation_split is not None) or result.get(key) != citation_split,
           "EXTRACTION_CONTRACT_ATTACHMENT_CITATION_SPLIT_MISMATCH")
+    numbered_items = _verified_contract_annex_numbered_items(raw, window)
+    key = CONTRACT_ANNEX_NUMBERED_ITEMS_RESOLUTION_KEY
+    _fail((key in result) != (numbered_items is not None) or result.get(key) != numbered_items,
+          "EXTRACTION_CONTRACT_ANNEX_NUMBERED_ITEMS_MISMATCH")
     annex_intro = _contract_annex_intro_resolution(raw, window)
     key = CONTRACT_ANNEX_INTRO_RESOLUTION_KEY
     _fail((key in result) != (annex_intro is not None) or result.get(key) != annex_intro,
@@ -3183,6 +3239,15 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                 guard(len(handoffs) != 1 or handoffs[0]["owner_window_id"] != owner["window_id"] or
                       handoffs[0]["member"]["locator"] != block["locator"],
                       "CONTRACT_ANNEX_PREDECESSOR_OWNER_MISMATCH", **context)
+            if numbered := result.get(CONTRACT_ANNEX_NUMBERED_ITEMS_RESOLUTION_KEY):
+                if deferred["block_id"] in numbered["declared_following_block_ids"]:
+                    successor = owner_result.get(CONTRACT_ANNEX_NUMBERED_ITEMS_RESOLUTION_KEY, {})
+                    guard(successor.get("proof", {}).get("scope") != numbered["proof"]["scope"] or
+                          successor.get("proof", {}).get("role") != "following_owner" or
+                          not any(deferred["block_id"] in row["operative_selector"]["block_ids"]
+                                  for row in successor.get("projections", [])),
+                          "CONTRACT_ANNEX_NUMBERED_ITEMS_OWNER_MISMATCH", **context)
+                    source_resolved = "owner_target_validated_numbered_contract_item_with_scope"
             if acceptance := result.get(CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY):
                 proof = acceptance["proof"]
                 if deferred["block_id"] == proof["adjacent_unresolved_block_id"]:
@@ -3271,7 +3336,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                                    CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY, CONTRACT_ANNEX_INTRO_CONFIG_KEY,
                                    NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY, CONTRACT_ANNEX_LIST_CONFIG_KEY,
                                    CONTRACT_OPERATIVE_LINE_CONFIG_KEY, CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY,
-                                   CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY}}
+                                   CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY, CONTRACT_ANNEX_NUMBERED_ITEMS_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -3411,6 +3476,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if citation_split is not None:
             supplement[CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY] = citation_split
             _capture(ctx, "n2-contract-attachment-citation-split", citation_split)
+        numbered_items = _verified_contract_annex_numbered_items(raw_model_candidate, window)
+        if numbered_items is not None:
+            supplement[CONTRACT_ANNEX_NUMBERED_ITEMS_RESOLUTION_KEY] = numbered_items
+            _capture(ctx, "n2-contract-annex-numbered-items-resolution", numbered_items)
         annex_intro = _contract_annex_intro_resolution(raw_model_candidate, window)
         if annex_intro is not None:
             supplement[CONTRACT_ANNEX_INTRO_RESOLUTION_KEY] = annex_intro
@@ -3770,6 +3839,8 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
         annex_owner = annex_owners.get(result["window_id"])
         acceptance_owner = acceptance_successors.get(result["window_id"])
         citation_split = result.get(CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY)
+        numbered = result.get(CONTRACT_ANNEX_NUMBERED_ITEMS_RESOLUTION_KEY, {})
+        numbered_scope = {row["candidate_index"]: row for row in numbered.get("projections", [])}
         for candidate_index, candidate in enumerate(candidates):
             if acceptance_owner is not None and _same_contract_acceptance_scope(candidate, acceptance_owner):
                 if result["window_id"] not in acceptance_owner["window_ids"]:
@@ -3782,12 +3853,18 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
                 # Keep the model's original keyword in the window and its citation.
                 # Material matching receives only what the tender asks to submit.
                 semantics.update(attachment_keywords=[], contract_evidence_scope=scope)
-            key = _hash(semantics)
+            projection = numbered_scope.get(candidate_index)
+            if projection is not None:
+                _fail(candidate["citation"]["block_ids"] != projection["operative_selector"]["block_ids"] or
+                      candidate["citation"]["quote_sha256"] != projection["operative_quote_sha256"],
+                      "EXTRACTION_CONTRACT_ANNEX_NUMBERED_ITEMS_PROJECTION_MISMATCH")
+            identity = semantics if projection is None else {**semantics, "contract_scope_citations": [projection["context_citation"]]}
+            key = _hash(identity)
             requirement = by_key.get(key)
             if annex_owner is not None and _same_contract_annex_scope(candidate, candidate["citation"], annex_owner[0], owner=True):
                 requirement = annex_owner[1]
             if requirement is None:
-                requirement = {"requirement_id": _id("R-", semantics), **semantics,
+                requirement = {"requirement_id": _id("R-", identity), **semantics,
                                "citations": [], "window_ids": []}
                 by_key[key] = requirement
                 requirements.append(requirement)
@@ -3795,11 +3872,14 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
                          else requirement.setdefault("equivalent_annex_citations", []))
             if candidate["citation"] not in citations:
                 citations.append(candidate["citation"])
-            if citation_split is not None and candidate_index == citation_split["candidate_index"]:
-                context = citation_split["context_citation"]
+            scope_citation = citation_split["context_citation"] if citation_split is not None and candidate_index == citation_split["candidate_index"] else None
+            if projection is not None:
+                _fail(scope_citation is not None, "EXTRACTION_CONTRACT_ANNEX_NUMBERED_ITEMS_PROJECTION_MISMATCH")
+                scope_citation = projection["context_citation"]
+            if scope_citation is not None:
                 scope = requirement.setdefault("contract_scope_citations", [])
-                if context not in scope:
-                    scope.append(context)
+                if scope_citation not in scope:
+                    scope.append(scope_citation)
             if result["window_id"] not in requirement["window_ids"]:
                 requirement["window_ids"].append(result["window_id"])
             local_ids.append(requirement["requirement_id"])

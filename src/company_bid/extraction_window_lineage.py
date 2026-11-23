@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from .contract_annex_intro import SOURCE_CONFIG_KEY as ANNEX_INTRO_SOURCE_KEY
 from .contract_annex_list import SOURCE_CONFIG_KEY as ANNEX_LIST_SOURCE_KEY
+from .contract_annex_numbered_items import SOURCE_CONFIG_KEY as ANNEX_NUMBERED_ITEMS_SOURCE_KEY
 from .contract_annex_predecessor import SOURCE_CONFIG_KEY as ANNEX_PREDECESSOR_SOURCE_KEY
 from .contract_attachment_citation_split import SOURCE_CONFIG_KEY
 from .contract_operative_line import SOURCE_CONFIG_KEY as OPERATIVE_LINE_SOURCE_KEY
@@ -28,7 +29,8 @@ PROOF_MISMATCH = "FAILED_WINDOW_LINEAGE_PROOF_MISMATCH"
 # These settings are validator inputs only. They cannot change the frozen
 # window order, source manifest, model prompt, or request body.
 _REVIEW_KEYS = (SOURCE_CONFIG_KEY, ANNEX_INTRO_SOURCE_KEY, NATIVE_LABEL_WRAP_SOURCE_KEY, ANNEX_LIST_SOURCE_KEY,
-                OPERATIVE_LINE_SOURCE_KEY, PERFORMANCE_RECORD_SOURCE_KEY, ANNEX_PREDECESSOR_SOURCE_KEY)
+                OPERATIVE_LINE_SOURCE_KEY, PERFORMANCE_RECORD_SOURCE_KEY, ANNEX_PREDECESSOR_SOURCE_KEY,
+                ANNEX_NUMBERED_ITEMS_SOURCE_KEY)
 
 
 def lineage_extraction_keys():
