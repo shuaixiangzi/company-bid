@@ -211,6 +211,7 @@ def test_cold_request_requires_completed_prefix_and_settled_first_call(stopped_l
     gate.allow_candidate(replay, ctx, "extract_requirements", "W44")
 
 
-def test_requires_legacy_replay_and_diagnostic_mode(tmp_path):
+@pytest.mark.parametrize("key", sorted(lineage.lineage_extraction_keys()))
+def test_requires_legacy_replay_and_diagnostic_mode(tmp_path, key):
     with pytest.raises(PipelineFailure, match="FAILED_WINDOW_LINEAGE_CONFIG_INVALID"):
-        build_executor(tmp_path, {"extraction": {lineage.CONFIG_KEY: []}})
+        build_executor(tmp_path, {"extraction": {key: []}})

@@ -13,6 +13,7 @@ from .extraction_failed_scoring_replay import (
     _allow_cold_candidate, _read_failed_call, _verify_replayed_checkpoint, _TASK,
 )
 from .extraction_numbered_clause_replay import rebuild_frozen_contract_windows
+from .native_reviewed_label_wrap import SOURCE_CONFIG_KEY as NATIVE_LABEL_WRAP_SOURCE_KEY
 from .storage import digest
 
 
@@ -22,7 +23,7 @@ SOURCE_INVALID = "FAILED_WINDOW_LINEAGE_SOURCE_INVALID"
 PROOF_MISMATCH = "FAILED_WINDOW_LINEAGE_PROOF_MISMATCH"
 # These settings are validator inputs only. They cannot change the frozen
 # window order, source manifest, model prompt, or request body.
-_REVIEW_KEYS = (SOURCE_CONFIG_KEY, ANNEX_INTRO_SOURCE_KEY)
+_REVIEW_KEYS = (SOURCE_CONFIG_KEY, ANNEX_INTRO_SOURCE_KEY, NATIVE_LABEL_WRAP_SOURCE_KEY)
 
 
 def lineage_extraction_keys():
