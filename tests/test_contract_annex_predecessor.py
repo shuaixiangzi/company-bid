@@ -141,3 +141,111 @@ def test_other_targets_and_future_declarations_cannot_use_predecessor_proof(scen
     _, target = bind(scenario)
     with pytest.raises(ext.PlanningError, match=seam.SOURCE_ERROR):
         ext.validate_live_window(raw, target, predecessor_result=past)
+
+
+@pytest.fixture
+def page_seam(tmp_path):
+    manifest, parsed = fixture(tmp_path)
+    parsed["documents"][0]["format"] = "pdf"
+    source = [
+        (1, "annex", "附件1：施工合作协议", True),
+        (1, "footer-1", "41", True),
+        (2, "section", "4.不可抗力", True),
+        (2, "before", "4.1 合同双方应尽力减少损失。", True),
+        (2, "start", "4.2 受影响的损失由双方分别承担。双方协商不成时，", True),
+        (2, "continued", "任何一方可以书面通知另一方，本协", False),
+        (2, "footer-2", "42", True),
+        (3, "tail", "议在通知送达时终止。", False),
+        (3, "after", "5.协议期限", True),
+        (3, "after-body", "本协议的期限与主合同一致。", True),
+        (3, "footer-3", "43", True),
+    ]
+    lines_by_page = {}
+    for page, identity, line, indented in source:
+        index = lines_by_page.get(page, 0)
+        lines_by_page[page] = index + 1
+        bbox = [280.0, 770.0, 292.0, 780.0] if identity.startswith("footer-") else [
+            113.0 if indented else 89.0, 20 + 30 * index, 400.0, 38 + 30 * index]
+        row = block(parsed, identity, line, page=page, origin="native", bbox=bbox)
+        row["locator"] = f"pdf/page[{page}]/line[{index}]"
+    blocks, _, docs = ext._index(parsed, manifest)
+    config = ext.extraction_window_config({"window_max_blocks": 7})
+    windows, _ = ext._windows(docs, blocks, config, manifest=manifest)
+    previous, target = windows
+    assert previous["blocks"][-1]["block_id"] == "footer-2" and target["blocks"][0]["block_id"] == "tail"
+    prior_raw = response(previous, [["start", "continued", "tail"]], unresolved=["tail"])
+    past = execute(previous, config, prior_raw)
+    raw = response(target, [["after", "after-body"]], unresolved=["tail"])
+    scope = {"source_id": "T", "source_sha256": docs[0]["sha256"], "window_id": target["window_id"],
+             "raw_candidate_sha256": digest(raw), "clause_start_block_id": "start", "section_heading_block_id": "section",
+             "annex_heading_block_id": "annex", "annex_page": {"physical_page": 1, "rendered_rgb_sha256": "1" * 64},
+             "next_section_block_id": "after", "seam_token": "本协议", "deferred_block_ids": [],
+             "reviewed_pages": [{"physical_page": page, "rendered_rgb_sha256": str(page) * 64} for page in (2, 3)],
+             "predecessor": {"window_id": previous["window_id"], "raw_candidate_sha256": digest(prior_raw), "candidate_index": 0,
+                             "requirement_sha256": digest(past["validated"]["requirements"][0])}}
+    return config, windows, blocks, scope, raw, past
+
+
+def bind_page_seam(scenario, *, footer=None):
+    config, (previous, target), blocks, scope, _, _ = scenario
+    clean = ext.extraction_window_config({**config, seam.SOURCE_CONFIG_KEY: scope})
+    footers = ext._pdf_footer_skips(blocks)
+    pages = [{"physical_page": page, "footer": footers[f"footer-{page}"]} for page in (2, 3)]
+    if footer is not None:
+        pages[0]["footer"] = footer
+    lines = [row for row in blocks.values() if row["page"] >= 2]
+    annex = [row for row in blocks.values() if row["page"] == 1]
+    proof = seam._source_proof(lines, pages, annex, scope["annex_page"], scope, blocks, previous, target, None)
+    proof.update(rule=seam.RULE, source_id=scope["source_id"], source_sha256=scope["source_sha256"], window_id=target["window_id"],
+                 scope=scope, reviewed_pages=pages)
+    return clean, {**target, seam.WINDOW_CONTEXT_KEY: {**proof, "proof_sha256": digest(proof)}}
+
+
+def test_cross_page_final_child_closes_with_authenticated_footer_and_next_root(page_seam):
+    config, (previous, window), _, _, raw, past = page_seam
+    reviewed, target = bind_page_seam(page_seam)
+    assert ext.extraction_window_payload(window, config) == ext.extraction_window_payload(target, reviewed)
+    result = execute(target, reviewed, raw, past)
+    assert result["raw_model_candidate"] == raw and result["processing"]["unresolved_block_ids"] == ["tail"]
+    proof = result[seam.RESOLUTION_KEY]["proof"]
+    assert proof["following_section"]["block_id"] == "after"
+    assert proof["page_seam"]["footer"]["block_id"] == "footer-2"
+    assert proof["page_seam"]["split_at"] == 2
+    prior = past["validated"]["requirements"][0]["citation"]
+    assert prior["pages"] == [2, 3] and prior["skipped_block_ids"] == ["footer-2"]
+    assert prior["quote"].endswith("本协\n议在通知送达时终止。")
+    closure = ext._close_deferred_context([previous, target], [past, result])
+    assert closure["items"][0]["resolution"] == "owner_target_complete_annex_clause_already_cited_by_predecessor"
+    requirements, _ = ext._merge_results([past, result])
+    assert len(requirements) == 2 and requirements[0]["citations"] == [prior]
+
+
+@pytest.mark.parametrize("change", ["uncertified_footer", "other_section", "wrong_page_split", "missing_first_line"])
+def test_cross_page_requires_certified_layout_and_exact_section_bounds(page_seam, change):
+    _, (previous, _), blocks, scope, _, _ = page_seam
+    if change == "uncertified_footer":
+        previous["safe_skip_blocks"] = [row for row in previous["safe_skip_blocks"] if row["block_id"] != "footer-2"]
+    elif change == "other_section":
+        blocks["after"]["text"] = "6.协议期限"
+    elif change == "wrong_page_split":
+        scope["seam_token"] = "主合同"
+    else:
+        blocks["tail"]["locator"] = "pdf/page[3]/line[1]"
+    with pytest.raises(ValueError):
+        bind_page_seam(page_seam)
+
+
+@pytest.mark.parametrize("change", ["footer_omitted", "wrong_footer", "tail_outside_quote"])
+def test_cross_page_requires_validated_predecessor_footer_and_complete_tail(page_seam, change):
+    _, _, _, _, raw, past = page_seam
+    _, target = bind_page_seam(page_seam)
+    tampered = copy.deepcopy(past)
+    citation = tampered["validated"]["requirements"][0]["citation"]
+    if change == "footer_omitted":
+        citation["skipped_block_ids"] = []
+    elif change == "wrong_footer":
+        citation["skipped_block_ids"] = ["footer-1"]
+    else:
+        citation["quote"] = citation["quote"].split("\n议")[0]
+    with pytest.raises(ext.PlanningError, match=seam.PREDECESSOR_ERROR):
+        ext.validate_live_window(raw, target, predecessor_result=tampered)

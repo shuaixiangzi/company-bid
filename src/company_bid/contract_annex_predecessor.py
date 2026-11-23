@@ -24,6 +24,8 @@ PREDECESSOR_ERROR = "CONTRACT_ANNEX_PREDECESSOR_CHECKPOINT_MISMATCH"
 RULE = "reviewed_native_annex_clause_already_cited_by_predecessor_v1"
 _NUMBERED = re.compile(r"^([1-9]\d*)[.．]([1-9]\d*)(?![\d.．])\s*\S")
 _SECTION = re.compile(r"^([1-9]\d*)[.．]\s*(?!\d)\S")
+_NUMBERING = re.compile(r"^[1-9]\d*[.．](?:[1-9]\d*(?:[.．][1-9]\d*)*[.．]?)?\s*[^\d\s.．]")
+_SEAM_TOKEN = re.compile(r"[\u3400-\u9fff]{2,12}")
 _SUBMISSION = re.compile(r"投标|响应文件|报价|报名|递交|资格审查")
 _END = ("。", "！", "？")
 
@@ -49,13 +51,15 @@ class _Scope(BaseModel):
     clause_start_block_id: _ID
     reviewed_pages: list[_ReviewPage] = Field(min_length=1, max_length=4)
     deferred_block_ids: list[_ID] = Field(max_length=12)
+    next_section_block_id: _ID | None = None
+    seam_token: _ID | None = None
 
 
 def normalize_contract_annex_predecessor_config(value):
     error = "CONTRACT_ANNEX_PREDECESSOR_CONFIG_INVALID"
     try:
         entries = value if isinstance(value, list) else [value]
-        scopes = [_Scope.model_validate(scope).model_dump() for scope in entries]
+        scopes = [_Scope.model_validate(scope).model_dump(exclude_none=True) for scope in entries]
     except ValidationError:
         raise ValueError(error) from None
     if not scopes or len({scope["window_id"] for scope in scopes}) != len(scopes):
@@ -65,6 +69,9 @@ def normalize_contract_annex_predecessor_config(value):
         deferred = scope["deferred_block_ids"]
         if (pages != list(range(pages[0], pages[0] + len(pages))) or scope["annex_page"]["physical_page"] >= pages[0] or
                 scope["predecessor"]["window_id"] == scope["window_id"] or len(set(deferred)) != len(deferred)):
+            raise ValueError(error)
+        if ("next_section_block_id" in scope) != ("seam_token" in scope) or (
+                "seam_token" in scope and (len(pages) < 2 or not _SEAM_TOKEN.fullmatch(scope["seam_token"]))):
             raise ValueError(error)
     return scopes if isinstance(value, list) else scopes[0]
 
@@ -113,10 +120,55 @@ def _clause_bounds(lines, scope):
     return section, lines[before:opening], clause, lines[after], f"{current[1]}.{current[2]}", quote
 
 
+def _cross_page_bounds(lines, pages, scope):
+    """Prove the last subsection continues above the next numbered root on a fresh page."""
+    by_id = {row["block_id"]: i for i, row in enumerate(lines)}
+    section_index, opening, after = (by_id[scope[key]] for key in (
+        "section_heading_block_id", "clause_start_block_id", "next_section_block_id"))
+    section, later = lines[section_index], lines[after]
+    heading, next_heading = _SECTION.match(section["text"]), _SECTION.match(later["text"])
+    number = _NUMBERED.match(lines[opening]["text"])
+    _require(section_index + 1 < opening < after and heading and next_heading and number and
+             heading[1] == number[1] and int(next_heading[1]) == int(heading[1]) + 1 and
+             not any(_SECTION.match(row["text"]) for row in lines[section_index + 1:after]))
+    children = [(index, match) for index in range(section_index + 1, after)
+                if (match := _NUMBERED.match(lines[index]["text"]))]
+    _require(len(children) >= 2 and children[-1][0] == opening and
+             [match.groups() for _, match in children] ==
+             [(number[1], str(child)) for child in range(1, int(number[2]) + 1)])
+    before = children[-2][0]
+    clause, earlier = lines[opening:after], lines[before:opening]
+    _require(len(clause) >= 2 and lines[opening - 1]["text"].endswith(_END) and clause[-1]["text"].endswith(_END) and
+             not any(_NUMBERING.match(row["text"]) for row in clause[1:]) and
+             abs(earlier[0]["bbox"][0] - clause[0]["bbox"][0]) <= .5 and abs(later["bbox"][0] - clause[0]["bbox"][0]) <= .5 and
+             all(row["bbox"][0] < clause[0]["bbox"][0] and abs(row["bbox"][0] - clause[-1]["bbox"][0]) <= .5 for row in clause[1:]))
+    reviewed = [*earlier, *clause, later]
+    pairs = list(zip(reviewed, reviewed[1:]))
+    (left, right), = [(left, right) for left, right in pairs if left["page"] != right["page"]]
+    footer, = [page["footer"] for page in pages if page["physical_page"] == left["page"]]
+    token = scope["seam_token"]
+    split, = [i for i in range(1, len(token)) if left["text"].endswith(token[:i]) and right["text"].startswith(token[i:])]
+    _require(left in clause[:-1] and right in clause[1:] and right["page"] == left["page"] + 1 == later["page"] and
+             right["locator"].endswith("/line[0]") and
+             footer["rule"] == "pdf-page-footer-v1" and footer["page"] == left["page"] and
+             footer["locator"] != left["locator"] and right["ordinal"] == left["ordinal"] + 2 and
+             all(b["ordinal"] == a["ordinal"] + 1 and a["bbox"][3] <= b["bbox"][1]
+                 for a, b in pairs if a["page"] == b["page"]))
+    quote = "\n".join(row["text"] for row in clause)
+    _require(not _SUBMISSION.search(quote))
+    seam = {"last_predecessor_member": _located_member(left), "first_target_member": _located_member(right),
+            "footer": footer, "split_token": token, "split_at": split}
+    return section, earlier, clause, later, f"{number[1]}.{number[2]}", quote, seam
+
+
 def _source_proof(lines, pages, annex_lines, annex_page, scope, blocks, previous, window, following):
     footers = {page["footer"]["block_id"] for page in pages}
     lines = [row for row in lines if row["block_id"] not in footers]
-    section, earlier, clause, later, number, quote = _clause_bounds(lines, scope)
+    seam = None
+    if "next_section_block_id" in scope:
+        section, earlier, clause, later, number, quote, seam = _cross_page_bounds(lines, pages, scope)
+    else:
+        section, earlier, clause, later, number, quote = _clause_bounds(lines, scope)
     annex, = [row for row in annex_lines if row["block_id"] == scope["annex_heading_block_id"]]
     _require(_ANNEX.fullmatch(annex["text"].split("【", 1)[0]) and annex["ordinal"] < section["ordinal"] and
              not any(row["source_id"] == scope["source_id"] and annex["ordinal"] < row["ordinal"] < section["ordinal"] and
@@ -124,11 +176,22 @@ def _source_proof(lines, pages, annex_lines, annex_page, scope, blocks, previous
     prior_owned = {row["block_id"]: row for row in previous["blocks"]}
     target = {row["block_id"]: row for row in window["blocks"]}
     adjacent = {row["block_id"]: row for row in window["adjacent_context"]}
-    tail = clause[1:]
-    _require(list(prior_owned)[-1:] == [clause[0]["block_id"]] and list(target)[:len(tail) + 1] ==
-             [row["block_id"] for row in [*tail, later]] and clause[0]["block_id"] in adjacent and
-             _same_members([prior_owned[clause[0]["block_id"]], adjacent[clause[0]["block_id"]]],
-                           [_located_member(clause[0])] * 2) and
+    previous_members = [row for row in clause if row["page"] == clause[0]["page"]] if seam else clause[:1]
+    tail = clause[len(previous_members):]
+    trailer = []
+    if seam:
+        footer = seam["footer"]
+        footer_id = footer["block_id"]
+        _require(blocks[footer_id]["ordinal"] == previous_members[-1]["ordinal"] + 1 and
+                 footer in previous["safe_skip_blocks"] and footer in window["safe_skip_blocks"] and
+                 previous_members[-1]["block_id"] == seam["last_predecessor_member"]["block_id"] and
+                 tail[0]["block_id"] == seam["first_target_member"]["block_id"])
+        trailer = [footer_id]
+    prior_ids = [row["block_id"] for row in previous_members]
+    _require(list(prior_owned)[-(len(prior_ids) + len(trailer)):] == [*prior_ids, *trailer] and
+             list(target)[:len(tail) + 1] == [row["block_id"] for row in [*tail, later]] and
+             _same_members([prior_owned[key] for key in prior_ids], [_located_member(row) for row in previous_members]) and
+             _same_members([adjacent[key] for key in prior_ids], [_located_member(row) for row in previous_members]) and
              _same_members([target[row["block_id"]] for row in [*tail, later]], [_located_member(row) for row in [*tail, later]]))
     prior_adjacent = {row["block_id"]: row for row in previous["adjacent_context"]}
     _require(_same_members([prior_adjacent[row["block_id"]] for row in tail], [_located_member(row) for row in tail]))
@@ -139,14 +202,19 @@ def _source_proof(lines, pages, annex_lines, annex_page, scope, blocks, previous
                  [row["block_id"] for row in following["blocks"][:len(deferred)]] == scope["deferred_block_ids"] and
                  _same_members(following["blocks"][:len(deferred)], [_located_member(row) for row in deferred]) and
                  _same_members([adjacent[row["block_id"]] for row in deferred], [_located_member(row) for row in deferred]))
-    return {
+    proof = {
         "annex_heading": _located_member(annex), "annex_page": annex_page, "section_heading": _located_member(section),
-        "preceding_sibling": [_located_member(row) for row in earlier], "following_sibling": _located_member(later),
+        "preceding_sibling": [_located_member(row) for row in earlier],
         "clause_number": number, "clause_members": [_located_member(row) for row in clause],
         "quote_sha256": hashlib.sha256(quote.encode()).hexdigest(),
         "following_context": [{"owner_window_id": following["window_id"], "member": _located_member(row),
                                "status": "deferred_to_owning_window"} for row in deferred],
     }
+    if seam:
+        proof.update(following_section=_located_member(later), page_seam=seam)
+    else:
+        proof["following_sibling"] = _located_member(later)
+    return proof
 
 
 def bind_contract_annex_predecessor(windows, documents, blocks, footer_skips, manifest, config):
@@ -204,9 +272,11 @@ def verify_contract_annex_predecessor(predecessor_result, proof):
         quote = "\n".join(row["text"] for row in members)
         citation = requirement["citation"]
         expected = {key: first[key] for key in ("source_id", "unit_id", "locator", "block_id", "page")}
+        seam = proof.get("page_seam")
         expected.update(block_ids=block_ids, end_locator=last["locator"], start=0, end=len(quote), quote=quote,
-                        quote_sha256=proof["quote_sha256"], pages=[first["page"]], basis="consecutive_blocks_lf_v1",
-                        skipped_block_ids=[], clause_id=None, table_row_id=None, label_grounding=[])
+                        quote_sha256=proof["quote_sha256"], pages=list(dict.fromkeys(row["page"] for row in members)),
+                        basis="consecutive_blocks_lf_v1", skipped_block_ids=[seam["footer"]["block_id"]] if seam else [],
+                        clause_id=None, table_row_id=None, label_grounding=[])
         _require(model["citation"] == {"block_ids": block_ids} and citation == expected and
                  digest(requirement) == prior["requirement_sha256"] and
                  {key: value for key, value in requirement.items() if key != "citation"} ==
@@ -233,7 +303,9 @@ def resolve_contract_annex_predecessor(raw, normalized, window, critical, predec
              all(proof[key] == window[key] for key in ("window_id", "source_id", "source_sha256")) and
              digest({key: value for key, value in proof.items() if key != "proof_sha256"}) == proof["proof_sha256"])
     members = proof["clause_members"]
-    tail = members[1:]
+    seam = proof.get("page_seam")
+    previous_members = [row for row in members if row["page"] == members[0]["page"]] if seam else members[:1]
+    tail = members[len(previous_members):]
     target_ids = [row["block_id"] for row in tail]
     context = proof["following_context"]
     future_ids = [row["member"]["block_id"] for row in context]
@@ -242,12 +314,13 @@ def resolve_contract_annex_predecessor(raw, normalized, window, critical, predec
     _require(critical == target_ids and normalized["unresolved_block_ids"] == [*target_ids, *future_ids] and
              future_ids == scope["deferred_block_ids"] and
              _same_members([targets[key] for key in target_ids], tail) and
-             _same_members([adjacent[members[0]["block_id"]], *(adjacent[key] for key in future_ids)],
-                           [members[0], *(row["member"] for row in context)]))
+             _same_members([*(adjacent[row["block_id"]] for row in previous_members), *(adjacent[key] for key in future_ids)],
+                           [*previous_members, *(row["member"] for row in context)]))
     selected = {key for row in [*normalized["requirements"], *normalized["format_chapters"]] for key in _candidate_ids(row)}
     selected.update(key for row in normalized["format_chapters"] for key in row["content_block_ids"])
-    _require(not selected.intersection({members[0]["block_id"], *target_ids, *future_ids}) and
-             any(_candidate_ids(row)[0] == proof["following_sibling"]["block_id"] for row in normalized["requirements"]))
+    following = proof["following_section"] if seam else proof["following_sibling"]
+    _require(not selected.intersection({*(row["block_id"] for row in previous_members), *target_ids, *future_ids}) and
+             any(_candidate_ids(row)[0] == following["block_id"] for row in normalized["requirements"]))
     verify_contract_annex_predecessor(predecessor_result, proof)
     return {"rule": RULE, "window_id": window["window_id"], "raw_candidate_sha256": digest(raw), "proof": proof,
             "resolved_block_ids": target_ids, "deferred_to_following_window": context,
