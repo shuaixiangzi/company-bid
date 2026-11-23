@@ -19,6 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from .contract_annex_sources import (
     CONTRACT_ANNEX_SOURCE_CONFIG_KEY, build_contract_annex_proof, contract_annex_pages, normalize_contract_annex_config,
 )
+from .contract_attachment_citation_split import (
+    RESOLUTION_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY,
+    SOURCE_CONFIG_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY,
+    bind_contract_attachment_citation_split, normalize_contract_attachment_citation_split_config,
+    split_contract_attachment_selection,
+)
 from .contract_acceptance_sources import (
     CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, SOURCE_ERROR as CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_ERROR,
     build_contract_insurance_acceptance_proof, normalize_contract_insurance_acceptance_config,
@@ -407,7 +414,8 @@ def _model_window(window: dict) -> dict:
                                          RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
                                          CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
                                          CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY,
-                                         CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY}})
+                                         CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
+                                         CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
             _model_source_block(block)
@@ -627,6 +635,12 @@ def extraction_window_config(config: dict) -> dict:
             frozen[key] = normalize_heading_only_annex_config(config[key])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_contract_attachment_citation_split_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     return frozen
 
 
@@ -819,6 +833,13 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
         try:
             bind_heading_only_annex(windows, documents, indexes, blocks, footer_skips, manifest,
                                     config[CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
+    if CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY in config:
+        try:
+            review = config[CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY]
+            for scope in review if isinstance(review, list) else [review]:
+                bind_contract_attachment_citation_split(windows, documents, blocks, manifest, scope)
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
     return windows, ledger
@@ -1801,7 +1822,8 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
     # does not change which raw blocks were available to the original caller.
     selector_window = {key: value for key, value in window.items()
                        if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
-                                      CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY}}
+                                      CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
+                                      CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
               "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
               "context_identity": copy.deepcopy(window.get("context_identity")), "selections": []}
@@ -2481,6 +2503,25 @@ def _contract_heading_only_annex_resolution(raw, window):
     return resolve_heading_only_annex(raw, data, window, critical)
 
 
+def _verified_contract_attachment_citation_split(raw, window, data=None):
+    if CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY not in window:
+        return None
+    if data is None:
+        normalized, _ = _normalize_source_selectors(raw, window)
+        data = _validate_response_schema(normalized, _LiveWindowResponse)
+    try:
+        resolution = split_contract_attachment_selection(raw, data, window)
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    _, available, safe_skips, clause_catalog, table_continuations, table_rows = _window_source_catalogs(window)
+    for role in ("context", "operative"):
+        selector = resolution[role + "_selector"]
+        citation = _citation({**selector, "quote": None, "clause_id": None, "table_row_id": None}, available,
+                             safe_skips, clause_catalog, table_continuations, table_rows)
+        resolution[role + "_citation"] = citation
+    return resolution
+
+
 def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2541,6 +2582,9 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
         internal["requirements"][review_cover["requirement_index"]]["format_title"] = review_cover["title"]
         internal["format_chapters"][review_cover["format_index"]].update(
             title=review_cover["title"], citation=copy.deepcopy(review_cover["title_citation"]))
+    citation_split = _verified_contract_attachment_citation_split(raw, window, data)
+    if citation_split is not None:
+        internal["requirements"][citation_split["candidate_index"]]["citation"] = citation_split["operative_selector"]
     for requirement in internal["requirements"]:
         if requirement["response_mode"] != "writing":
             requirement["reference_keywords"] = []
@@ -2637,6 +2681,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_KEY
     _fail((key in result) != (heading_only_annex is not None) or result.get(key) != heading_only_annex,
           "EXTRACTION_CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_MISMATCH")
+    citation_split = _verified_contract_attachment_citation_split(raw, window)
+    key = CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY
+    _fail((key in result) != (citation_split is not None) or result.get(key) != citation_split,
+          "EXTRACTION_CONTRACT_ATTACHMENT_CITATION_SPLIT_MISMATCH")
     projection = _response_review_table_merge_projection(validated, window, review_table)
     _fail((_RESPONSE_REVIEW_MERGE_PROJECTION in result) != (projection is not None) or
           result.get(_RESPONSE_REVIEW_MERGE_PROJECTION) != projection, "EXTRACTION_RESPONSE_REVIEW_TABLE_PROJECTION_MISMATCH")
@@ -2836,7 +2884,8 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                                    RESPONSE_COVER_CONFIG_KEY, RESPONSE_REVIEW_TABLE_CONFIG_KEY, RESPONSE_LETTER_CONFIG_KEY,
                                    RESPONSE_CELL_REFLOW_CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY,
                                    CONTRACT_ANNEX_SOURCE_CONFIG_KEY, CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY,
-                                   CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY}}
+                                   CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY,
+                                   CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -2967,6 +3016,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if heading_only_annex is not None:
             supplement[CONTRACT_HEADING_ONLY_ANNEX_RESOLUTION_KEY] = heading_only_annex
             _capture(ctx, "n2-contract-heading-only-annex-source-resolution", heading_only_annex)
+        citation_split = _verified_contract_attachment_citation_split(raw_model_candidate, window)
+        if citation_split is not None:
+            supplement[CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY] = citation_split
+            _capture(ctx, "n2-contract-attachment-citation-split", citation_split)
         inactive_hints = _inactive_reference_hints(raw_model_candidate or {})
         if inactive_hints["ignored_fields"]:
             _capture(ctx, "n2-inactive-reference-hints", {"window_id": window["window_id"], **inactive_hints})
@@ -3280,7 +3333,8 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
             candidates = [*candidates, *(item["requirement"] for item in boundary["items"] if "requirement" in item)]
         annex_owner = annex_owners.get(result["window_id"])
         acceptance_owner = acceptance_successors.get(result["window_id"])
-        for candidate in candidates:
+        citation_split = result.get(CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY)
+        for candidate_index, candidate in enumerate(candidates):
             if acceptance_owner is not None and _same_contract_acceptance_scope(candidate, acceptance_owner):
                 if result["window_id"] not in acceptance_owner["window_ids"]:
                     acceptance_owner["window_ids"].append(result["window_id"])
@@ -3305,6 +3359,11 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
                          else requirement.setdefault("equivalent_annex_citations", []))
             if candidate["citation"] not in citations:
                 citations.append(candidate["citation"])
+            if citation_split is not None and candidate_index == citation_split["candidate_index"]:
+                context = citation_split["context_citation"]
+                scope = requirement.setdefault("contract_scope_citations", [])
+                if context not in scope:
+                    scope.append(context)
             if result["window_id"] not in requirement["window_ids"]:
                 requirement["window_ids"].append(result["window_id"])
             local_ids.append(requirement["requirement_id"])

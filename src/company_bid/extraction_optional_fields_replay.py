@@ -147,7 +147,7 @@ class FailedContractHeadingOnlyAnnexReplay(FailedContractOptionalFieldsReplay):
 
     @staticmethod
     def successor_gate(replay):
-        return None
+        return getattr(replay, "_failed_window_lineage", None)
 
     def actual_units(self, replay):
         order = tuple(replay.windows)

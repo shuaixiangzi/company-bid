@@ -28,6 +28,7 @@ from .contract_clause_packing import POLICY_KEY, WHOLE_CLAUSES
 from .extraction_illustrations import CONFIG_KEY, ILLUSTRATION_SOURCE_CONFIG_KEY
 from .extraction_numbered_clause_replay import FailedNumberedContractClauseReplay
 from .extraction_optional_fields_replay import FailedContractHeadingOnlyAnnexReplay, FailedContractOptionalFieldsReplay
+from .extraction_window_lineage import CONFIG_KEY as FAILED_WINDOW_LINEAGE, FailedWindowLineage
 from .provider import ProviderFailure
 from .storage import digest
 
@@ -81,6 +82,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
     _failed_numbered_contract_clause = None
     _failed_contract_optional_fields = None
     _failed_contract_heading_only_annex = None
+    _failed_window_lineage = None
 
     def preflight(self, ctx, value):
         self._ready = None
@@ -99,6 +101,7 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         self._failed_numbered_contract_clause = None
         self._failed_contract_optional_fields = None
         self._failed_contract_heading_only_annex = None
+        self._failed_window_lineage = None
         self._target_extraction = ctx.execution_config.get("extraction", {})
         if FAILED_CELL_WRAP_REPLAY in self._target_extraction:
             self._failed_cell_wrap = self._failed_cell_wrap_options(ctx.execution_config)
@@ -157,6 +160,8 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
                  FailedContractHeadingOnlyAnnexReplay.config_error)
         if FAILED_CONTRACT_HEADING_ONLY_ANNEX_REPLAY in self._target_extraction:
             self._failed_contract_heading_only_annex = FailedContractHeadingOnlyAnnexReplay(self, ctx)
+        if FAILED_WINDOW_LINEAGE in self._target_extraction:
+            self._failed_window_lineage = FailedWindowLineage(self, ctx)
         with _scope(self._target_extraction.get(CONFIG_KEY), value["manifest"], self._target_extraction.get(POLICY_KEY)):
             return super().preflight(ctx, value)
 
@@ -191,6 +196,12 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return copy.deepcopy(options)
 
     def _read_entry(self, binding, task, full_window):
+        if self._failed_window_lineage is not None:
+            return self._failed_window_lineage.read_entry(self, binding, task, full_window,
+                                                          self._read_legacy_entry)
+        return self._read_legacy_entry(binding, task, full_window)
+
+    def _read_legacy_entry(self, binding, task, full_window):
         heading_only_annex = self._failed_contract_heading_only_annex
         if heading_only_annex is None:
             return self._read_before_heading_only_annex(binding, task, full_window)
@@ -403,7 +414,9 @@ class ExtractionDiagnosticReplay(DiagnosticReplay):
         return entry
 
     def candidate(self, ctx, task_type, unit_id, request, validate):
-        if self._failed_contract_heading_only_annex is not None:
+        if self._failed_window_lineage is not None:
+            self._failed_window_lineage.allow_candidate(self, ctx, task_type, unit_id)
+        elif self._failed_contract_heading_only_annex is not None:
             self._failed_contract_heading_only_annex.allow_candidate(self, ctx, task_type, unit_id)
         elif self._failed_contract_optional_fields is not None:
             self._failed_contract_optional_fields.allow_candidate(self, ctx, task_type, unit_id)

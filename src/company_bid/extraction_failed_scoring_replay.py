@@ -58,6 +58,7 @@ class FailedScoringReplay:
     def __init__(self, replay, config):
         from .extraction import PRICE_SCORING_CONFIG_KEY
         from .extraction_replay_scope import FAILED_CELL_WRAP_REPLAY
+        from .extraction_window_lineage import lineage_extraction_keys
 
         extraction = config["extraction"]
         options = extraction[FAILED_SCORING_REPLAY]
@@ -87,7 +88,8 @@ class FailedScoringReplay:
                                                  *_CONTRACT_INTERESTED_PARTIES_KEYS,
                                                  *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
                                                  FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
-                                                 FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, *_HEADING_ONLY_ANNEX_KEYS}}
+                                                 FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, *_HEADING_ONLY_ANNEX_KEYS,
+                                                 *lineage_extraction_keys()}}
         _require(FAILED_CELL_WRAP_REPLAY in self.source_extraction, _CONFIG)
         self.prefix = ()
         self.run = None
@@ -126,6 +128,8 @@ class FailedScoringReplay:
             expected_bindings.update(_TASK + unit for unit in optional_fields.actual_units(replay))
         if heading_only_annex := getattr(replay, "_failed_contract_heading_only_annex", None):
             expected_bindings.update(_TASK + unit for unit in heading_only_annex.actual_units(replay))
+        if lineage := getattr(replay, "_failed_window_lineage", None):
+            expected_bindings.update(_TASK + unit for unit in lineage.actual_units(replay))
         _require(prefix[0] == self.first_id and len(prefix) >= 2 and set(bindings) == expected_bindings and
                  all(replay.windows[unit]["blocks"] for unit in prefix), _CONFIG)
         run = replay._run(self.source_binding["alias"], self.source_binding["run_id"])
@@ -276,6 +280,8 @@ class FailedScoringRowsReplay:
         self.checkpoints_verified = False
 
     def verify_history(self, replay):
+        from .extraction_window_lineage import lineage_extraction_keys
+
         if self.run is not None:
             return
         self.predecessor.verify_history(replay)
@@ -297,7 +303,8 @@ class FailedScoringRowsReplay:
                                             *_CONTRACT_INTERESTED_PARTIES_KEYS,
                                             *_CONTRACT_INSURANCE_ACCEPTANCE_KEYS,
                                             FAILED_NUMBERED_CONTRACT_CLAUSE_REPLAY,
-                                            FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, *_HEADING_ONLY_ANNEX_KEYS}}
+                                            FAILED_CONTRACT_OPTIONAL_FIELDS_REPLAY, *_HEADING_ONLY_ANNEX_KEYS,
+                                            *lineage_extraction_keys()}}
         source_bindings = {_TASK + unit: bindings[_TASK + unit] for unit in self.predecessor.prefix}
         source_replay = {**replay.config, "bindings": source_bindings}
         _require(run.state.get("config_hash") == digest(historical) and
@@ -428,6 +435,9 @@ class _StoppedResponseReplay:
     def successor_gate(replay):
         return None
 
+    def added_extraction_keys(self):
+        return {self.replay_key, self.proof_key}
+
     def verify_history(self, replay):
         if self.run is not None:
             return
@@ -441,7 +451,7 @@ class _StoppedResponseReplay:
         later = successor
         while later is not None:
             declared += later.actual_units(replay)
-            later_keys.update((later.replay_key, later.proof_key))
+            later_keys.update(later.added_extraction_keys())
             later = later.successor_gate(replay)
         _require(prefix == tuple(replay.windows)[:len(prefix)] and set(bindings) == {_TASK + unit for unit in declared} and
                  all(bindings[_TASK + unit] == {**self.source_binding, "unit_id": unit} for unit in actual), self.config_error)

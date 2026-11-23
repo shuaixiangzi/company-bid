@@ -117,14 +117,14 @@ class FailedNumberedContractClauseReplay(_StoppedResponseReplay):
                               terminal_result_hash=self.offline_proof["result_sha256"])
 
 
-def rebuild_frozen_contract_windows(replay, invalid):
+def rebuild_frozen_contract_windows(replay, invalid, *, extraction=None):
     from .extraction import (
         _index, _windows, build_contract_clause_indexes, extraction_window_config, extraction_window_payload,
     )
 
     value = replay.current
     blocks, _, documents = _index(value["parsed"], value["manifest"])
-    window_config = extraction_window_config(replay._target_extraction)
+    window_config = extraction_window_config(replay._target_extraction if extraction is None else extraction)
     indexes = build_contract_clause_indexes(documents, blocks)
     windows, _ = _windows(documents, blocks, window_config, manifest=value["manifest"],
                           contract_clause_indexes=indexes)
