@@ -10,6 +10,7 @@ from .contract_annex_intro import SOURCE_CONFIG_KEY as ANNEX_INTRO_SOURCE_KEY
 from .contract_annex_list import SOURCE_CONFIG_KEY as ANNEX_LIST_SOURCE_KEY
 from .contract_attachment_citation_split import SOURCE_CONFIG_KEY
 from .contract_operative_line import SOURCE_CONFIG_KEY as OPERATIVE_LINE_SOURCE_KEY
+from .contract_performance_record import SOURCE_CONFIG_KEY as PERFORMANCE_RECORD_SOURCE_KEY
 from .diagnostic_replay import _id, _one, _require
 from .extraction_failed_scoring_replay import (
     _allow_cold_candidate, _read_failed_call, _verify_replayed_checkpoint, _TASK,
@@ -26,7 +27,7 @@ PROOF_MISMATCH = "FAILED_WINDOW_LINEAGE_PROOF_MISMATCH"
 # These settings are validator inputs only. They cannot change the frozen
 # window order, source manifest, model prompt, or request body.
 _REVIEW_KEYS = (SOURCE_CONFIG_KEY, ANNEX_INTRO_SOURCE_KEY, NATIVE_LABEL_WRAP_SOURCE_KEY, ANNEX_LIST_SOURCE_KEY,
-                OPERATIVE_LINE_SOURCE_KEY)
+                OPERATIVE_LINE_SOURCE_KEY, PERFORMANCE_RECORD_SOURCE_KEY)
 
 
 def lineage_extraction_keys():

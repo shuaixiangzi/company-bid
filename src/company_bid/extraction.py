@@ -39,6 +39,13 @@ from .contract_operative_line import (
     SOURCE_ERROR as CONTRACT_OPERATIVE_LINE_SOURCE_ERROR,
     bind_contract_operative_line, normalize_contract_operative_line_config, resolve_contract_operative_line,
 )
+from .contract_performance_record import (
+    RESOLUTION_KEY as CONTRACT_PERFORMANCE_RECORD_RESOLUTION_KEY,
+    SOURCE_CONFIG_KEY as CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY,
+    SOURCE_ERROR as CONTRACT_PERFORMANCE_RECORD_SOURCE_ERROR,
+    bind_contract_performance_record, normalize_contract_performance_record_config, project_contract_performance_record,
+)
 from .contract_attachment_citation_split import (
     RESOLUTION_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY,
     SOURCE_CONFIG_KEY as CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY,
@@ -443,6 +450,7 @@ def _model_window(window: dict) -> dict:
                                          CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                          CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
                                          CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
+                                         CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY,
                                          NATIVE_REVIEWED_LABEL_WRAP_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
@@ -687,6 +695,12 @@ def extraction_window_config(config: dict) -> dict:
             frozen[key] = normalize_contract_operative_line_config(config[key])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_contract_performance_record_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     key = NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY
     if key in config:
         try:
@@ -913,6 +927,13 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
             review = config[CONTRACT_OPERATIVE_LINE_CONFIG_KEY]
             for scope in review if isinstance(review, list) else [review]:
                 bind_contract_operative_line(windows, documents, blocks, footer_skips, manifest, scope)
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
+    if CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY in config:
+        try:
+            review = config[CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY]
+            for scope in review if isinstance(review, list) else [review]:
+                bind_contract_performance_record(windows, documents, blocks, footer_skips, manifest, scope)
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
     if NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY in config:
@@ -1932,7 +1953,8 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
                        if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
                                       CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                       CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
-                                      CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY}}
+                                      CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
+                                      CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
               "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
               "context_identity": copy.deepcopy(window.get("context_identity")), "selections": []}
@@ -2766,6 +2788,29 @@ def _verified_reviewed_label_wrap(raw, window, data=None):
         raise PlanningError("NATIVE_REVIEWED_LABEL_WRAP_SOURCE_MISMATCH") from None
 
 
+def _contract_performance_record_resolution(raw, window, *, validated=None):
+    if CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY not in window:
+        return None
+    try:
+        proof = window[CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY]
+        index = proof["scope"]["candidate_index"]
+        if validated is None:
+            normalized, _ = _normalize_source_selectors(raw, window)
+            data = _validate_response_schema(normalized, _LiveWindowResponse)
+            candidate = data["requirements"][index]
+            _, available, safe_skips, clauses, tables, rows = _window_source_catalogs(window)
+            citation = _citation(candidate["citation"], available, safe_skips, clauses, tables, rows)
+            original = {**candidate, "citation": citation}
+            citation["label_grounding"] = _label_grounding(original, available, window)
+        else:
+            original = validated["requirements"][index]
+        return project_contract_performance_record(raw, original, window)
+    except (ValueError, KeyError, TypeError, IndexError) as error:
+        if isinstance(error, PlanningError):
+            raise
+        raise PlanningError(CONTRACT_PERFORMANCE_RECORD_SOURCE_ERROR) from None
+
+
 def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2847,6 +2892,7 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
                                  response_review_table=review_table, response_letter=letter,
                                  response_cell_reflow=cell_reflow, reviewed_label_wrap=label_wrap, reviewed_operative=operative)
     _response_review_table_merge_projection(validated, window, review_table)
+    _contract_performance_record_resolution(raw, window, validated=validated)
     if continuation is not None:
         proof = continuation["proof"]
         ids = set(proof["predecessor"]["block_ids"])
@@ -2951,6 +2997,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY
     _fail((key in result) != (operative is not None) or result.get(key) != operative,
           "EXTRACTION_CONTRACT_OPERATIVE_LINE_MISMATCH")
+    performance_record = _contract_performance_record_resolution(raw, window, validated=validated)
+    key = CONTRACT_PERFORMANCE_RECORD_RESOLUTION_KEY
+    _fail((key in result) != (performance_record is not None) or result.get(key) != performance_record,
+          "EXTRACTION_CONTRACT_PERFORMANCE_RECORD_MISMATCH")
     label_wrap = _verified_reviewed_label_wrap(raw, window)
     key = NATIVE_REVIEWED_LABEL_WRAP_RESOLUTION_KEY
     _fail((key in result) != (label_wrap is not None) or result.get(key) != label_wrap,
@@ -3166,7 +3216,7 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                                    CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY,
                                    CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY, CONTRACT_ANNEX_INTRO_CONFIG_KEY,
                                    NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY, CONTRACT_ANNEX_LIST_CONFIG_KEY,
-                                   CONTRACT_OPERATIVE_LINE_CONFIG_KEY}}
+                                   CONTRACT_OPERATIVE_LINE_CONFIG_KEY, CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -3316,6 +3366,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if operative is not None:
             supplement[CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY] = operative
             _capture(ctx, "n2-contract-operative-line-source-resolution", operative)
+        performance_record = _contract_performance_record_resolution(raw_model_candidate, window, validated=validated)
+        if performance_record is not None:
+            supplement[CONTRACT_PERFORMANCE_RECORD_RESOLUTION_KEY] = performance_record
+            _capture(ctx, "n2-contract-performance-record-source-resolution", performance_record)
         if label_wrap is not None:
             supplement[NATIVE_REVIEWED_LABEL_WRAP_RESOLUTION_KEY] = label_wrap
             _capture(ctx, "n2-native-reviewed-label-wrap", label_wrap)
@@ -3647,6 +3701,12 @@ def _merge_results(results: list, *, contract_indexes=()) -> tuple[list, list]:
                       "EXTRACTION_CONTRACT_OPERATIVE_LINE_PROJECTION_MISMATCH")
                 candidates = list(candidates)
                 candidates[index] = projection["requirement"]
+        if record := result.get(CONTRACT_PERFORMANCE_RECORD_RESOLUTION_KEY):
+            index = record["candidate_index"]
+            _fail(_hash(candidates[index]) != record["original_requirement_sha256"],
+                  "EXTRACTION_CONTRACT_PERFORMANCE_RECORD_PROJECTION_MISMATCH")
+            candidates = list(candidates)
+            candidates[index] = record["requirement"]
         annex_owner = annex_owners.get(result["window_id"])
         acceptance_owner = acceptance_successors.get(result["window_id"])
         citation_split = result.get(CONTRACT_ATTACHMENT_CITATION_SPLIT_RESOLUTION_KEY)

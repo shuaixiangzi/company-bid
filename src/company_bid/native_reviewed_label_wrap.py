@@ -23,6 +23,7 @@ SOURCE_ERROR = "NATIVE_REVIEWED_LABEL_WRAP_SOURCE_MISMATCH"
 RULE = "reviewed_native_mixed_font_label_wrap_v1"
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 _NUMBERED = re.compile(r"^\s*(?:[0-9]+(?:[.．][0-9]+)*[.．、）)]?|第[一二三四五六七八九十百0-9]+[章节条款])\s*")
+_LIST_ITEM = re.compile(r"(?:（([1-9]\d{0,2})）|\(([1-9]\d{0,2})\))(?=\s*\S)")
 _TERMINATORS = ("。", "！", "？", "；", ".", "!", "?", ";")
 
 
@@ -39,13 +40,14 @@ class _WrapScope(BaseModel):
     candidate_index: int = Field(ge=0)
     field: Literal["reference_keywords"]
     label_index: int = Field(ge=0)
+    list_item_number: int | None = Field(default=None, ge=2, le=999)
 
 
 def normalize_reviewed_label_wrap_config(value):
     try:
         if not isinstance(value, list):
-            return _WrapScope.model_validate(value).model_dump()
-        scopes = [_WrapScope.model_validate(scope).model_dump() for scope in value]
+            return _WrapScope.model_validate(value).model_dump(exclude_none=True)
+        scopes = [_WrapScope.model_validate(scope).model_dump(exclude_none=True) for scope in value]
     except ValidationError:
         raise ValueError("NATIVE_REVIEWED_LABEL_WRAP_CONFIG_INVALID") from None
     if not scopes or len({scope["window_id"] for scope in scopes}) != len(scopes):
@@ -124,6 +126,50 @@ def _prove_boundary(lines, native, left_index):
             "left_mixed_latin_glyphs": [_glyph(char) for char in mixed_latin]}
 
 
+def _prove_numbered_item_boundary(lines, native, left_index, number):
+    # The label crosses only the opening line and its unnumbered, final
+    # continuation. Consecutive siblings bracket the reviewed list item.
+    previous, left, right, following = native[left_index - 1:left_index + 3]
+    left_marker = _LIST_ITEM.match(left["text"])
+    next_marker = _LIST_ITEM.match(following["text"])
+    before = next((block for block in reversed(native[max(0, left_index - 12):left_index])
+                   if _LIST_ITEM.match(block["text"]) or _NUMBERED.match(block["text"])), None)
+    prior_marker = _LIST_ITEM.match(before["text"]) if before else None
+    _require(left_marker and prior_marker and next_marker and
+             tuple(int(marker[1] or marker[2]) for marker in (prior_marker, left_marker, next_marker)) ==
+             (number - 1, number, number + 1) and
+             len({marker[1] is not None for marker in (prior_marker, left_marker, next_marker)}) == 1 and
+             previous["text"].endswith(_TERMINATORS) and not left["text"].endswith(_TERMINATORS) and
+             right["text"].endswith(_TERMINATORS) and not _LIST_ITEM.match(right["text"]) and
+             not _NUMBERED.match(right["text"]))
+    prior_chars, left_chars, right_chars = [_visible(lines[i][3]) for i in range(left_index - 1, left_index + 2)]
+    tail, head = _boundary_glyphs(left_chars, tail=True), _boundary_glyphs(right_chars, tail=False)
+    last, first = tail[-1], head[0]
+    size = last["size"]
+    baseline = last["matrix"][5]
+    spacing = baseline - first["matrix"][5]
+    marker = left_chars[:len(left_marker[0])]
+    digits = marker[1:-1]
+    _require("".join(char["text"] for char in marker) == left_marker[0] and
+             all(horizontal_matrix(char) is not None and abs(char["matrix"][5] - baseline) <= .15 for char in marker) and
+             all(char["fontname"] != last["fontname"] and abs(char["size"] - size) < .05 and
+                 char["bottom"] > last["bottom"] + .5 * size for char in digits) and
+             last["fontname"] == first["fontname"] and abs(first["size"] - size) < .05 and
+             size <= spacing <= 2.5 * size and horizontal_matrix(prior_chars[-1]) is not None and
+             abs((prior_chars[-1]["matrix"][5] - baseline) - spacing) <= .1 * size and
+             1.5 * size <= left["bbox"][0] - right["bbox"][0] <= 3 * size and
+             all(abs(left["bbox"][0] - sibling["bbox"][0]) <= .15 * size for sibling in (before, following)) and
+             abs(last["x1"] - following["bbox"][2]) <= size and last["x1"] - right["bbox"][0] >= 10 * size and
+             abs(last["x1"] - left["bbox"][2]) <= .05 * size and abs(first["x0"] - right["bbox"][0]) <= .05 * size and
+             right["bbox"][2] < last["x1"] - size)
+    left_text, right_text = ("".join(char["text"] for char in glyphs) for glyphs in (tail, head))
+    _require(left["text"].endswith(left_text) and right["text"].startswith(right_text))
+    return {"paragraph_start": _member(left), "previous_sibling": _member(before),
+            "previous_sibling_end": _member(previous), "following_boundary": _member(following), "list_item_number": number,
+            "left_cjk_glyphs": [_glyph(char) for char in tail], "right_cjk_glyphs": [_glyph(char) for char in head],
+            "left_item_marker_glyphs": [_glyph(char) for char in marker]}
+
+
 def bind_reviewed_label_wrap(windows, documents, blocks, manifest, config):
     """Reread the exact native page and its raster for a single frozen candidate."""
     try:
@@ -147,7 +193,10 @@ def bind_reviewed_label_wrap(windows, documents, blocks, manifest, config):
             lines = list(pdf_page_text_lines(pdf.pages[page - 1], ()))
             _require([(i, text, bbox) for i, text, bbox, _, _ in lines] ==
                      [(i, block["text"], block["bbox"]) for i, block in enumerate(native)])
-            boundary = _prove_boundary(lines, native, left_index)
+            if number := config.get("list_item_number"):
+                boundary = _prove_numbered_item_boundary(lines, native, left_index, number)
+            else:
+                boundary = _prove_boundary(lines, native, left_index)
         proof = {"rule": RULE, "scope": config, "native_coverage_sha256": coverage_hash,
                  "left": _member(left), "right": _member(right), "boundary": boundary}
         window[WINDOW_CONTEXT_KEY] = proof | {"proof_sha256": digest(proof)}
@@ -180,6 +229,8 @@ def resolve_reviewed_label_wrap(raw, requirement, window, citation):
              proof["boundary"]["paragraph_start"]["block_id"] in selected and
              citation["basis"] == "consecutive_blocks_lf_v1" and index < len(requirement[field]) and
              proof["rule"] == RULE and digest({key: value for key, value in proof.items() if key != "proof_sha256"}) == proof["proof_sha256"])
+    if number := scope.get("list_item_number"):
+        _require(selected == [left_id, right_id] and proof["boundary"].get("list_item_number") == number)
     label = requirement[field][index]
     quote = citation["quote"]
     blocks = {block["block_id"]: block for block in window["blocks"]}

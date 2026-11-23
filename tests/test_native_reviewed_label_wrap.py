@@ -108,3 +108,57 @@ def test_scope_accepts_two_distinct_reviewed_windows_with_exact_reference_use(re
         wrap.normalize_reviewed_label_wrap_config([scope, copy.deepcopy(scope)])
     with pytest.raises(ValueError, match="CONFIG_INVALID"):
         wrap.normalize_reviewed_label_wrap_config({**scope, "field": "attachment_keywords"})
+
+
+@pytest.fixture
+def numbered_item():
+    left = "（5）组织事故演练并建立应急救援资源及应急"
+    following = "（6）" + "继续执行适用的工程质量要求和管理程序"[:len(left) - 3]
+    lines, native = map(list, zip(_line(0, "（4）完整列明风险控制事项。", 114, 200), _line(1, left, 114, 177),
+                                 _line(2, "救援体系，及时落实。", 90, 154), _line(3, following, 114, 131), strict=True))
+    return lines, native
+
+
+def test_numbered_item_glyph_proof_and_frozen_legacy_scope_can_coexist(reviewed, numbered_item):
+    *_, legacy = reviewed
+    lines, native = numbered_item
+    requirement = {"response_mode": "writing", "reference_keywords": ["应急救援体系"]}
+    raw = {"requirements": [requirement]}
+    scope = {**legacy, "window_id": "numbered-item", "raw_candidate_sha256": digest(raw), "list_item_number": 5}
+    assert wrap.normalize_reviewed_label_wrap_config([legacy, scope]) == [legacy, scope]
+    assert "list_item_number" not in wrap.normalize_reviewed_label_wrap_config(legacy)
+    boundary = wrap._prove_numbered_item_boundary(lines, native, 1, 5)
+    assert boundary["paragraph_start"]["block_id"] == "B1" and boundary["following_boundary"]["block_id"] == "B3"
+    proof = {"rule": wrap.RULE, "scope": scope, "native_coverage_sha256": "3" * 64,
+             "left": _member(native[1]), "right": _member(native[2]), "boundary": boundary}
+    window = {key: scope[key] for key in ("source_id", "source_sha256", "window_id")}
+    window["blocks"] = native
+    window[wrap.WINDOW_CONTEXT_KEY] = proof | {"proof_sha256": digest(proof)}
+    quote = "\n".join(block["text"] for block in native[1:3])
+    citation = {"source_id": "source", "quote": quote, "quote_sha256": digest(quote),
+                "block_ids": ["B1", "B2"], "basis": "consecutive_blocks_lf_v1"}
+    resolution = wrap.resolve_reviewed_label_wrap(raw, requirement, window, citation)
+    (a, b), (c, d) = resolution["grounding"]["matches"][0]["quote_spans"]
+    assert quote[a:b] + quote[c:d] == resolution["label"] == "应急救援体系"
+    citation["block_ids"] = ["B1", "B2", "B3"]
+    citation["quote"] += "\n" + native[3]["text"]
+    with pytest.raises(ValueError, match=wrap.SOURCE_ERROR):
+        wrap.resolve_reviewed_label_wrap(raw, requirement, window, citation)
+
+
+@pytest.mark.parametrize("fault", ["nonconsecutive_sibling", "wrong_ordinal", "new_item", "previous_open", "wrong_column"])
+def test_numbered_item_requires_same_parent_and_exact_wrap(numbered_item, fault):
+    lines, native = numbered_item
+    number = 5
+    if fault == "nonconsecutive_sibling":
+        lines[3], native[3] = _line(3, native[3]["text"].replace("（6）", "（7）"), 114, 131)
+    elif fault == "wrong_ordinal":
+        number = 6
+    elif fault == "new_item":
+        lines[2], native[2] = _line(2, "（6）救援体系，及时落实。", 90, 154)
+    elif fault == "previous_open":
+        lines[0], native[0] = _line(0, native[0]["text"][:-1], 114, 200)
+    else:
+        lines[2], native[2] = _line(2, native[2]["text"], 151, 154)
+    with pytest.raises(ValueError, match=wrap.SOURCE_ERROR):
+        wrap._prove_numbered_item_boundary(lines, native, 1, number)
