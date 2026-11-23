@@ -136,6 +136,32 @@ def test_original_candidate_and_new_checkpoint_require_exact_original_failure(st
         gate._read_failure(replay, stage, {})
 
 
+def test_old_recovery_is_verified_as_a_checkpoint_in_each_new_source(stopped_lineage, monkeypatch):
+    gate, replay = stopped_lineage.gate, stopped_lineage.replay
+    gate.verify_history(replay)
+    first, second = gate.stages
+    unit_id = first.proof["unit_id"]
+    expected_hash = first.proof["result_sha256"]
+    entry = {"candidate": {"window": unit_id}, "origin": {"lineage_notes": []}}
+    second.run.unit = lambda *_: (None, None, None, {"window_id": "W39"}, None)
+    monkeypatch.setattr(gate, "_read_failure", lambda *args: copy.deepcopy(entry))
+
+    def check_replayed(stage, _replay, unit, candidate, window, _error, *, predecessor_result):
+        assert stage.run is second.run and unit == window["window_id"] == unit_id
+        assert candidate == entry and predecessor_result["window_id"] == "W39"
+        candidate["origin"]["lineage_notes"].append({"copied_in": stage.run.run_id})
+        return expected_hash
+
+    monkeypatch.setattr(lineage, "_verify_replayed_checkpoint", check_replayed)
+    binding = replay.config["bindings"][lineage._TASK + unit_id]
+    read = gate.read_entry(replay, binding, {}, replay.windows[unit_id], pytest.fail)
+    assert read["origin"]["lineage_notes"] == [{"copied_in": second.run.run_id}]
+    assert gate.prior_checkpoint_hashes[unit_id] == expected_hash
+    expected_hash = "0" * 64
+    with pytest.raises(ProviderFailure, match="SOURCE_INVALID"):
+        gate.read_entry(replay, binding, {}, replay.windows[unit_id], pytest.fail)
+
+
 def test_cold_request_requires_completed_prefix_and_settled_first_call(stopped_lineage, monkeypatch):
     gate, replay, ctx = stopped_lineage.gate, stopped_lineage.replay, stopped_lineage.ctx
     gate.verify_history(replay)
