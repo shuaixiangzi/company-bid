@@ -41,7 +41,7 @@ def _version(*names: str) -> str:
                                       "contract_clause_resolution.py", "contract_clause_packing.py", "contract_optional_fields.py",
                                       "contract_heading_only_annex.py", "contract_attachment_citation_split.py", "contract_annex_intro.py",
                                       "native_reviewed_label_wrap.py", "contract_annex_list.py", "contract_operative_line.py",
-                                      "contract_performance_record.py"),
+                                      "contract_performance_record.py", "contract_annex_predecessor.py"),
                     "contract_annex_list.py": ("native_numbered_clause_spans.py",),
                     "contract_operative_line.py": ("contract_operative_line_scope.py",),
                     "extraction_replay_scope.py": ("extraction_failed_scoring_replay.py", "extraction_numbered_clause_replay.py",

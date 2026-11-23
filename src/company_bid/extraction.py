@@ -32,6 +32,13 @@ from .contract_annex_list import (
     SOURCE_ERROR as CONTRACT_ANNEX_LIST_SOURCE_ERROR,
     bind_contract_annex_list, normalize_contract_annex_list_config, resolve_contract_annex_list,
 )
+from .contract_annex_predecessor import (
+    RESOLUTION_KEY as CONTRACT_ANNEX_PREDECESSOR_RESOLUTION_KEY,
+    SOURCE_CONFIG_KEY as CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY,
+    WINDOW_CONTEXT_KEY as CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY,
+    SOURCE_ERROR as CONTRACT_ANNEX_PREDECESSOR_SOURCE_ERROR,
+    bind_contract_annex_predecessor, normalize_contract_annex_predecessor_config, resolve_contract_annex_predecessor,
+)
 from .contract_operative_line import (
     RESOLUTION_KEY as CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY,
     SOURCE_CONFIG_KEY as CONTRACT_OPERATIVE_LINE_CONFIG_KEY,
@@ -450,7 +457,7 @@ def _model_window(window: dict) -> dict:
                                          CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                          CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
                                          CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
-                                         CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY,
+                                         CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY, CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY,
                                          NATIVE_REVIEWED_LABEL_WRAP_CONTEXT_KEY}})
     for key in ("blocks", "adjacent_context"):
         for block in view.get(key, []):
@@ -689,6 +696,12 @@ def extraction_window_config(config: dict) -> dict:
             frozen[key] = normalize_contract_annex_list_config(config[key])
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
+    key = CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY
+    if key in config:
+        try:
+            frozen[key] = normalize_contract_annex_predecessor_config(config[key])
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
     key = CONTRACT_OPERATIVE_LINE_CONFIG_KEY
     if key in config:
         try:
@@ -920,6 +933,13 @@ def _windows(documents: list, blocks: dict, config: dict, *, manifest: dict | No
             review = config[CONTRACT_ANNEX_LIST_CONFIG_KEY]
             for scope in review if isinstance(review, list) else [review]:
                 bind_contract_annex_list(windows, documents, blocks, footer_skips, manifest, scope)
+        except ValueError as exc:
+            raise PlanningError(str(exc)) from None
+    if CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY in config:
+        try:
+            review = config[CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY]
+            for scope in review if isinstance(review, list) else [review]:
+                bind_contract_annex_predecessor(windows, documents, blocks, footer_skips, manifest, scope)
         except ValueError as exc:
             raise PlanningError(str(exc)) from None
     if CONTRACT_OPERATIVE_LINE_CONFIG_KEY in config:
@@ -1953,7 +1973,8 @@ def _normalize_source_selectors(raw: dict, window: dict) -> tuple[dict, dict]:
                        if key not in {CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_OPTIONAL_FIELDS_CONTEXT_KEY,
                                       CONTRACT_HEADING_ONLY_ANNEX_CONTEXT_KEY,
                                       CONTRACT_ATTACHMENT_CITATION_SPLIT_CONTEXT_KEY, CONTRACT_ANNEX_INTRO_CONTEXT_KEY,
-                                      CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
+                                      CONTRACT_ANNEX_LIST_CONTEXT_KEY, CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY,
+                                      CONTRACT_OPERATIVE_LINE_CONTEXT_KEY,
                                       CONTRACT_PERFORMANCE_RECORD_CONTEXT_KEY}}
     record = {"rule": "frozen_block_ids_to_canonical_coordinates_v1", "window_id": window["window_id"],
               "source_sha256": window.get("source_sha256"), "frozen_window_sha256": _hash(selector_window),
@@ -2602,7 +2623,8 @@ def verify_contract_insurance_acceptance_predecessor(predecessor_result: dict, p
 def _contract_boundary_resolution(raw, window, predecessor_result, *, data=None, critical=None):
     if not window.get(CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY) or any(key in window for key in (
             PRICE_SCORING_CONFIG_KEY, RESPONSE_COVER_CONFIG_KEY, CONTRACT_ANNEX_SOURCE_CONFIG_KEY,
-            CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY)):
+            CONTRACT_INTERESTED_PARTIES_SOURCE_CONFIG_KEY, CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY,
+            CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY)):
         return None
     if data is None:
         normalized, _ = _normalize_source_selectors(raw, window)
@@ -2811,6 +2833,24 @@ def _contract_performance_record_resolution(raw, window, *, validated=None):
         raise PlanningError(CONTRACT_PERFORMANCE_RECORD_SOURCE_ERROR) from None
 
 
+def _contract_annex_predecessor_resolution(raw, window, predecessor_result, *, data=None, critical=None):
+    if CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY not in window:
+        return None
+    if data is None:
+        normalized, _ = _normalize_source_selectors(raw, window)
+        data = _validate_response_schema(normalized, _LiveWindowResponse)
+    if critical is None:
+        processing = _window_processing_ledger(window, data["unresolved_block_ids"])
+        critical = [row["block_id"] for row in processing["blocks"]
+                    if row["status"] == "supplied" and row["self_reported_unresolved"]]
+    try:
+        return resolve_contract_annex_predecessor(raw, data, window, critical, predecessor_result)
+    except ValueError as exc:
+        raise PlanningError(str(exc)) from None
+    except (KeyError, TypeError, IndexError):
+        raise PlanningError(CONTRACT_ANNEX_PREDECESSOR_SOURCE_ERROR) from None
+
+
 def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) -> dict:
     """Validate the actual source-selected wire, before internal enrichment."""
     if isinstance(raw, dict):
@@ -2843,8 +2883,10 @@ def validate_live_window(raw: dict, window: dict, *, predecessor_result=None) ->
     heading_only_annex = resolve_heading_only_annex(raw, data, window, critical)
     annex_intro = _contract_annex_intro_resolution(raw, window, data=data, critical=critical)
     annex_list = _contract_annex_list_resolution(raw, window, data=data, critical=critical)
+    annex_predecessor = _contract_annex_predecessor_resolution(raw, window, predecessor_result, data=data, critical=critical)
     resolved = (resolution or cover or annex or continuation or acceptance or optional_fields or heading_only_annex or
-                annex_intro or annex_list or _contract_boundary_resolution(raw, window, predecessor_result, data=data, critical=critical))
+                annex_intro or annex_list or annex_predecessor or
+                _contract_boundary_resolution(raw, window, predecessor_result, data=data, critical=critical))
     if critical and (resolved is None or critical != resolved["resolved_block_ids"]):
         raise PlanningError("LIVE_REQUIRED_BLOCK_UNRESOLVED", {"field": "unresolved_block_ids", "block_ids": critical})
     # This is application normalization from frozen input,
@@ -2993,6 +3035,10 @@ def _validate_normalized_window_result(result: dict, window: dict, *, predecesso
     key = CONTRACT_ANNEX_LIST_RESOLUTION_KEY
     _fail((key in result) != (annex_list is not None) or result.get(key) != annex_list,
           "EXTRACTION_CONTRACT_ANNEX_LIST_MISMATCH")
+    annex_predecessor = _contract_annex_predecessor_resolution(raw, window, predecessor_result)
+    key = CONTRACT_ANNEX_PREDECESSOR_RESOLUTION_KEY
+    _fail((key in result) != (annex_predecessor is not None) or result.get(key) != annex_predecessor,
+          "EXTRACTION_CONTRACT_ANNEX_PREDECESSOR_MISMATCH")
     operative = _contract_operative_line_resolution(raw, window)
     key = CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY
     _fail((key in result) != (operative is not None) or result.get(key) != operative,
@@ -3124,11 +3170,19 @@ def _close_deferred_context(windows: list[dict], results: list[dict]) -> dict:
                                 ("owner_target_source_proven_contract_annex_introduction",
                                  owner_result.get(CONTRACT_ANNEX_INTRO_RESOLUTION_KEY)),
                                 ("owner_target_source_proven_contract_annex_list_items",
-                                 owner_result.get(CONTRACT_ANNEX_LIST_RESOLUTION_KEY)))
+                                 owner_result.get(CONTRACT_ANNEX_LIST_RESOLUTION_KEY)),
+                                ("owner_target_complete_annex_clause_already_cited_by_predecessor",
+                                 owner_result.get(CONTRACT_ANNEX_PREDECESSOR_RESOLUTION_KEY)))
             source_resolved = next((basis for basis, source in resolved_sources
                                     if source is not None and deferred["block_id"] in source["resolved_block_ids"]), None)
             guard(deferred["block_id"] in owner_result["processing"]["unresolved_block_ids"] and not source_resolved,
                   "DEFERRED_CONTEXT_OWNER_TARGET_UNRESOLVED", **context)
+            if predecessor := result.get(CONTRACT_ANNEX_PREDECESSOR_RESOLUTION_KEY):
+                handoffs = [row for row in predecessor["deferred_to_following_window"]
+                            if row["member"]["block_id"] == deferred["block_id"]]
+                guard(len(handoffs) != 1 or handoffs[0]["owner_window_id"] != owner["window_id"] or
+                      handoffs[0]["member"]["locator"] != block["locator"],
+                      "CONTRACT_ANNEX_PREDECESSOR_OWNER_MISMATCH", **context)
             if acceptance := result.get(CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY):
                 proof = acceptance["proof"]
                 if deferred["block_id"] == proof["adjacent_unresolved_block_id"]:
@@ -3216,7 +3270,8 @@ def extraction_window_payload(window: dict, window_config: dict) -> dict:
                                    CONTRACT_INSURANCE_ACCEPTANCE_SOURCE_CONFIG_KEY, CONTRACT_HEADING_ONLY_ANNEX_CONFIG_KEY,
                                    CONTRACT_ATTACHMENT_CITATION_SPLIT_CONFIG_KEY, CONTRACT_ANNEX_INTRO_CONFIG_KEY,
                                    NATIVE_REVIEWED_LABEL_WRAP_CONFIG_KEY, CONTRACT_ANNEX_LIST_CONFIG_KEY,
-                                   CONTRACT_OPERATIVE_LINE_CONFIG_KEY, CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY}}
+                                   CONTRACT_OPERATIVE_LINE_CONFIG_KEY, CONTRACT_PERFORMANCE_RECORD_CONFIG_KEY,
+                                   CONTRACT_ANNEX_PREDECESSOR_CONFIG_KEY}}
     return {"producer_version": EXTRACTION_VERSION, "window_config": model_config,
             "task_instructions": instructions, "output_contract": source_selected_output_contract(),
             "window": _model_window(window), "source_sha256": window["source_sha256"]}
@@ -3363,6 +3418,10 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
         if annex_list is not None:
             supplement[CONTRACT_ANNEX_LIST_RESOLUTION_KEY] = annex_list
             _capture(ctx, "n2-contract-annex-list-source-resolution", annex_list)
+        annex_predecessor = _contract_annex_predecessor_resolution(raw_model_candidate, window, predecessor_result)
+        if annex_predecessor is not None:
+            supplement[CONTRACT_ANNEX_PREDECESSOR_RESOLUTION_KEY] = annex_predecessor
+            _capture(ctx, "n2-contract-annex-predecessor-source-resolution", annex_predecessor)
         if operative is not None:
             supplement[CONTRACT_OPERATIVE_LINE_RESOLUTION_KEY] = operative
             _capture(ctx, "n2-contract-operative-line-source-resolution", operative)
@@ -3401,7 +3460,8 @@ def run_extraction_window(ctx, window: dict, window_config: dict, call_json, *, 
 def _parallel_contract_predecessor(ctx, window, predecessor):
     """Load the immutable preceding result only when a fragment needs it."""
     snapshot = getattr(ctx, "prior_unit_record", None)
-    if not callable(snapshot) or not predecessor or not window.get(CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY):
+    if not callable(snapshot) or not predecessor or not any(window.get(key) for key in (
+            CONTRACT_CLAUSE_WINDOW_CONTEXT_KEY, CONTRACT_ANNEX_PREDECESSOR_CONTEXT_KEY)):
         return None
 
     from .runtime import CheckpointInvalidError
